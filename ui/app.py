@@ -14,7 +14,17 @@ from tcb.inventory import (
 )
 
 st.set_page_config(page_title="TCB Warehouse", page_icon="📦", layout="wide")
-st.title("📦 The Cradle Box — Warehouse")
+
+# ── Header ─────────────────────────────────────────────────────────────────────
+logo_path = os.path.join(os.path.dirname(__file__), '..', 'assets', 'logo.png')
+if os.path.exists(logo_path):
+    col_logo, col_title = st.columns([1, 6])
+    with col_logo:
+        st.image(logo_path, width=100)
+    with col_title:
+        st.markdown("## Warehouse Management")
+else:
+    st.markdown("## Warehouse Management")
 
 db = get_client()
 
