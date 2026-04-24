@@ -13,14 +13,14 @@ from tcb.inventory import (
     check_assembly_feasibility, assemble_sku, dispatch_sku, receive_item,
 )
 
-st.set_page_config(page_title="TCB Warehouse", page_icon="📦", layout="wide")
+st.set_page_config(page_title="TCB Warehouse", page_icon="📦", layout="centered")
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 logo_path = os.path.join(os.path.dirname(__file__), '..', 'assets', 'logo.png')
 if os.path.exists(logo_path):
-    col_logo, col_title = st.columns([1, 6])
+    col_logo, col_title = st.columns([1, 4])
     with col_logo:
-        st.image(logo_path, width=100)
+        st.image(logo_path, width=80)
     with col_title:
         st.markdown("## Warehouse Management")
 else:
@@ -79,65 +79,62 @@ with tab_stock:
     if st.button("🔄 Refresh", key="refresh_stock"):
         st.cache_data.clear()
 
-    col1, col2 = st.columns(2)
+    item_stock = get_item_stock()
 
-    # ── Item stock ────────────────────────────────────────────
-    with col1:
-        st.subheader("Loose Item Stock (Own WH)")
-        item_stock = get_item_stock()
-        if item_stock:
-            rows = []
-            for item_id, s in sorted(item_stock.items(), key=lambda x: x[1]["name"]):
-                status = (
-                    "🔴 OUT"  if s["qty"] == 0 else
-                    "🟡 LOW"  if s["qty"] <= s["reorder_point"] and s["reorder_point"] > 0 else
-                    "🟢"
-                )
-                rows.append({
-                    "Item":           s["name"],
-                    "Code":           s["item_code"],
-                    "Qty":            s["qty"],
-                    "Unit":           s["unit"],
-                    "Reorder At":     s["reorder_point"] or "—",
-                    "Status":         status,
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("No item stock found.")
-
-    # ── SKU stock + assemblable ───────────────────────────────
-    with col2:
-        st.subheader("Assembled SKU Stock (Own WH)")
-        sku_stock    = {r["sku_id"]: r for r in get_sku_stock()}
-        assemblable  = {r["sku_id"]: r["assemblable"] for r in get_assemblable()}
-        skus         = load_skus()
-
-        rows = []
-        for sku in skus:
-            sid  = sku["sku_id"]
-            s    = sku_stock.get(sid, {})
-            on_hand = s.get("qty_on_hand", 0)
-            can_make = assemblable.get(sid, 0)
-            rows.append({
-                "SKU":         sid,
-                "Name":        sku["name"],
-                "In Stock":    on_hand,
-                "Can Assemble": can_make,
-                "Total Available": on_hand + can_make,
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    # ── Low stock alerts ──────────────────────────────────────
+    # ── Low stock alerts (show at top so visible immediately on mobile) ────────
     alerts = [
         (item_id, s) for item_id, s in item_stock.items()
         if s["reorder_point"] > 0 and s["qty"] <= s["reorder_point"]
     ]
     if alerts:
-        st.divider()
         st.subheader("⚠️ Reorder Alerts")
         for _, s in sorted(alerts, key=lambda x: x[1]["qty"]):
             icon = "🔴" if s["qty"] == 0 else "🟡"
             st.warning(f"{icon} **{s['name']}** — {s['qty']} {s['unit']}s left (reorder at {s['reorder_point']})")
+        st.divider()
+
+    # ── SKU stock + assemblable ───────────────────────────────
+    st.subheader("Assembled SKU Stock")
+    sku_stock   = {r["sku_id"]: r for r in get_sku_stock()}
+    assemblable = {r["sku_id"]: r["assemblable"] for r in get_assemblable()}
+    skus        = load_skus()
+
+    rows = []
+    for sku in skus:
+        sid      = sku["sku_id"]
+        s        = sku_stock.get(sid, {})
+        on_hand  = s.get("qty_on_hand", 0)
+        can_make = assemblable.get(sid, 0)
+        rows.append({
+            "SKU":       sid,
+            "Name":      sku["name"],
+            "Packed":    on_hand,
+            "Can Pack":  can_make,
+            "Total":     on_hand + can_make,
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Item stock ────────────────────────────────────────────
+    st.subheader("Loose Item Stock")
+    if item_stock:
+        rows = []
+        for item_id, s in sorted(item_stock.items(), key=lambda x: x[1]["name"]):
+            status = (
+                "🔴 OUT" if s["qty"] == 0 else
+                "🟡 LOW" if s["qty"] <= s["reorder_point"] and s["reorder_point"] > 0 else
+                "🟢"
+            )
+            rows.append({
+                "Item":   s["name"],
+                "Qty":    s["qty"],
+                "Unit":   s["unit"],
+                "Status": status,
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No item stock found.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
