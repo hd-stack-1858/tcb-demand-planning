@@ -185,54 +185,118 @@ with tab_assemble:
 # TAB 3 — SHIP OUT
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_ship:
-    st.subheader("Ship Out / Dispatch")
+    st.subheader("Ship Out")
 
-    skus        = load_skus()
-    channels    = load_channels()
-    sku_stock   = {r["sku_id"]: r["qty_on_hand"] for r in get_sku_stock()}
-    blinkit_whs = load_blinkit_whs()
+    all_channels = load_channels()
+    sku_stock    = {r["sku_id"]: r["qty_on_hand"] for r in get_sku_stock()}
+    skus         = load_skus()
+    blinkit_whs  = load_blinkit_whs()
 
-    sku_opts = {
-        f"{s['sku_id']} — {s['name']} (stock: {sku_stock.get(s['sku_id'], 0)})": s["sku_id"]
-        for s in skus
-    }
-    ch_opts = {f"{c['name']} ({c['code']})": c for c in channels}
-    blk_opts = {w["name"]: w["location_id"] for w in blinkit_whs}
+    DROPSHIP_MODELS = {"DROP_SHIP", "DIRECT"}
+    BULK_MODELS     = {"FBA", "SOR", "OUTRIGHT"}
 
-    with st.form("ship_form"):
-        sku_label   = st.selectbox("SKU", list(sku_opts.keys()))
-        qty         = st.number_input("Quantity", min_value=1, value=1, step=1)
-        ch_label    = st.selectbox("Channel / Destination", list(ch_opts.keys()))
-        ch_data     = ch_opts[ch_label]
+    dropship_channels = [c for c in all_channels if c["business_model"] in DROPSHIP_MODELS]
+    bulk_channels     = [c for c in all_channels if c["business_model"] in BULK_MODELS]
 
-        blk_wh_label = None
-        if ch_data["code"] == "BLK" and blinkit_whs:
-            blk_wh_label = st.selectbox("Blinkit WH", list(blk_opts.keys()))
+    # ── Step 1: shipment type ─────────────────────────────────
+    ship_type = st.radio(
+        "Shipment type",
+        ["🛍️ Drop-ship (end customer order)", "📦 Bulk to partner"],
+        horizontal=True,
+    )
+    is_bulk = ship_type.startswith("📦")
 
-        reference   = st.text_input("Reference (invoice / order #)")
-        notes       = st.text_input("Notes (optional)")
-        submitted   = st.form_submit_button("Ship ✅")
+    # ── Step 2: channel ───────────────────────────────────────
+    ch_list  = bulk_channels if is_bulk else dropship_channels
+    ch_opts  = {c["name"]: c for c in ch_list}
+    ch_label = st.selectbox("Partner / Channel", list(ch_opts.keys()))
+    ch_data  = ch_opts[ch_label]
 
-    if submitted:
-        sku_id     = sku_opts[sku_label]
-        channel_id = ch_data["channel_id"]
-        available  = sku_stock.get(sku_id, 0)
+    # ── Step 3: Blinkit WH (only for BLK) ────────────────────
+    blk_wh_label = None
+    if ch_data["code"] == "BLK" and blinkit_whs:
+        blk_opts     = {w["name"]: w for w in blinkit_whs}
+        blk_wh_label = st.selectbox("Blinkit Warehouse", list(blk_opts.keys()))
 
-        if available < qty:
-            st.error(f"❌ Only {available} units in stock — cannot ship {qty}.")
+    # ── Step 4: reference doc ─────────────────────────────────
+    if is_bulk:
+        ref_label    = "Delivery Challan #" if ch_data["code"] == "AZ_FBA" else "Invoice #"
+        ref_required = True
+    else:
+        ref_label    = "Order # (optional — can reconcile later)"
+        ref_required = False
+
+    reference = st.text_input(ref_label)
+    notes     = st.text_input("Notes (optional)")
+
+    # ── Step 5: SKU qty table ─────────────────────────────────
+    st.markdown("**Enter quantities to ship:**")
+
+    sku_rows = []
+    for s in skus:
+        sid   = s["sku_id"]
+        stock = sku_stock.get(sid, 0)
+        if stock == 0:
+            continue
+        sku_rows.append({
+            "SKU":      sid,
+            "Name":     s["name"],
+            "In Stock": stock,
+            "Ship Qty": 0,
+        })
+
+    if not sku_rows:
+        st.info("No SKUs currently in stock at Own WH.")
+        st.stop()
+
+    edited = st.data_editor(
+        pd.DataFrame(sku_rows),
+        column_config={
+            "SKU":      st.column_config.TextColumn(disabled=True),
+            "Name":     st.column_config.TextColumn(disabled=True),
+            "In Stock": st.column_config.NumberColumn(disabled=True),
+            "Ship Qty": st.column_config.NumberColumn(min_value=0, step=1),
+        },
+        hide_index=True,
+        use_container_width=True,
+        key=f"ship_table_{ch_label}",
+    )
+
+    to_ship = edited[edited["Ship Qty"] > 0]
+
+    if st.button("Ship Out ✅", type="primary"):
+        # Validation
+        if ref_required and not reference.strip():
+            st.error(f"❌ {ref_label} is required for bulk shipments.")
+        elif len(to_ship) == 0:
+            st.error("❌ Enter at least one quantity to ship.")
         else:
-            ref = reference
+            ref_str = reference.strip()
             if blk_wh_label:
-                ref = f"{reference} | WH: {blk_wh_label}".strip(" |")
+                ref_str = f"{ref_str} | WH: {blk_wh_label}".strip(" |")
 
-            try:
-                txn_type = dispatch_sku(sku_id, qty, channel_id,
-                                        reference=ref, notes=notes, created_by="app")
-                verb = "Transferred" if txn_type == "TRANSFER_OUT" else "Dispatched"
-                st.success(f"✅ {verb} **{qty}× {sku_id}** → {ch_data['name']}")
+            errors, successes = [], []
+            for _, row in to_ship.iterrows():
+                sid = row["SKU"]
+                qty = int(row["Ship Qty"])
+                if qty > row["In Stock"]:
+                    errors.append(f"❌ {sid}: only {int(row['In Stock'])} in stock, cannot ship {qty}")
+                    continue
+                try:
+                    txn_type = dispatch_sku(sid, qty, ch_data["channel_id"],
+                                            reference=ref_str, notes=notes, created_by="app")
+                    verb = "Transferred" if txn_type == "TRANSFER_OUT" else "Dispatched"
+                    successes.append(f"✅ {verb} {qty}× {sid}")
+                except Exception as e:
+                    errors.append(f"❌ {sid}: {e}")
+
+            for msg in successes:
+                st.success(msg)
+            for msg in errors:
+                st.error(msg)
+
+            if successes:
                 st.cache_data.clear()
-            except Exception as e:
-                st.error(f"Error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
