@@ -1,0 +1,23 @@
+# Credentials — NEVER commit this
+.env
+
+# Excel master files — stay local, not needed for the running app
+master files/
+*.xlsx
+*.xls
+*.csv
+
+# Raw data downloads
+blinkit_inventory/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# Streamlit local config
+.streamlit/secrets.toml

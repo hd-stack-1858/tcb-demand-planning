@@ -1,0 +1,1 @@
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS legal_name TEXT;
