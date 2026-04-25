@@ -257,6 +257,163 @@ def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="ap
     return txn_type
 
 
+def return_sku(sku_id, qty, from_channel_id, notes="", created_by="app"):
+    """Return assembled SKU from a partner back into OWN_WH stock."""
+    db = get_client()
+    own_wh_id = _own_wh_id()
+
+    existing = (db.table("sku_inventory").select("sku_inv_id, qty_on_hand")
+                  .eq("sku_id", sku_id).eq("channel_id", own_wh_id).execute().data)
+    if existing:
+        db.table("sku_inventory").update(
+            {"qty_on_hand": existing[0]["qty_on_hand"] + qty, "last_updated": _now()}
+        ).eq("sku_inv_id", existing[0]["sku_inv_id"]).execute()
+    else:
+        db.table("sku_inventory").insert({
+            "sku_id": sku_id, "channel_id": own_wh_id,
+            "qty_on_hand": qty, "qty_reserved": 0,
+        }).execute()
+
+    db.table("sku_inventory_transactions").insert({
+        "type":            "RETURN",
+        "sku_id":          sku_id,
+        "from_channel_id": from_channel_id,
+        "to_channel_id":   own_wh_id,
+        "quantity":        qty,
+        "notes":           notes,
+        "created_by":      created_by,
+    }).execute()
+
+
+def return_item(item_id, qty, notes="", created_by="app"):
+    """
+    Return individual item/packaging component to OWN_WH.
+    Added to today's batch (cost=0 since it's a return, not a purchase).
+    """
+    db = get_client()
+    own_wh_id = _own_wh_id()
+    today      = date.today()
+    batch_code = today.strftime("%Y%m%d")
+
+    existing_batch = (db.table("item_batches")
+                        .select("batch_id, qty_received, qty_remaining")
+                        .eq("item_id", item_id)
+                        .eq("batch_code", batch_code)
+                        .execute().data)
+
+    if existing_batch:
+        batch_id = existing_batch[0]["batch_id"]
+        db.table("item_batches").update({
+            "qty_received":  existing_batch[0]["qty_received"]  + qty,
+            "qty_remaining": existing_batch[0]["qty_remaining"] + qty,
+            "is_current":    True,
+        }).eq("batch_id", batch_id).execute()
+    else:
+        result = db.table("item_batches").insert({
+            "item_id":       item_id,
+            "batch_code":    batch_code,
+            "received_date": today.strftime("%Y-%m-%d"),
+            "cost_per_unit": 0,
+            "qty_received":  qty,
+            "qty_remaining": qty,
+            "is_current":    True,
+        }).execute()
+        batch_id = result.data[0]["batch_id"]
+
+    existing_inv = (db.table("inventory")
+                      .select("inv_id, quantity_on_hand")
+                      .eq("item_id", item_id)
+                      .eq("batch_id", batch_id)
+                      .eq("channel_id", own_wh_id)
+                      .execute().data)
+    if existing_inv:
+        db.table("inventory").update({
+            "quantity_on_hand": existing_inv[0]["quantity_on_hand"] + qty
+        }).eq("inv_id", existing_inv[0]["inv_id"]).execute()
+    else:
+        db.table("inventory").insert({
+            "item_id":            item_id,
+            "batch_id":           batch_id,
+            "channel_id":         own_wh_id,
+            "quantity_on_hand":   qty,
+            "quantity_reserved":  0,
+            "quantity_intransit": 0,
+        }).execute()
+
+    db.table("inventory_transactions").insert({
+        "type":          "SALE_RETURN",
+        "item_id":       item_id,
+        "to_channel_id": own_wh_id,
+        "quantity":      qty,
+        "notes":         notes,
+        "created_by":    created_by,
+    }).execute()
+
+
+def writeoff_sku(sku_id, qty, reason, notes="", created_by="app"):
+    """Write off assembled SKU qty from OWN_WH (Lost / Damaged / QC Reject)."""
+    db = get_client()
+    own_wh_id = _own_wh_id()
+
+    inv = (db.table("sku_inventory").select("sku_inv_id, qty_on_hand")
+             .eq("sku_id", sku_id).eq("channel_id", own_wh_id).execute().data)
+    available = inv[0]["qty_on_hand"] if inv else 0
+    if available < qty:
+        raise ValueError(f"Insufficient SKU stock: need {qty}, have {available}")
+
+    db.table("sku_inventory").update(
+        {"qty_on_hand": available - qty, "last_updated": _now()}
+    ).eq("sku_inv_id", inv[0]["sku_inv_id"]).execute()
+
+    db.table("sku_inventory_transactions").insert({
+        "type":            "ADJUSTMENT",
+        "sku_id":          sku_id,
+        "from_channel_id": own_wh_id,
+        "quantity":        qty,
+        "notes":           f"[WRITE-OFF: {reason}] {notes}".strip(),
+        "created_by":      created_by,
+    }).execute()
+
+
+def writeoff_item(item_id, qty, reason, notes="", created_by="app"):
+    """Write off loose item qty from OWN_WH FIFO (Lost / Damaged / QC Reject)."""
+    db = get_client()
+    own_wh_id = _own_wh_id()
+
+    inv_rows = (db.table("inventory")
+                  .select("inv_id, batch_id, quantity_on_hand, item_batches(received_date)")
+                  .eq("item_id", item_id)
+                  .eq("channel_id", own_wh_id)
+                  .gt("quantity_on_hand", 0)
+                  .execute().data)
+    inv_rows.sort(key=lambda r: r["item_batches"]["received_date"])
+
+    available = sum(r["quantity_on_hand"] for r in inv_rows)
+    if available < qty:
+        raise ValueError(f"Insufficient stock: need {qty}, have {available}")
+
+    remaining = qty
+    for row in inv_rows:
+        if remaining <= 0:
+            break
+        consume  = min(row["quantity_on_hand"], remaining)
+        new_qty  = row["quantity_on_hand"] - consume
+        db.table("inventory").update({"quantity_on_hand": new_qty})\
+          .eq("inv_id", row["inv_id"]).execute()
+        db.table("item_batches").update({"is_current": new_qty > 0})\
+          .eq("batch_id", row["batch_id"]).execute()
+        remaining -= consume
+
+    db.table("inventory_transactions").insert({
+        "type":            "DAMAGE_WRITE_OFF",
+        "item_id":         item_id,
+        "from_channel_id": own_wh_id,
+        "quantity":        qty,
+        "notes":           f"[{reason}] {notes}".strip(),
+        "created_by":      created_by,
+    }).execute()
+
+
 def receive_item(item_id, qty, cost_per_unit, supplier_id=None,
                  receipt_date=None, notes="", created_by="app"):
     """

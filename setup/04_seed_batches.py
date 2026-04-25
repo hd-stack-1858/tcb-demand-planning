@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from tcb.db import get_client
 import openpyxl
 
-EXCEL = os.path.join(os.path.dirname(__file__), '..', 'master files', 'Batch wise-cost-inventory.xlsx')
+EXCEL = os.path.join(os.path.dirname(__file__), '..', 'master files', 'Batch-wise-cost-inventory.xlsx')
 db = get_client()
 
 # ── Helpers ───────────────────────────────────────────────────

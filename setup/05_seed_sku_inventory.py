@@ -11,7 +11,7 @@ from tcb.db import get_client
 import openpyxl
 from datetime import datetime, timezone
 
-EXCEL = os.path.join(os.path.dirname(__file__), '..', 'master files', 'Batch wise-cost-inventory.xlsx')
+EXCEL = os.path.join(os.path.dirname(__file__), '..', 'master files', 'Batch-wise-cost-inventory.xlsx')
 db = get_client()
 
 # ── Lookups ───────────────────────────────────────────────────
