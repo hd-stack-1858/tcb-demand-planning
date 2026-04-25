@@ -11,6 +11,7 @@ from tcb.db import get_client
 from tcb.inventory import (
     get_item_stock, get_sku_stock, get_assemblable,
     check_assembly_feasibility, assemble_sku, dispatch_sku, receive_item,
+    return_sku, return_item, writeoff_sku, writeoff_item,
 )
 
 st.set_page_config(page_title="TCB Warehouse", page_icon="📦", layout="centered")
@@ -68,8 +69,8 @@ def clear_cache():
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 
-tab_stock, tab_assemble, tab_ship, tab_receive = st.tabs(
-    ["📊 Stock", "🔧 Assemble", "🚚 Ship Out", "📥 Receive Stock"]
+tab_stock, tab_assemble, tab_ship, tab_receive, tab_returns = st.tabs(
+    ["📊 Stock", "🔧 Assemble", "🚚 Ship Out", "📥 Receive Stock", "↩️ Returns"]
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -201,10 +202,113 @@ with tab_ship:
     # ── Step 1: shipment type ─────────────────────────────────
     ship_type = st.radio(
         "Shipment type",
-        ["🛍️ Drop-ship (end customer order)", "📦 Bulk to partner"],
+        ["🛍️ Drop-ship (end customer order)", "📦 Bulk to partner", "🗑️ Write-off (Lost / Damaged / QC)"],
         horizontal=True,
     )
-    is_bulk = ship_type.startswith("📦")
+    is_bulk     = ship_type.startswith("📦")
+    is_writeoff = ship_type.startswith("🗑️")
+
+    # ── Write-off branch (no channel needed) ─────────────────
+    if is_writeoff:
+        writeoff_level = st.radio(
+            "What are you writing off?",
+            ["📦 Assembled SKU", "🧺 Loose Item / Packaging"],
+            horizontal=True,
+        )
+        reason = st.selectbox("Reason", ["Lost", "Damaged", "QC Reject"])
+        wo_notes = st.text_input("Notes (optional)", key="wo_notes")
+
+        if writeoff_level.startswith("📦"):
+            st.markdown("**Enter quantities to write off:**")
+            sku_stock_wo = {r["sku_id"]: r["qty_on_hand"] for r in get_sku_stock()}
+            wo_rows = [
+                {"SKU": s["sku_id"], "Name": s["name"],
+                 "In Stock": sku_stock_wo.get(s["sku_id"], 0), "Write-off Qty": 0}
+                for s in load_skus() if sku_stock_wo.get(s["sku_id"], 0) > 0
+            ]
+            if not wo_rows:
+                st.info("No assembled SKU stock to write off.")
+            else:
+                wo_edited = st.data_editor(
+                    pd.DataFrame(wo_rows),
+                    column_config={
+                        "SKU":           st.column_config.TextColumn(disabled=True),
+                        "Name":          st.column_config.TextColumn(disabled=True),
+                        "In Stock":      st.column_config.NumberColumn(disabled=True),
+                        "Write-off Qty": st.column_config.NumberColumn(min_value=0, step=1),
+                    },
+                    hide_index=True, use_container_width=True, key="wo_sku_table",
+                )
+                if st.button("Write Off ✅", type="primary", key="wo_sku_btn"):
+                    to_wo = wo_edited[wo_edited["Write-off Qty"] > 0]
+                    if len(to_wo) == 0:
+                        st.error("Enter at least one quantity.")
+                    else:
+                        for _, row in to_wo.iterrows():
+                            try:
+                                writeoff_sku(row["SKU"], int(row["Write-off Qty"]),
+                                             reason=reason, notes=wo_notes, created_by="app")
+                                st.success(f"✅ Written off {int(row['Write-off Qty'])}× {row['SKU']} [{reason}]")
+                            except Exception as e:
+                                st.error(f"❌ {row['SKU']}: {e}")
+                        st.cache_data.clear()
+        else:
+            skus_wo     = load_skus()
+            sku_wo_opts = {f"{s['sku_id']} — {s['name']}": s["sku_id"] for s in skus_wo}
+            sku_wo_sel  = st.selectbox("Which SKU do these items belong to?", list(sku_wo_opts.keys()), key="wo_item_sku")
+            sku_wo_id   = sku_wo_opts[sku_wo_sel]
+
+            bom_wo       = (db.table("bom")
+                              .select("item_id, items(item_code, name, unit)")
+                              .eq("sku_id", sku_wo_id).execute().data)
+            item_stock_wo = get_item_stock()
+
+            wo_item_rows = []
+            for b in bom_wo:
+                item_id = b["item_id"]
+                stock   = item_stock_wo.get(item_id, {}).get("qty", 0)
+                if stock == 0:
+                    continue
+                wo_item_rows.append({
+                    "Code":          b["items"]["item_code"],
+                    "Item":          b["items"]["name"],
+                    "Unit":          b["items"]["unit"],
+                    "In Stock":      stock,
+                    "Write-off Qty": 0,
+                    "_item_id":      item_id,
+                })
+
+            if not wo_item_rows:
+                st.info("No stock found for items in this SKU.")
+            else:
+                display_cols = ["Code", "Item", "Unit", "In Stock", "Write-off Qty"]
+                wo_item_edited = st.data_editor(
+                    pd.DataFrame(wo_item_rows),
+                    column_config={
+                        "Code":          st.column_config.TextColumn(disabled=True),
+                        "Item":          st.column_config.TextColumn(disabled=True),
+                        "Unit":          st.column_config.TextColumn(disabled=True),
+                        "In Stock":      st.column_config.NumberColumn(disabled=True),
+                        "Write-off Qty": st.column_config.NumberColumn(min_value=0, step=1),
+                        "_item_id":      st.column_config.NumberColumn(disabled=True),
+                    },
+                    hide_index=True, use_container_width=True, key="wo_item_table",
+                    column_order=display_cols,
+                )
+                if st.button("Write Off ✅", type="primary", key="wo_item_btn"):
+                    to_wo = wo_item_edited[wo_item_edited["Write-off Qty"] > 0]
+                    if len(to_wo) == 0:
+                        st.error("Enter at least one quantity.")
+                    else:
+                        for _, row in to_wo.iterrows():
+                            try:
+                                writeoff_item(int(row["_item_id"]), int(row["Write-off Qty"]),
+                                              reason=reason, notes=wo_notes, created_by="app")
+                                st.success(f"✅ Written off {int(row['Write-off Qty'])}× {row['Item']} [{reason}]")
+                            except Exception as e:
+                                st.error(f"❌ {row['Item']}: {e}")
+                        st.cache_data.clear()
+        st.stop()
 
     # ── Step 2: channel ───────────────────────────────────────
     ch_list  = bulk_channels if is_bulk else dropship_channels
@@ -344,3 +448,111 @@ with tab_receive:
             st.cache_data.clear()
         except Exception as e:
             st.error(f"Error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — RETURNS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_returns:
+    st.subheader("Inward Returns")
+    st.caption("Record stock coming back from any partner. Only inward what is reusable/in good condition.")
+
+    all_channels_ret = load_channels()
+    ch_ret_opts      = {c["name"]: c for c in all_channels_ret}
+    ch_ret_label     = st.selectbox("Returning partner", list(ch_ret_opts.keys()), key="ret_channel")
+    ch_ret           = ch_ret_opts[ch_ret_label]
+
+    return_type = st.radio(
+        "What is being returned?",
+        ["📦 Full SKU (assembled hamper)", "🧺 Individual items / components only"],
+        horizontal=True,
+        key="ret_type",
+    )
+
+    ret_reference = st.text_input("Reference (optional)", key="ret_ref")
+    ret_notes     = st.text_input("Notes (optional)", key="ret_notes")
+
+    # ── Full SKU return — table of all SKUs ──────────────────
+    if return_type.startswith("📦"):
+        st.markdown("**Enter return qty for each SKU:**")
+        skus_ret = load_skus()
+        ret_sku_rows = [
+            {"SKU": s["sku_id"], "Name": s["name"], "Return Qty": 0}
+            for s in skus_ret
+        ]
+        ret_sku_edited = st.data_editor(
+            pd.DataFrame(ret_sku_rows),
+            column_config={
+                "SKU":        st.column_config.TextColumn(disabled=True),
+                "Name":       st.column_config.TextColumn(disabled=True),
+                "Return Qty": st.column_config.NumberColumn(min_value=0, step=1),
+            },
+            hide_index=True, use_container_width=True, key="ret_sku_table",
+        )
+        if st.button("Inward Return ✅", type="primary", key="ret_sku_btn"):
+            to_ret = ret_sku_edited[ret_sku_edited["Return Qty"] > 0]
+            if len(to_ret) == 0:
+                st.error("Enter at least one quantity.")
+            else:
+                full_notes = f"Return from {ch_ret_label} | {ret_reference} | {ret_notes}".strip(" |")
+                for _, row in to_ret.iterrows():
+                    try:
+                        return_sku(
+                            sku_id          = row["SKU"],
+                            qty             = int(row["Return Qty"]),
+                            from_channel_id = ch_ret["channel_id"],
+                            notes           = full_notes,
+                            created_by      = "app",
+                        )
+                        st.success(f"✅ {int(row['Return Qty'])}× {row['SKU']} returned to OWN_WH from {ch_ret_label}")
+                    except Exception as e:
+                        st.error(f"❌ {row['SKU']}: {e}")
+                st.cache_data.clear()
+
+    # ── Individual item / component return ────────────────────
+    else:
+        skus_ret     = load_skus()
+        sku_ret_opts = {f"{s['sku_id']} — {s['name']}": s["sku_id"] for s in skus_ret}
+        sku_ret_sel  = st.selectbox("Which SKU is this return from?", list(sku_ret_opts.keys()), key="ret_item_sku")
+        sku_ret_id   = sku_ret_opts[sku_ret_sel]
+
+        bom_ret = (db.table("bom")
+                     .select("item_id, items(item_code, name, unit)")
+                     .eq("sku_id", sku_ret_id).execute().data)
+
+        st.markdown("**Enter qty for each reusable component being returned:**")
+        ret_item_rows = [
+            {"Code": b["items"]["item_code"], "Item": b["items"]["name"],
+             "Unit": b["items"]["unit"], "Return Qty": 0, "_item_id": b["item_id"]}
+            for b in bom_ret
+        ]
+        ret_item_edited = st.data_editor(
+            pd.DataFrame(ret_item_rows),
+            column_config={
+                "Code":       st.column_config.TextColumn(disabled=True),
+                "Item":       st.column_config.TextColumn(disabled=True),
+                "Unit":       st.column_config.TextColumn(disabled=True),
+                "Return Qty": st.column_config.NumberColumn(min_value=0, step=1),
+                "_item_id":   st.column_config.NumberColumn(disabled=True),
+            },
+            hide_index=True, use_container_width=True, key="ret_item_table",
+            column_order=["Code", "Item", "Unit", "Return Qty"],
+        )
+        if st.button("Inward Return ✅", type="primary", key="ret_item_btn"):
+            to_ret = ret_item_edited[ret_item_edited["Return Qty"] > 0]
+            if len(to_ret) == 0:
+                st.error("Enter at least one quantity.")
+            else:
+                full_notes = f"Return from {ch_ret_label} ({sku_ret_id}) | {ret_reference} | {ret_notes}".strip(" |")
+                for _, row in to_ret.iterrows():
+                    try:
+                        return_item(
+                            item_id    = int(row["_item_id"]),
+                            qty        = int(row["Return Qty"]),
+                            notes      = full_notes,
+                            created_by = "app",
+                        )
+                        st.success(f"✅ {int(row['Return Qty'])}× {row['Item']} returned to stock")
+                    except Exception as e:
+                        st.error(f"❌ {row['Item']}: {e}")
+                st.cache_data.clear()
