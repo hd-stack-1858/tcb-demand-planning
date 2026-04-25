@@ -172,7 +172,7 @@ def assemble_sku(sku_id, qty_to_pack, notes="", created_by="app"):
             # Fetch current qty (re-fetch to be safe)
             cur = (db.table("inventory").select("quantity_on_hand")
                      .eq("inv_id", p["inv_id"]).single().execute().data)
-            new_qty = cur["quantity_on_hand"] - p["consume"]
+            new_qty = int(cur["quantity_on_hand"]) - int(p["consume"])
             db.table("inventory").update({"quantity_on_hand": new_qty})\
               .eq("inv_id", p["inv_id"]).execute()
             db.table("item_batches").update({"is_current": new_qty > 0})\
@@ -183,7 +183,7 @@ def assemble_sku(sku_id, qty_to_pack, notes="", created_by="app"):
                 "item_id":         item_id,
                 "sku_id":          sku_id,
                 "from_channel_id": own_wh_id,
-                "quantity":        p["consume"],
+                "quantity":        int(p["consume"]),
                 "reference":       f"ASSEMBLE_{sku_id}",
                 "notes":           notes,
                 "created_by":      created_by,
@@ -194,20 +194,20 @@ def assemble_sku(sku_id, qty_to_pack, notes="", created_by="app"):
                   .eq("sku_id", sku_id).eq("channel_id", own_wh_id).execute().data)
     if existing:
         db.table("sku_inventory").update(
-            {"qty_on_hand": existing[0]["qty_on_hand"] + qty_to_pack,
+            {"qty_on_hand": int(existing[0]["qty_on_hand"]) + int(qty_to_pack),
              "last_updated": _now()}
         ).eq("sku_inv_id", existing[0]["sku_inv_id"]).execute()
     else:
         db.table("sku_inventory").insert({
             "sku_id": sku_id, "channel_id": own_wh_id,
-            "qty_on_hand": qty_to_pack, "qty_reserved": 0,
+            "qty_on_hand": int(qty_to_pack), "qty_reserved": 0,
         }).execute()
 
     db.table("sku_inventory_transactions").insert({
         "type":          "ASSEMBLY",
         "sku_id":        sku_id,
         "to_channel_id": own_wh_id,
-        "quantity":      qty_to_pack,
+        "quantity":      int(qty_to_pack),
         "unit_cogs":     unit_cogs,
         "notes":         notes,
         "created_by":    created_by,
