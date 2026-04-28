@@ -268,6 +268,63 @@ def assemble_sku(sku_id, qty_to_pack, notes="", created_by="app"):
     return unit_cogs
 
 
+def record_dropship_sale(sku_id, qty, channel_id, selling_price,
+                         order_date=None, platform_order_id=None,
+                         city=None, notes="", created_by="app"):
+    """
+    Record a drop-ship / direct sale: dispatches inventory AND writes to orders table.
+    Use this for DROP_SHIP / DIRECT channel shipments instead of dispatch_sku().
+    COGS pulled from most recent ASSEMBLY transaction for the SKU.
+    """
+    db  = get_client()
+    qty = int(qty)
+    selling_price = float(selling_price)
+
+    if order_date is None:
+        order_date = date.today()
+
+    ch = (db.table("channels")
+            .select("commission_pct, name")
+            .eq("channel_id", channel_id).single().execute().data)
+    commission_pct = float(ch["commission_pct"] or 0)
+
+    last_asm = (db.table("sku_inventory_transactions")
+                  .select("unit_cogs")
+                  .eq("sku_id", sku_id)
+                  .eq("type", "ASSEMBLY")
+                  .order("created_at", desc=True)
+                  .limit(1).execute().data)
+    unit_cogs = float(last_asm[0]["unit_cogs"]) if last_asm else 0.0
+
+    # Inventory movement first — raises ValueError on insufficient stock
+    dispatch_sku(sku_id, qty, channel_id,
+                 reference=platform_order_id or "",
+                 notes=notes, created_by=created_by)
+
+    gross_value    = round(qty * selling_price, 2)
+    commission_amt = round(gross_value * commission_pct / 100, 2)
+    cogs_total     = round(qty * unit_cogs, 2)
+    net_margin     = round(gross_value - cogs_total - commission_amt, 2)
+
+    db.table("orders").insert({
+        "channel_id":        channel_id,
+        "order_date":        order_date.strftime("%Y-%m-%d") if hasattr(order_date, "strftime") else str(order_date),
+        "sku_id":            sku_id,
+        "quantity":          qty,
+        "selling_price":     selling_price,
+        "gross_value":       gross_value,
+        "commission_pct":    commission_pct,
+        "commission_amt":    commission_amt,
+        "cogs":              cogs_total,
+        "net_margin":        net_margin,
+        "fulfillment_type":  "DROP_SHIP",
+        "city":              city or None,
+        "platform_order_id": platform_order_id or None,
+        "status":            "FULFILLED",
+        "source_file":       "warehouse_app",
+    }).execute()
+
+
 def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="app"):
     """
     Dispatch assembled SKUs from OWN_WH.

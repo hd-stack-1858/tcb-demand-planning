@@ -12,6 +12,7 @@ from tcb.inventory import (
     get_item_stock, get_sku_stock, get_assemblable,
     check_assembly_feasibility, assemble_sku, dispatch_sku, receive_item,
     return_sku, return_item, writeoff_sku, writeoff_item,
+    record_dropship_sale,
 )
 
 st.set_page_config(page_title="TCB Warehouse", page_icon="📦", layout="centered")
@@ -78,6 +79,17 @@ def load_channels():
 @st.cache_data(ttl=60)
 def load_suppliers():
     return db.table("suppliers").select("supplier_id, name").order("name").execute().data
+
+@st.cache_data(ttl=300)
+def load_sku_prices():
+    """Latest selling price per SKU from sku_pricing (most recent effective_date)."""
+    rows = db.table("sku_pricing").select("sku_id, sp, effective_date")\
+             .order("effective_date", desc=True).execute().data
+    prices = {}
+    for r in rows:
+        if r["sku_id"] not in prices:
+            prices[r["sku_id"]] = float(r["sp"] or 0)
+    return prices  # sku_id → sp
 
 @st.cache_data(ttl=60)
 def load_blinkit_whs():
@@ -321,8 +333,18 @@ with tab_ship:
         with st.status(f"Dispatching to {p['ch_label']}...", expanded=True) as status:
             for row in p["to_ship"]:
                 try:
-                    dispatch_sku(row["sku"], row["qty"], p["channel_id"],
-                                 reference=p["ref_str"], notes=p["notes"], created_by="app")
+                    if p.get("is_dropship"):
+                        record_dropship_sale(
+                            sku_id=row["sku"], qty=row["qty"],
+                            channel_id=p["channel_id"],
+                            selling_price=row["selling_price"],
+                            platform_order_id=p["ref_str"] or None,
+                            city=p.get("city") or None,
+                            notes=p["notes"], created_by="app",
+                        )
+                    else:
+                        dispatch_sku(row["sku"], row["qty"], p["channel_id"],
+                                     reference=p["ref_str"], notes=p["notes"], created_by="app")
                     st.write(f"Dispatched {row['qty']}× {row['sku']}")
                 except Exception as e:
                     errors.append(f"❌ {row['sku']}: {e}")
@@ -395,6 +417,7 @@ with tab_ship:
     sku_stock    = {r["sku_id"]: r["qty_on_hand"] for r in get_sku_stock()}
     skus         = load_skus()
     blinkit_whs  = load_blinkit_whs()
+    sku_prices   = load_sku_prices()
 
     DROPSHIP_MODELS = {"DROP_SHIP", "DIRECT"}
     BULK_MODELS     = {"FBA", "SOR", "OUTRIGHT"}
@@ -542,52 +565,85 @@ with tab_ship:
         ref_required = False
 
     reference = st.text_input(ref_label,          key=f"ship_ref_{st.session_state.ship_key}")
+    city      = st.text_input("City (optional)",  key=f"ship_city_{st.session_state.ship_key}") if not is_bulk else None
     notes     = st.text_input("Notes (optional)", key=f"ship_notes_{st.session_state.ship_key}")
 
     # ── Step 5: SKU qty table ─────────────────────────────────────────────────
     st.markdown("**Enter quantities to ship:**")
-    sku_rows = [
-        {"SKU": s["sku_id"], "Name": s["name"],
-         "In Stock": sku_stock.get(s["sku_id"], 0), "Ship Qty": 0}
-        for s in skus if sku_stock.get(s["sku_id"], 0) > 0
-    ]
+
+    if not is_bulk:
+        sku_rows = [
+            {"SKU": s["sku_id"], "Name": s["name"],
+             "In Stock": sku_stock.get(s["sku_id"], 0),
+             "Selling Price (₹)": sku_prices.get(s["sku_id"], 0.0),
+             "Ship Qty": 0}
+            for s in skus if sku_stock.get(s["sku_id"], 0) > 0
+        ]
+    else:
+        sku_rows = [
+            {"SKU": s["sku_id"], "Name": s["name"],
+             "In Stock": sku_stock.get(s["sku_id"], 0), "Ship Qty": 0}
+            for s in skus if sku_stock.get(s["sku_id"], 0) > 0
+        ]
 
     if not sku_rows:
         st.info("No SKUs currently in stock at Own WH.")
         st.stop()
 
-    edited = st.data_editor(
-        pd.DataFrame(sku_rows),
-        column_config={
-            "SKU":      st.column_config.TextColumn(disabled=True),
-            "Name":     st.column_config.TextColumn(disabled=True),
-            "In Stock": st.column_config.NumberColumn(disabled=True),
-            "Ship Qty": st.column_config.NumberColumn(min_value=0, step=1),
-        },
-        hide_index=True, width="stretch",
-        key=f"ship_table_{ch_label}_{st.session_state.ship_key}",
-    )
+    if not is_bulk:
+        edited = st.data_editor(
+            pd.DataFrame(sku_rows),
+            column_config={
+                "SKU":                st.column_config.TextColumn(disabled=True),
+                "Name":               st.column_config.TextColumn(disabled=True),
+                "In Stock":           st.column_config.NumberColumn(disabled=True),
+                "Selling Price (₹)":  st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.2f"),
+                "Ship Qty":           st.column_config.NumberColumn(min_value=0, step=1),
+            },
+            hide_index=True, width="stretch",
+            key=f"ship_table_{ch_label}_{st.session_state.ship_key}",
+        )
+    else:
+        edited = st.data_editor(
+            pd.DataFrame(sku_rows),
+            column_config={
+                "SKU":      st.column_config.TextColumn(disabled=True),
+                "Name":     st.column_config.TextColumn(disabled=True),
+                "In Stock": st.column_config.NumberColumn(disabled=True),
+                "Ship Qty": st.column_config.NumberColumn(min_value=0, step=1),
+            },
+            hide_index=True, width="stretch",
+            key=f"ship_table_{ch_label}_{st.session_state.ship_key}",
+        )
 
     to_ship = edited[edited["Ship Qty"] > 0]
 
     if st.button("Ship Out ✅", type="primary"):
         if ref_required and not reference.strip():
             st.error(f"❌ {ref_label} is required for bulk shipments.")
+        elif not is_bulk and len(to_ship) > 0 and (to_ship["Selling Price (₹)"] == 0).any():
+            st.error("❌ Selling price cannot be 0 for drop-ship orders. Check highlighted rows.")
         elif len(to_ship) == 0:
             st.error("❌ Enter at least one quantity to ship.")
         else:
             ref_str = reference.strip()
             if blk_wh_label:
                 ref_str = f"{ref_str} | WH: {blk_wh_label}".strip(" |")
+            ship_rows = []
+            for _, r in to_ship.iterrows():
+                row = {"sku": r["SKU"], "qty": int(r["Ship Qty"]), "in_stock": int(r["In Stock"])}
+                if not is_bulk:
+                    row["selling_price"] = float(r["Selling Price (₹)"])
+                ship_rows.append(row)
             st.session_state.shipping     = True
             st.session_state.pending_ship = {
-                "ch_label":   ch_label,
-                "channel_id": ch_data["channel_id"],
-                "ref_str":    ref_str,
-                "notes":      notes,
-                "to_ship":    [{"sku": r["SKU"], "qty": int(r["Ship Qty"]),
-                                "in_stock": int(r["In Stock"])}
-                               for _, r in to_ship.iterrows()],
+                "ch_label":    ch_label,
+                "channel_id":  ch_data["channel_id"],
+                "ref_str":     ref_str,
+                "notes":       notes,
+                "is_dropship": not is_bulk,
+                "city":        city,
+                "to_ship":     ship_rows,
             }
             st.rerun()
 
