@@ -9,7 +9,7 @@ import pandas as pd
 from datetime import date
 from tcb.db import get_client
 from tcb.inventory import (
-    get_item_stock, get_sku_stock, get_assemblable,
+    get_item_stock, get_sku_stock, get_assemblable, get_reorder_alerts,
     check_assembly_feasibility, assemble_sku, dispatch_sku, receive_item,
     return_sku, return_item, writeoff_sku, writeoff_item,
 )
@@ -102,16 +102,34 @@ with tab_stock:
         st.cache_data.clear()
 
     item_stock = get_item_stock()
+    alerts     = get_reorder_alerts()
 
-    alerts = [
-        (item_id, s) for item_id, s in item_stock.items()
-        if s["reorder_point"] > 0 and s["qty"] <= s["reorder_point"]
-    ]
     if alerts:
-        st.subheader("⚠️ Reorder Alerts")
-        for _, s in sorted(alerts, key=lambda x: x[1]["qty"]):
-            icon = "🔴" if s["qty"] == 0 else "🟡"
-            st.warning(f"{icon} **{s['name']}** — {s['qty']} {s['unit']}s left (reorder at {s['reorder_point']})")
+        critical = [s for s in alerts if s["qty"] == 0]
+        low      = [s for s in alerts if s["qty"] > 0]
+        total    = len(alerts)
+        st.subheader(f"⚠️ Reorder Alerts ({total} item{'s' if total > 1 else ''})")
+
+        def _alert_rows(items_list):
+            rows = []
+            for s in sorted(items_list, key=lambda x: x["lead_time_days"], reverse=True):
+                rows.append({
+                    "Item":       s["name"],
+                    "Supplier":   s["supplier"] or "—",
+                    "Stock":      s["qty"],
+                    "Reorder At": s["reorder_point"],
+                    "Min Order":  s["moq"],
+                    "Lead Time":  f"{s['lead_time_days']}d",
+                })
+            return pd.DataFrame(rows)
+
+        if critical:
+            st.markdown(f"**🔴 Out of stock ({len(critical)})** — order immediately")
+            st.dataframe(_alert_rows(critical), hide_index=True, use_container_width=True)
+        if low:
+            st.markdown(f"**🟡 Below reorder point ({len(low)})**")
+            st.dataframe(_alert_rows(low), hide_index=True, use_container_width=True)
+        st.caption("Min Order = MOQ from supplier. Sorted by lead time — longest first.")
         st.divider()
 
     st.subheader("Assembled SKU Stock")
@@ -139,14 +157,20 @@ with tab_stock:
     st.subheader("Loose Item Stock")
     if item_stock:
         rows = []
-        for item_id, s in sorted(item_stock.items(), key=lambda x: x[1]["name"]):
+        for s in sorted(item_stock.values(), key=lambda x: x["name"]):
             status = (
                 "🔴 OUT" if s["qty"] == 0 else
                 "🟡 LOW" if s["qty"] <= s["reorder_point"] and s["reorder_point"] > 0 else
                 "🟢"
             )
-            rows.append({"Item": s["name"], "Qty": s["qty"], "Unit": s["unit"], "Status": status})
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            rows.append({
+                "Item":   s["name"],
+                "Qty":    s["qty"],
+                "Unit":   s["unit"],
+                "ROP":    s["reorder_point"] if s["reorder_point"] > 0 else "—",
+                "Status": status,
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
         st.info("No item stock found.")
 

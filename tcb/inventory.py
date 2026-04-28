@@ -26,18 +26,66 @@ def get_item_stock():
     db = get_client()
     own_wh_id = _own_wh_id()
     rows = (db.table("inventory")
-              .select("item_id, quantity_on_hand, items(item_code, name, unit, reorder_point)")
+              .select("item_id, quantity_on_hand, items(item_code, name, unit, reorder_point, moq, lead_time_days, supplier_id, suppliers(name))")
               .eq("channel_id", own_wh_id)
               .execute().data)
-    agg = defaultdict(lambda: {"item_code": "", "name": "", "unit": "", "reorder_point": 0, "qty": 0})
+    agg = defaultdict(lambda: {
+        "item_code": "", "name": "", "unit": "", "qty": 0,
+        "reorder_point": 0, "moq": 1, "lead_time_days": 7, "supplier": "",
+    })
     for r in rows:
         it = r["items"]
-        agg[r["item_id"]]["item_code"]     = it["item_code"]
-        agg[r["item_id"]]["name"]          = it["name"]
-        agg[r["item_id"]]["unit"]          = it["unit"]
-        agg[r["item_id"]]["reorder_point"] = it["reorder_point"] or 0
-        agg[r["item_id"]]["qty"]          += r["quantity_on_hand"]
+        agg[r["item_id"]]["item_code"]      = it["item_code"]
+        agg[r["item_id"]]["name"]           = it["name"]
+        agg[r["item_id"]]["unit"]           = it["unit"]
+        agg[r["item_id"]]["reorder_point"]  = it["reorder_point"] or 0
+        agg[r["item_id"]]["moq"]            = it["moq"] or 1
+        agg[r["item_id"]]["lead_time_days"] = it["lead_time_days"] or 7
+        agg[r["item_id"]]["supplier"]       = (it.get("suppliers") or {}).get("name", "")
+        agg[r["item_id"]]["qty"]           += r["quantity_on_hand"]
     return dict(agg)  # item_id → {...}
+
+
+def get_reorder_alerts():
+    """
+    All items where stock < reorder_point, including items with zero stock
+    (no inventory row yet). Queries items table directly then overlays stock.
+    """
+    db = get_client()
+    own_wh_id = _own_wh_id()
+
+    # All items with a meaningful ROP
+    all_items = (db.table("items")
+                   .select("item_id, item_code, name, unit, reorder_point, moq, lead_time_days, suppliers(name)")
+                   .gt("reorder_point", 0)
+                   .eq("is_active", True)
+                   .execute().data)
+
+    # Current stock summed per item at OWN_WH
+    inv_rows = (db.table("inventory")
+                  .select("item_id, quantity_on_hand")
+                  .eq("channel_id", own_wh_id)
+                  .execute().data)
+    stock_map = {}
+    for r in inv_rows:
+        stock_map[r["item_id"]] = stock_map.get(r["item_id"], 0) + r["quantity_on_hand"]
+
+    alerts = []
+    for it in all_items:
+        qty = stock_map.get(it["item_id"], 0)
+        rop = it["reorder_point"] or 0
+        if qty < rop:
+            alerts.append({
+                "item_code":      it["item_code"],
+                "name":           it["name"],
+                "unit":           it["unit"],
+                "qty":            qty,
+                "reorder_point":  rop,
+                "moq":            it["moq"] or 1,
+                "lead_time_days": it["lead_time_days"] or 7,
+                "supplier":       (it.get("suppliers") or {}).get("name", ""),
+            })
+    return alerts
 
 
 def get_sku_stock():
