@@ -9,7 +9,7 @@ import pandas as pd
 from datetime import date
 from tcb.db import get_client
 from tcb.inventory import (
-    get_item_stock, get_sku_stock, get_assemblable, get_reorder_alerts,
+    get_item_stock, get_sku_stock, get_assemblable,
     check_assembly_feasibility, assemble_sku, dispatch_sku, receive_item,
     return_sku, return_item, writeoff_sku, writeoff_item,
 )
@@ -87,6 +87,37 @@ def load_blinkit_whs():
              .eq("stock_sent", True)\
              .order("name").execute().data
 
+@st.cache_data(ttl=60)
+def load_reorder_alerts():
+    own_wh = db.table("channels").select("channel_id").eq("code", "OWN_WH").single().execute().data
+    own_wh_id = own_wh["channel_id"]
+    all_items = (db.table("items")
+                   .select("item_id, item_code, name, unit, reorder_point, moq, lead_time_days, suppliers(name)")
+                   .gt("reorder_point", 0)
+                   .eq("is_active", True)
+                   .execute().data)
+    inv_rows = (db.table("inventory")
+                  .select("item_id, quantity_on_hand")
+                  .eq("channel_id", own_wh_id)
+                  .execute().data)
+    stock_map = {}
+    for r in inv_rows:
+        stock_map[r["item_id"]] = stock_map.get(r["item_id"], 0) + r["quantity_on_hand"]
+    alerts = []
+    for it in all_items:
+        qty = stock_map.get(it["item_id"], 0)
+        rop = it["reorder_point"] or 0
+        if qty < rop:
+            alerts.append({
+                "name":           it["name"],
+                "qty":            qty,
+                "reorder_point":  rop,
+                "moq":            it["moq"] or 1,
+                "lead_time_days": it["lead_time_days"] or 7,
+                "supplier":       (it.get("suppliers") or {}).get("name", ""),
+            })
+    return alerts
+
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 
@@ -102,7 +133,7 @@ with tab_stock:
         st.cache_data.clear()
 
     item_stock = get_item_stock()
-    alerts     = get_reorder_alerts()
+    alerts     = load_reorder_alerts()
 
     if alerts:
         n_critical = sum(1 for s in alerts if s["qty"] == 0)
@@ -165,7 +196,7 @@ with tab_reorder:
     if st.button("🔄 Refresh", key="refresh_reorder"):
         st.cache_data.clear()
 
-    ro_alerts = get_reorder_alerts()
+    ro_alerts = load_reorder_alerts()
 
     if not ro_alerts:
         st.success("All items are above reorder point. Nothing to order.")
