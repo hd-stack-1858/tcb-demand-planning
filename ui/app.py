@@ -90,8 +90,8 @@ def load_blinkit_whs():
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 
-tab_stock, tab_assemble, tab_ship, tab_receive, tab_returns = st.tabs(
-    ["📊 Stock", "🔧 Assemble", "🚚 Ship Out", "📥 Receive Stock", "↩️ Returns"]
+tab_stock, tab_reorder, tab_assemble, tab_ship, tab_receive, tab_returns = st.tabs(
+    ["📊 Stock", "🔔 Reorder", "🔧 Assemble", "🚚 Ship Out", "📥 Receive Stock", "↩️ Returns"]
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -105,31 +105,14 @@ with tab_stock:
     alerts     = get_reorder_alerts()
 
     if alerts:
-        critical = [s for s in alerts if s["qty"] == 0]
-        low      = [s for s in alerts if s["qty"] > 0]
-        total    = len(alerts)
-        st.subheader(f"⚠️ Reorder Alerts ({total} item{'s' if total > 1 else ''})")
-
-        def _alert_rows(items_list):
-            rows = []
-            for s in sorted(items_list, key=lambda x: x["lead_time_days"], reverse=True):
-                rows.append({
-                    "Item":       s["name"],
-                    "Supplier":   s["supplier"] or "—",
-                    "Stock":      s["qty"],
-                    "Reorder At": s["reorder_point"],
-                    "Min Order":  s["moq"],
-                    "Lead Time":  f"{s['lead_time_days']}d",
-                })
-            return pd.DataFrame(rows)
-
-        if critical:
-            st.markdown(f"**🔴 Out of stock ({len(critical)})** — order immediately")
-            st.dataframe(_alert_rows(critical), hide_index=True, use_container_width=True)
-        if low:
-            st.markdown(f"**🟡 Below reorder point ({len(low)})**")
-            st.dataframe(_alert_rows(low), hide_index=True, use_container_width=True)
-        st.caption("Min Order = MOQ from supplier. Sorted by lead time — longest first.")
+        n_critical = sum(1 for s in alerts if s["qty"] == 0)
+        n_low      = len(alerts) - n_critical
+        parts = []
+        if n_critical:
+            parts.append(f"🔴 {n_critical} out of stock")
+        if n_low:
+            parts.append(f"🟡 {n_low} below ROP")
+        st.warning(f"**Reorder needed** — {', '.join(parts)}. See **🔔 Reorder** tab.")
         st.divider()
 
     st.subheader("Assembled SKU Stock")
@@ -176,7 +159,52 @@ with tab_stock:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — ASSEMBLE
+# TAB 2 — REORDER
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_reorder:
+    if st.button("🔄 Refresh", key="refresh_reorder"):
+        st.cache_data.clear()
+
+    ro_alerts = get_reorder_alerts()
+
+    if not ro_alerts:
+        st.success("All items are above reorder point. Nothing to order.")
+    else:
+        n_crit = sum(1 for s in ro_alerts if s["qty"] == 0)
+        n_low  = len(ro_alerts) - n_crit
+        st.caption(f"{len(ro_alerts)} items below reorder point — {n_crit} out of stock, {n_low} running low")
+
+        rows = []
+        for s in sorted(ro_alerts, key=lambda x: (x["qty"] > 0, -x["lead_time_days"])):
+            rows.append({
+                "Status":      "🔴 OUT" if s["qty"] == 0 else "🟡 LOW",
+                "Item":        s["name"],
+                "Supplier":    s["supplier"] or "—",
+                "Stock":       s["qty"],
+                "Reorder At":  s["reorder_point"],
+                "Min Order":   s["moq"],
+                "Lead Time":   f"{s['lead_time_days']}d",
+            })
+
+        st.dataframe(
+            pd.DataFrame(rows),
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Status":     st.column_config.TextColumn(width="small"),
+                "Item":       st.column_config.TextColumn(width="large"),
+                "Supplier":   st.column_config.TextColumn(width="medium"),
+                "Stock":      st.column_config.NumberColumn(width="small"),
+                "Reorder At": st.column_config.NumberColumn(width="small"),
+                "Min Order":  st.column_config.NumberColumn(width="small"),
+                "Lead Time":  st.column_config.TextColumn(width="small"),
+            },
+        )
+        st.caption("Sorted: out-of-stock first, then by lead time (longest first). Min Order = supplier MOQ.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — ASSEMBLE
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_assemble:
     st.subheader("Pack / Assemble SKUs")
