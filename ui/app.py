@@ -31,15 +31,29 @@ db = get_client()
 
 # ── Session state init ─────────────────────────────────────────────────────────
 for _k, _v in [
-    ("assemble_key",    0),
+    ("assemble_key",     0),
     ("assemble_success", None),
-    ("ship_key",        0),
-    ("ship_messages",   None),
-    ("wo_key",          0),
-    ("wo_messages",     None),
-    ("ret_key",         0),
-    ("ret_messages",    None),
-    ("recv_success",    None),
+    ("assemble_error",   None),
+    ("assembling",       False),
+    ("pending_assembly", None),
+    ("ship_key",         0),
+    ("ship_success",     None),
+    ("shipping",         False),
+    ("pending_ship",     None),
+    ("wo_key",           0),
+    ("wo_success",       None),
+    ("writing_off",      False),
+    ("pending_wo",       None),
+    ("ret_key",          0),
+    ("ret_success",      None),
+    ("returning",        False),
+    ("pending_ret",      None),
+    ("recv_form_key",    0),
+    ("recv_item_prev",   None),
+    ("receiving",        False),
+    ("pending_receipt",  None),
+    ("recv_success",     None),
+    ("recv_error",       None),
 ]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -89,7 +103,6 @@ with tab_stock:
 
     item_stock = get_item_stock()
 
-    # ── Low stock alerts ───────────────────────────────────────────────────────
     alerts = [
         (item_id, s) for item_id, s in item_stock.items()
         if s["reorder_point"] > 0 and s["qty"] <= s["reorder_point"]
@@ -101,7 +114,6 @@ with tab_stock:
             st.warning(f"{icon} **{s['name']}** — {s['qty']} {s['unit']}s left (reorder at {s['reorder_point']})")
         st.divider()
 
-    # ── SKU stock + assemblable ───────────────────────────────────────────────
     st.subheader("Assembled SKU Stock")
     sku_stock   = {r["sku_id"]: r for r in get_sku_stock()}
     assemblable = {r["sku_id"]: r["assemblable"] for r in get_assemblable()}
@@ -120,11 +132,10 @@ with tab_stock:
             "Can Pack": can_make,
             "Total":    on_hand + can_make,
         })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
     st.divider()
 
-    # ── Item stock ────────────────────────────────────────────────────────────
     st.subheader("Loose Item Stock")
     if item_stock:
         rows = []
@@ -134,13 +145,8 @@ with tab_stock:
                 "🟡 LOW" if s["qty"] <= s["reorder_point"] and s["reorder_point"] > 0 else
                 "🟢"
             )
-            rows.append({
-                "Item":   s["name"],
-                "Qty":    s["qty"],
-                "Unit":   s["unit"],
-                "Status": status,
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            rows.append({"Item": s["name"], "Qty": s["qty"], "Unit": s["unit"], "Status": status})
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     else:
         st.info("No item stock found.")
 
@@ -151,9 +157,43 @@ with tab_stock:
 with tab_assemble:
     st.subheader("Pack / Assemble SKUs")
 
+    # ── Assembling state: form hidden, assembly running ───────────────────────
+    if st.session_state.assembling:
+        pending = st.session_state.pending_assembly
+        with st.status(
+            f"Assembling {pending['qty']}× {pending['sku_id']}...", expanded=True
+        ) as status:
+            st.write("Consuming loose stock (FIFO)...")
+            try:
+                assemble_sku(pending["sku_id"], pending["qty"],
+                             notes=pending["notes"], created_by="app")
+                status.update(
+                    label=f"Packed {pending['qty']}× {pending['sku_id']}",
+                    state="complete", expanded=False,
+                )
+                st.session_state.assemble_success = (
+                    f"✅ Packed **{pending['qty']}× {pending['sku_id']}**"
+                )
+            except Exception as e:
+                status.update(label="Assembly failed", state="error", expanded=True)
+                st.session_state.assemble_error = str(e)
+
+        st.session_state.assembling       = False
+        st.session_state.pending_assembly = None
+        st.session_state.assemble_key    += 1
+        st.cache_data.clear()
+        st.rerun()
+
+    # ── Normal state ──────────────────────────────────────────────────────────
     if st.session_state.assemble_success:
         st.success(st.session_state.assemble_success)
+        if st.button("Dismiss ✕", key="dismiss_assemble"):
+            pass
         st.session_state.assemble_success = None
+
+    if st.session_state.assemble_error:
+        st.error(f"Assembly failed: {st.session_state.assemble_error}")
+        st.session_state.assemble_error = None
 
     skus     = load_skus()
     sku_opts = {f"{s['sku_id']} — {s['name']}": s["sku_id"] for s in skus}
@@ -166,34 +206,21 @@ with tab_assemble:
 
     if submitted:
         sku_id = sku_opts[sku_label]
-
         with st.spinner("Checking stock..."):
             feasible, detail = check_assembly_feasibility(sku_id, qty)
 
         st.write("**BOM Check:**")
-        check_rows = []
-        for d in detail:
-            check_rows.append({
-                "Item":      d["name"],
-                "Unit":      d["unit"],
-                "Need":      d["needed"],
-                "Available": d["available"],
-                "✓":         "✅" if d["ok"] else "❌",
-            })
-        st.dataframe(pd.DataFrame(check_rows), use_container_width=True, hide_index=True)
+        check_rows = [
+            {"Item": d["name"], "Unit": d["unit"], "Need": d["needed"],
+             "Available": d["available"], "✓": "✅" if d["ok"] else "❌"}
+            for d in detail
+        ]
+        st.dataframe(pd.DataFrame(check_rows), width="stretch", hide_index=True)
 
         if feasible:
-            with st.spinner("Assembling..."):
-                try:
-                    unit_cogs = assemble_sku(sku_id, qty, notes=notes, created_by="app")
-                    st.session_state.assemble_success = (
-                        f"✅ Packed **{qty}× {sku_id}** — Unit COGS: ₹{unit_cogs:,.2f}"
-                    )
-                    st.session_state.assemble_key += 1
-                    st.cache_data.clear()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {e}")
+            st.session_state.assembling       = True
+            st.session_state.pending_assembly = {"sku_id": sku_id, "qty": qty, "notes": notes}
+            st.rerun()
         else:
             st.error("❌ Cannot pack — insufficient stock for highlighted items.")
 
@@ -204,23 +231,83 @@ with tab_assemble:
 with tab_ship:
     st.subheader("Ship Out")
 
-    # Display messages carried over from a successful previous submission
-    if st.session_state.ship_messages:
-        msgs = st.session_state.ship_messages
-        for msg in msgs.get("successes", []):
-            st.success(msg)
-        for msg in msgs.get("errors", []):
+    # ── Shipping (dispatch) state ─────────────────────────────────────────────
+    if st.session_state.shipping:
+        p = st.session_state.pending_ship
+        errors = []
+        with st.status(f"Dispatching to {p['ch_label']}...", expanded=True) as status:
+            for row in p["to_ship"]:
+                try:
+                    dispatch_sku(row["sku"], row["qty"], p["channel_id"],
+                                 reference=p["ref_str"], notes=p["notes"], created_by="app")
+                    st.write(f"Dispatched {row['qty']}× {row['sku']}")
+                except Exception as e:
+                    errors.append(f"❌ {row['sku']}: {e}")
+            status.update(
+                label="Shipment recorded" if not errors else "Completed with errors",
+                state="complete" if not errors else "error",
+            )
+        for msg in errors:
             st.error(msg)
-        st.session_state.ship_messages = None
+        if len(errors) < len(p["to_ship"]):
+            skus_str = ", ".join(f"{r['qty']}× {r['sku']}" for r in p["to_ship"])
+            st.session_state.ship_success = f"✅ Dispatched to **{p['ch_label']}** — {skus_str}"
+        st.session_state.shipping     = False
+        st.session_state.pending_ship = None
+        st.session_state.ship_key    += 1
+        st.cache_data.clear()
+        st.rerun()
 
-    if st.session_state.wo_messages:
-        msgs = st.session_state.wo_messages
-        for msg in msgs.get("successes", []):
-            st.success(msg)
-        for msg in msgs.get("errors", []):
+    # ── Write-off state ───────────────────────────────────────────────────────
+    if st.session_state.writing_off:
+        p = st.session_state.pending_wo
+        errors = []
+        with st.status("Processing write-off...", expanded=True) as status:
+            for row in p["to_wo"]:
+                try:
+                    if p["level"] == "sku":
+                        writeoff_sku(row["sku"], row["qty"],
+                                     reason=p["reason"], notes=p["wo_notes"], created_by="app")
+                        st.write(f"Written off {row['qty']}× {row['sku']}")
+                    else:
+                        writeoff_item(row["item_id"], row["qty"],
+                                      reason=p["reason"], notes=p["wo_notes"], created_by="app")
+                        st.write(f"Written off {row['qty']}× {row['item_name']}")
+                except Exception as e:
+                    name = row.get("sku", row.get("item_name", "?"))
+                    errors.append(f"❌ {name}: {e}")
+            status.update(
+                label="Done" if not errors else "Completed with errors",
+                state="complete" if not errors else "error",
+            )
+        for msg in errors:
             st.error(msg)
-        st.session_state.wo_messages = None
+        if not errors:
+            if p["level"] == "sku":
+                wo_str = ", ".join(f"{r['qty']}× {r['sku']}" for r in p["to_wo"])
+            else:
+                wo_str = ", ".join(f"{r['qty']}× {r['item_name']}" for r in p["to_wo"])
+            st.session_state.wo_success = f"✅ Written off [{p['reason']}] — {wo_str}"
+        st.session_state.writing_off = False
+        st.session_state.pending_wo  = None
+        st.session_state.wo_key     += 1
+        st.cache_data.clear()
+        st.rerun()
 
+    # ── Success banners ───────────────────────────────────────────────────────
+    if st.session_state.ship_success:
+        st.success(st.session_state.ship_success)
+        if st.button("Dismiss ✕", key="dismiss_ship"):
+            pass
+        st.session_state.ship_success = None
+
+    if st.session_state.wo_success:
+        st.success(st.session_state.wo_success)
+        if st.button("Dismiss ✕", key="dismiss_wo"):
+            pass
+        st.session_state.wo_success = None
+
+    # ── Load data ─────────────────────────────────────────────────────────────
     all_channels = load_channels()
     sku_stock    = {r["sku_id"]: r["qty_on_hand"] for r in get_sku_stock()}
     skus         = load_skus()
@@ -237,11 +324,12 @@ with tab_ship:
         "Shipment type",
         ["🛍️ Drop-ship (end customer order)", "📦 Bulk to partner", "🗑️ Write-off (Lost / Damaged / QC)"],
         horizontal=True,
+        key=f"ship_type_{st.session_state.ship_key}",
     )
     is_bulk     = ship_type.startswith("📦")
     is_writeoff = ship_type.startswith("🗑️")
 
-    # ── Write-off branch ──────────────────────────────────────────────────────
+    # ── Write-off form ────────────────────────────────────────────────────────
     if is_writeoff:
         writeoff_level = st.radio(
             "What are you writing off?",
@@ -270,7 +358,7 @@ with tab_ship:
                         "In Stock":      st.column_config.NumberColumn(disabled=True),
                         "Write-off Qty": st.column_config.NumberColumn(min_value=0, step=1),
                     },
-                    hide_index=True, use_container_width=True,
+                    hide_index=True, width="stretch",
                     key=f"wo_sku_table_{st.session_state.wo_key}",
                 )
                 if st.button("Write Off ✅", type="primary", key="wo_sku_btn"):
@@ -278,27 +366,17 @@ with tab_ship:
                     if len(to_wo) == 0:
                         st.error("Enter at least one quantity.")
                     else:
-                        errors, successes = [], []
-                        with st.spinner("Processing write-off..."):
-                            for _, row in to_wo.iterrows():
-                                try:
-                                    writeoff_sku(row["SKU"], int(row["Write-off Qty"]),
-                                                 reason=reason, notes=wo_notes, created_by="app")
-                                    successes.append(
-                                        f"✅ Written off {int(row['Write-off Qty'])}× {row['SKU']} [{reason}]"
-                                    )
-                                except Exception as e:
-                                    errors.append(f"❌ {row['SKU']}: {e}")
-                        if successes:
-                            st.session_state.wo_messages = {"successes": successes, "errors": errors}
-                            st.session_state.wo_key += 1
-                            st.cache_data.clear()
-                            st.rerun()
-                        for msg in errors:
-                            st.error(msg)
+                        st.session_state.writing_off = True
+                        st.session_state.pending_wo  = {
+                            "level":    "sku",
+                            "reason":   reason,
+                            "wo_notes": wo_notes,
+                            "to_wo":    [{"sku": r["SKU"], "qty": int(r["Write-off Qty"])}
+                                         for _, r in to_wo.iterrows()],
+                        }
+                        st.rerun()
         else:
-            skus_wo     = load_skus()
-            sku_wo_opts = {f"{s['sku_id']} — {s['name']}": s["sku_id"] for s in skus_wo}
+            sku_wo_opts = {f"{s['sku_id']} — {s['name']}": s["sku_id"] for s in load_skus()}
             sku_wo_sel  = st.selectbox("Which SKU do these items belong to?",
                                         list(sku_wo_opts.keys()), key="wo_item_sku")
             sku_wo_id   = sku_wo_opts[sku_wo_sel]
@@ -315,18 +393,14 @@ with tab_ship:
                 if stock == 0:
                     continue
                 wo_item_rows.append({
-                    "Code":          b["items"]["item_code"],
-                    "Item":          b["items"]["name"],
-                    "Unit":          b["items"]["unit"],
-                    "In Stock":      stock,
-                    "Write-off Qty": 0,
-                    "_item_id":      item_id,
+                    "Code": b["items"]["item_code"], "Item": b["items"]["name"],
+                    "Unit": b["items"]["unit"], "In Stock": stock,
+                    "Write-off Qty": 0, "_item_id": item_id,
                 })
 
             if not wo_item_rows:
                 st.info("No stock found for items in this SKU.")
             else:
-                display_cols = ["Code", "Item", "Unit", "In Stock", "Write-off Qty"]
                 wo_item_edited = st.data_editor(
                     pd.DataFrame(wo_item_rows),
                     column_config={
@@ -337,46 +411,44 @@ with tab_ship:
                         "Write-off Qty": st.column_config.NumberColumn(min_value=0, step=1),
                         "_item_id":      st.column_config.NumberColumn(disabled=True),
                     },
-                    hide_index=True, use_container_width=True,
+                    hide_index=True, width="stretch",
                     key=f"wo_item_table_{st.session_state.wo_key}",
-                    column_order=display_cols,
+                    column_order=["Code", "Item", "Unit", "In Stock", "Write-off Qty"],
                 )
                 if st.button("Write Off ✅", type="primary", key="wo_item_btn"):
                     to_wo = wo_item_edited[wo_item_edited["Write-off Qty"] > 0]
                     if len(to_wo) == 0:
                         st.error("Enter at least one quantity.")
                     else:
-                        errors, successes = [], []
-                        with st.spinner("Processing write-off..."):
-                            for _, row in to_wo.iterrows():
-                                try:
-                                    writeoff_item(int(row["_item_id"]), int(row["Write-off Qty"]),
-                                                  reason=reason, notes=wo_notes, created_by="app")
-                                    successes.append(
-                                        f"✅ Written off {int(row['Write-off Qty'])}× {row['Item']} [{reason}]"
-                                    )
-                                except Exception as e:
-                                    errors.append(f"❌ {row['Item']}: {e}")
-                        if successes:
-                            st.session_state.wo_messages = {"successes": successes, "errors": errors}
-                            st.session_state.wo_key += 1
-                            st.cache_data.clear()
-                            st.rerun()
-                        for msg in errors:
-                            st.error(msg)
+                        st.session_state.writing_off = True
+                        st.session_state.pending_wo  = {
+                            "level":    "item",
+                            "reason":   reason,
+                            "wo_notes": wo_notes,
+                            "to_wo":    [{"item_id": int(r["_item_id"]), "item_name": r["Item"],
+                                          "qty": int(r["Write-off Qty"])}
+                                         for _, r in to_wo.iterrows()],
+                        }
+                        st.rerun()
         st.stop()
 
     # ── Step 2: channel ───────────────────────────────────────────────────────
     ch_list  = bulk_channels if is_bulk else dropship_channels
     ch_opts  = {c["name"]: c for c in ch_list}
-    ch_label = st.selectbox("Partner / Channel", list(ch_opts.keys()))
-    ch_data  = ch_opts[ch_label]
+    ch_label = st.selectbox(
+        "Partner / Channel", list(ch_opts.keys()),
+        key=f"ship_channel_{st.session_state.ship_key}",
+    )
+    ch_data = ch_opts[ch_label]
 
     # ── Step 3: Blinkit WH ────────────────────────────────────────────────────
     blk_wh_label = None
     if ch_data["code"] == "BLK" and blinkit_whs:
         blk_opts     = {w["name"]: w for w in blinkit_whs}
-        blk_wh_label = st.selectbox("Blinkit Warehouse", list(blk_opts.keys()))
+        blk_wh_label = st.selectbox(
+            "Blinkit Warehouse", list(blk_opts.keys()),
+            key=f"ship_blk_wh_{st.session_state.ship_key}",
+        )
 
     # ── Step 4: reference doc ─────────────────────────────────────────────────
     if is_bulk:
@@ -391,19 +463,11 @@ with tab_ship:
 
     # ── Step 5: SKU qty table ─────────────────────────────────────────────────
     st.markdown("**Enter quantities to ship:**")
-
-    sku_rows = []
-    for s in skus:
-        sid   = s["sku_id"]
-        stock = sku_stock.get(sid, 0)
-        if stock == 0:
-            continue
-        sku_rows.append({
-            "SKU":      sid,
-            "Name":     s["name"],
-            "In Stock": stock,
-            "Ship Qty": 0,
-        })
+    sku_rows = [
+        {"SKU": s["sku_id"], "Name": s["name"],
+         "In Stock": sku_stock.get(s["sku_id"], 0), "Ship Qty": 0}
+        for s in skus if sku_stock.get(s["sku_id"], 0) > 0
+    ]
 
     if not sku_rows:
         st.info("No SKUs currently in stock at Own WH.")
@@ -417,8 +481,7 @@ with tab_ship:
             "In Stock": st.column_config.NumberColumn(disabled=True),
             "Ship Qty": st.column_config.NumberColumn(min_value=0, step=1),
         },
-        hide_index=True,
-        use_container_width=True,
+        hide_index=True, width="stretch",
         key=f"ship_table_{ch_label}_{st.session_state.ship_key}",
     )
 
@@ -433,31 +496,17 @@ with tab_ship:
             ref_str = reference.strip()
             if blk_wh_label:
                 ref_str = f"{ref_str} | WH: {blk_wh_label}".strip(" |")
-
-            errors, successes = [], []
-            with st.spinner("Processing shipment..."):
-                for _, row in to_ship.iterrows():
-                    sid = row["SKU"]
-                    qty = int(row["Ship Qty"])
-                    if qty > row["In Stock"]:
-                        errors.append(f"❌ {sid}: only {int(row['In Stock'])} in stock, cannot ship {qty}")
-                        continue
-                    try:
-                        txn_type = dispatch_sku(sid, qty, ch_data["channel_id"],
-                                                reference=ref_str, notes=notes, created_by="app")
-                        verb = "Transferred" if txn_type == "TRANSFER_OUT" else "Dispatched"
-                        successes.append(f"✅ {verb} {qty}× {sid}")
-                    except Exception as e:
-                        errors.append(f"❌ {sid}: {e}")
-
-            if successes:
-                st.session_state.ship_messages = {"successes": successes, "errors": errors}
-                st.session_state.ship_key += 1
-                st.cache_data.clear()
-                st.rerun()
-            else:
-                for msg in errors:
-                    st.error(msg)
+            st.session_state.shipping     = True
+            st.session_state.pending_ship = {
+                "ch_label":   ch_label,
+                "channel_id": ch_data["channel_id"],
+                "ref_str":    ref_str,
+                "notes":      notes,
+                "to_ship":    [{"sku": r["SKU"], "qty": int(r["Ship Qty"]),
+                                "in_stock": int(r["In Stock"])}
+                               for _, r in to_ship.iterrows()],
+            }
+            st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -467,9 +516,47 @@ with tab_receive:
     st.subheader("Receive Inward Stock")
     st.caption("A new batch is auto-created for each inward date. Same-day inwards for the same item are merged.")
 
+    # ── Receiving state: form hidden, DB write running ────────────────────────
+    if st.session_state.receiving:
+        p = st.session_state.pending_receipt
+        with st.status(
+            f"Recording {p['qty']}× {p['item_name']}...", expanded=True
+        ) as status:
+            st.write(f"Creating batch for {p['item_name']}...")
+            try:
+                batch_id = receive_item(
+                    item_id       = p["item_id"],
+                    qty           = p["qty"],
+                    cost_per_unit = p["cost"],
+                    supplier_id   = p["supplier_id"],
+                    receipt_date  = p["receipt_date"],
+                    notes         = p["notes"],
+                    created_by    = "app",
+                )
+                status.update(label="Receipt recorded", state="complete", expanded=False)
+                st.session_state.recv_success = (
+                    f"✅ Received **{p['qty']}× {p['item_name']}** "
+                    f"@ ₹{p['cost']:.2f}/unit (Batch #{batch_id})"
+                )
+            except Exception as e:
+                status.update(label="Failed", state="error", expanded=True)
+                st.session_state.recv_error = str(e)
+
+        st.session_state.receiving       = False
+        st.session_state.pending_receipt = None
+        st.session_state.recv_form_key  += 1
+        st.cache_data.clear()
+        st.rerun()
+
+    # ── Normal state ─────────────────────────────────────────────────────────
     if st.session_state.recv_success:
         st.success(st.session_state.recv_success)
+        if st.button("Dismiss ✕", key="dismiss_recv"):
+            pass
         st.session_state.recv_success = None
+    if st.session_state.recv_error:
+        st.error(f"Error: {st.session_state.recv_error}")
+        st.session_state.recv_error = None
 
     items     = load_items()
     suppliers = load_suppliers()
@@ -477,25 +564,24 @@ with tab_receive:
     item_opts     = {f"{i['item_code']} — {i['name']}": i for i in items}
     supplier_opts = {"— (not known yet)": None} | {s["name"]: s["supplier_id"] for s in suppliers}
 
-    # Item selectbox lives OUTSIDE the form so selecting it re-runs and pre-populates cost
     item_label = st.selectbox("Item received", list(item_opts.keys()), key="recv_item_sel")
     item_data  = item_opts[item_label]
 
-    # Fetch the most recent batch cost for this item
+    if st.session_state.recv_item_prev is not None and item_label != st.session_state.recv_item_prev:
+        st.session_state.recv_form_key += 1
+    st.session_state.recv_item_prev = item_label
+
     latest_batch = (db.table("item_batches")
                       .select("cost_per_unit, received_date")
                       .eq("item_id", item_data["item_id"])
+                      .gt("cost_per_unit", 0)
                       .order("received_date", desc=True)
                       .limit(1).execute().data)
-    latest_cost = (
-        float(latest_batch[0]["cost_per_unit"])
-        if latest_batch and latest_batch[0]["cost_per_unit"] is not None
-        else 0.0
-    )
+    latest_cost = float(latest_batch[0]["cost_per_unit"]) if latest_batch else 0.0
     if latest_cost > 0:
         st.caption(f"Last recorded cost: ₹{latest_cost:.2f}/unit — edit below if price has changed")
 
-    with st.form("receive_form"):
+    with st.form(f"receive_form_{st.session_state.recv_form_key}", enter_to_submit=False):
         qty           = st.number_input("Quantity received", min_value=1, value=1, step=1)
         cost          = st.number_input("Cost per unit (₹)", min_value=0.0, value=latest_cost,
                                         step=0.5, format="%.2f")
@@ -506,26 +592,17 @@ with tab_receive:
 
     if submitted:
         supplier_id = supplier_opts[supplier_name]
-        with st.spinner("Recording receipt..."):
-            try:
-                batch_id = receive_item(
-                    item_id       = item_data["item_id"],
-                    qty           = qty,
-                    cost_per_unit = cost,
-                    supplier_id   = supplier_id,
-                    receipt_date  = recv_date,
-                    notes         = notes,
-                    created_by    = "app",
-                )
-                st.session_state.recv_success = (
-                    f"✅ Received **{qty}× {item_data['name']}** "
-                    f"@ ₹{cost:.2f}/unit on {recv_date.strftime('%d %b %Y')} "
-                    f"(Batch #{batch_id})"
-                )
-                st.cache_data.clear()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error: {e}")
+        st.session_state.receiving = True
+        st.session_state.pending_receipt = {
+            "item_id":      item_data["item_id"],
+            "item_name":    item_data["name"],
+            "qty":          qty,
+            "cost":         cost,
+            "supplier_id":  supplier_id,
+            "receipt_date": recv_date,
+            "notes":        notes,
+        }
+        st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -535,14 +612,59 @@ with tab_returns:
     st.subheader("Inward Returns")
     st.caption("Record stock coming back from any partner. Only inward what is reusable/in good condition.")
 
-    if st.session_state.ret_messages:
-        msgs = st.session_state.ret_messages
-        for msg in msgs.get("successes", []):
-            st.success(msg)
-        for msg in msgs.get("errors", []):
+    # ── Returning state ───────────────────────────────────────────────────────
+    if st.session_state.returning:
+        p = st.session_state.pending_ret
+        errors = []
+        with st.status(f"Processing return from {p['ch_ret_label']}...", expanded=True) as status:
+            for row in p["to_ret"]:
+                try:
+                    if p["level"] == "sku":
+                        return_sku(
+                            sku_id          = row["sku"],
+                            qty             = row["qty"],
+                            from_channel_id = p["ch_ret_channel_id"],
+                            notes           = p["full_notes"],
+                            created_by      = "app",
+                        )
+                        st.write(f"Returned {row['qty']}× {row['sku']}")
+                    else:
+                        return_item(
+                            item_id    = row["item_id"],
+                            qty        = row["qty"],
+                            notes      = p["full_notes"],
+                            created_by = "app",
+                        )
+                        st.write(f"Returned {row['qty']}× {row['item_name']}")
+                except Exception as e:
+                    name = row.get("sku", row.get("item_name", "?"))
+                    errors.append(f"❌ {name}: {e}")
+            status.update(
+                label="Return recorded" if not errors else "Completed with errors",
+                state="complete" if not errors else "error",
+            )
+        for msg in errors:
             st.error(msg)
-        st.session_state.ret_messages = None
+        if not errors:
+            if p["level"] == "sku":
+                ret_str = ", ".join(f"{r['qty']}× {r['sku']}" for r in p["to_ret"])
+            else:
+                ret_str = ", ".join(f"{r['qty']}× {r['item_name']}" for r in p["to_ret"])
+            st.session_state.ret_success = f"✅ Returned from **{p['ch_ret_label']}** — {ret_str}"
+        st.session_state.returning    = False
+        st.session_state.pending_ret  = None
+        st.session_state.ret_key     += 1
+        st.cache_data.clear()
+        st.rerun()
 
+    # ── Normal state ─────────────────────────────────────────────────────────
+    if st.session_state.ret_success:
+        st.success(st.session_state.ret_success)
+        if st.button("Dismiss ✕", key="dismiss_ret"):
+            pass
+        st.session_state.ret_success = None
+
+    # ── Form ─────────────────────────────────────────────────────────────────
     all_channels_ret = load_channels()
     ch_ret_opts      = {c["name"]: c for c in all_channels_ret}
     ch_ret_label     = st.selectbox("Returning partner", list(ch_ret_opts.keys()), key="ret_channel")
@@ -558,7 +680,6 @@ with tab_returns:
     ret_reference = st.text_input("Reference (optional)", key=f"ret_ref_{st.session_state.ret_key}")
     ret_notes     = st.text_input("Notes (optional)",     key=f"ret_notes_{st.session_state.ret_key}")
 
-    # ── Full SKU return ───────────────────────────────────────────────────────
     if return_type.startswith("📦"):
         st.markdown("**Enter return qty for each SKU:**")
         skus_ret = load_skus()
@@ -573,7 +694,7 @@ with tab_returns:
                 "Name":       st.column_config.TextColumn(disabled=True),
                 "Return Qty": st.column_config.NumberColumn(min_value=0, step=1),
             },
-            hide_index=True, use_container_width=True,
+            hide_index=True, width="stretch",
             key=f"ret_sku_table_{st.session_state.ret_key}",
         )
         if st.button("Inward Return ✅", type="primary", key="ret_sku_btn"):
@@ -582,35 +703,18 @@ with tab_returns:
                 st.error("Enter at least one quantity.")
             else:
                 full_notes = f"Return from {ch_ret_label} | {ret_reference} | {ret_notes}".strip(" |")
-                errors, successes = [], []
-                with st.spinner("Processing return..."):
-                    for _, row in to_ret.iterrows():
-                        try:
-                            return_sku(
-                                sku_id          = row["SKU"],
-                                qty             = int(row["Return Qty"]),
-                                from_channel_id = ch_ret["channel_id"],
-                                notes           = full_notes,
-                                created_by      = "app",
-                            )
-                            successes.append(
-                                f"✅ {int(row['Return Qty'])}× {row['SKU']} returned to OWN_WH from {ch_ret_label}"
-                            )
-                        except Exception as e:
-                            errors.append(f"❌ {row['SKU']}: {e}")
-                if successes:
-                    st.session_state.ret_messages = {"successes": successes, "errors": errors}
-                    st.session_state.ret_key += 1
-                    st.cache_data.clear()
-                    st.rerun()
-                else:
-                    for msg in errors:
-                        st.error(msg)
-
-    # ── Individual item / component return ────────────────────────────────────
+                st.session_state.returning   = True
+                st.session_state.pending_ret = {
+                    "level":             "sku",
+                    "ch_ret_label":      ch_ret_label,
+                    "ch_ret_channel_id": ch_ret["channel_id"],
+                    "full_notes":        full_notes,
+                    "to_ret":            [{"sku": r["SKU"], "qty": int(r["Return Qty"])}
+                                          for _, r in to_ret.iterrows()],
+                }
+                st.rerun()
     else:
-        skus_ret     = load_skus()
-        sku_ret_opts = {f"{s['sku_id']} — {s['name']}": s["sku_id"] for s in skus_ret}
+        sku_ret_opts = {f"{s['sku_id']} — {s['name']}": s["sku_id"] for s in load_skus()}
         sku_ret_sel  = st.selectbox("Which SKU is this return from?",
                                      list(sku_ret_opts.keys()), key="ret_item_sku")
         sku_ret_id   = sku_ret_opts[sku_ret_sel]
@@ -634,7 +738,7 @@ with tab_returns:
                 "Return Qty": st.column_config.NumberColumn(min_value=0, step=1),
                 "_item_id":   st.column_config.NumberColumn(disabled=True),
             },
-            hide_index=True, use_container_width=True,
+            hide_index=True, width="stretch",
             key=f"ret_item_table_{st.session_state.ret_key}",
             column_order=["Code", "Item", "Unit", "Return Qty"],
         )
@@ -646,26 +750,14 @@ with tab_returns:
                 full_notes = (
                     f"Return from {ch_ret_label} ({sku_ret_id}) | {ret_reference} | {ret_notes}"
                 ).strip(" |")
-                errors, successes = [], []
-                with st.spinner("Processing return..."):
-                    for _, row in to_ret.iterrows():
-                        try:
-                            return_item(
-                                item_id    = int(row["_item_id"]),
-                                qty        = int(row["Return Qty"]),
-                                notes      = full_notes,
-                                created_by = "app",
-                            )
-                            successes.append(
-                                f"✅ {int(row['Return Qty'])}× {row['Item']} returned to stock"
-                            )
-                        except Exception as e:
-                            errors.append(f"❌ {row['Item']}: {e}")
-                if successes:
-                    st.session_state.ret_messages = {"successes": successes, "errors": errors}
-                    st.session_state.ret_key += 1
-                    st.cache_data.clear()
-                    st.rerun()
-                else:
-                    for msg in errors:
-                        st.error(msg)
+                st.session_state.returning   = True
+                st.session_state.pending_ret = {
+                    "level":             "item",
+                    "ch_ret_label":      ch_ret_label,
+                    "ch_ret_channel_id": ch_ret["channel_id"],
+                    "full_notes":        full_notes,
+                    "to_ret":            [{"item_id": int(r["_item_id"]), "item_name": r["Item"],
+                                           "qty": int(r["Return Qty"])}
+                                          for _, r in to_ret.iterrows()],
+                }
+                st.rerun()

@@ -8,7 +8,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-load_dotenv(Path(__file__).parent.parent / ".env")
+# Set TCB_ENV=dev in your shell to use .env.dev instead of .env
+_env_file = ".env.dev" if os.environ.get("TCB_ENV") == "dev" else ".env"
+load_dotenv(Path(__file__).parent.parent / _env_file)
 
 _client: Client | None = None
 

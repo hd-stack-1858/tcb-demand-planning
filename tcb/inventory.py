@@ -3,8 +3,10 @@ Inventory business logic — assembly, dispatch, receive.
 All operations update both the position tables and the audit log.
 """
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from collections import defaultdict
+
+IST = timezone(timedelta(hours=5, minutes=30))
 from tcb.db import get_client
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -14,7 +16,7 @@ def _own_wh_id():
             .eq("code", "OWN_WH").single().execute().data["channel_id"])
 
 def _now():
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(IST).isoformat()
 
 
 # ── Read helpers ──────────────────────────────────────────────────────────────
@@ -116,6 +118,7 @@ def assemble_sku(sku_id, qty_to_pack, notes="", created_by="app"):
     """
     db = get_client()
     own_wh_id = _own_wh_id()
+    qty_to_pack = int(qty_to_pack)
 
     bom = (db.table("bom").select("item_id, quantity_per_sku")
              .eq("sku_id", sku_id).execute().data)
@@ -126,7 +129,7 @@ def assemble_sku(sku_id, qty_to_pack, notes="", created_by="app"):
 
     for b in bom:
         item_id  = b["item_id"]
-        needed   = b["quantity_per_sku"] * qty_to_pack
+        needed   = int(b["quantity_per_sku"]) * qty_to_pack
 
         inv_rows = (db.table("inventory")
                       .select("inv_id, batch_id, quantity_on_hand, "
@@ -182,6 +185,7 @@ def assemble_sku(sku_id, qty_to_pack, notes="", created_by="app"):
                 "type":            "ASSEMBLY",
                 "item_id":         item_id,
                 "sku_id":          sku_id,
+                "batch_id":        p["batch_id"],
                 "from_channel_id": own_wh_id,
                 "quantity":        int(p["consume"]),
                 "reference":       f"ASSEMBLE_{sku_id}",
@@ -225,6 +229,7 @@ def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="ap
     """
     db = get_client()
     own_wh_id = _own_wh_id()
+    qty = int(qty)
 
     ch = (db.table("channels").select("code, business_model, name")
             .eq("channel_id", channel_id).single().execute().data)
@@ -261,6 +266,7 @@ def return_sku(sku_id, qty, from_channel_id, notes="", created_by="app"):
     """Return assembled SKU from a partner back into OWN_WH stock."""
     db = get_client()
     own_wh_id = _own_wh_id()
+    qty = int(qty)
 
     existing = (db.table("sku_inventory").select("sku_inv_id, qty_on_hand")
                   .eq("sku_id", sku_id).eq("channel_id", own_wh_id).execute().data)
@@ -288,12 +294,23 @@ def return_sku(sku_id, qty, from_channel_id, notes="", created_by="app"):
 def return_item(item_id, qty, notes="", created_by="app"):
     """
     Return individual item/packaging component to OWN_WH.
-    Added to today's batch (cost=0 since it's a return, not a purchase).
+    Added to today's batch. Carries last known purchase cost so re-assembled
+    hampers reflect correct COGS.
     """
     db = get_client()
     own_wh_id = _own_wh_id()
+    qty = int(qty)
     today      = date.today()
     batch_code = today.strftime("%Y%m%d")
+
+    # Use last real purchase cost so re-assembled COGS is correct
+    last = (db.table("item_batches")
+              .select("cost_per_unit")
+              .eq("item_id", item_id)
+              .gt("cost_per_unit", 0)
+              .order("received_date", desc=True)
+              .limit(1).execute().data)
+    cost = float(last[0]["cost_per_unit"]) if last else 0.0
 
     existing_batch = (db.table("item_batches")
                         .select("batch_id, qty_received, qty_remaining")
@@ -313,7 +330,7 @@ def return_item(item_id, qty, notes="", created_by="app"):
             "item_id":       item_id,
             "batch_code":    batch_code,
             "received_date": today.strftime("%Y-%m-%d"),
-            "cost_per_unit": 0,
+            "cost_per_unit": cost,
             "qty_received":  qty,
             "qty_remaining": qty,
             "is_current":    True,
@@ -343,6 +360,7 @@ def return_item(item_id, qty, notes="", created_by="app"):
     db.table("inventory_transactions").insert({
         "type":          "SALE_RETURN",
         "item_id":       item_id,
+        "batch_id":      batch_id,
         "to_channel_id": own_wh_id,
         "quantity":      qty,
         "notes":         notes,
@@ -354,6 +372,7 @@ def writeoff_sku(sku_id, qty, reason, notes="", created_by="app"):
     """Write off assembled SKU qty from OWN_WH (Lost / Damaged / QC Reject)."""
     db = get_client()
     own_wh_id = _own_wh_id()
+    qty = int(qty)
 
     inv = (db.table("sku_inventory").select("sku_inv_id, qty_on_hand")
              .eq("sku_id", sku_id).eq("channel_id", own_wh_id).execute().data)
@@ -379,6 +398,7 @@ def writeoff_item(item_id, qty, reason, notes="", created_by="app"):
     """Write off loose item qty from OWN_WH FIFO (Lost / Damaged / QC Reject)."""
     db = get_client()
     own_wh_id = _own_wh_id()
+    qty = int(qty)
 
     inv_rows = (db.table("inventory")
                   .select("inv_id, batch_id, quantity_on_hand, item_batches(received_date)")
@@ -423,6 +443,7 @@ def receive_item(item_id, qty, cost_per_unit, supplier_id=None,
     """
     db = get_client()
     own_wh_id = _own_wh_id()
+    qty = int(qty)
 
     if receipt_date is None:
         receipt_date = date.today()
@@ -480,6 +501,7 @@ def receive_item(item_id, qty, cost_per_unit, supplier_id=None,
     db.table("inventory_transactions").insert({
         "type":          "RECEIPT",
         "item_id":       item_id,
+        "batch_id":      batch_id,
         "to_channel_id": own_wh_id,
         "quantity":      qty,
         "reference":     f"INWARD_{batch_code}",
