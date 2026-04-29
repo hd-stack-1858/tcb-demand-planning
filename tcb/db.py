@@ -98,10 +98,6 @@ def get_low_stock_alerts():
     )
 
 
-def get_darkstore_doc():
-    """Return darkstore days-of-cover view — replenishment trigger data."""
-    return get_client().table("v_darkstore_doc").select("*").execute().data
-
 
 def get_monthly_mis(months: int = 3):
     """Return monthly MIS summary for the last N months."""
