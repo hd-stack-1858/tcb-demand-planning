@@ -2,7 +2,6 @@
 Inventory business logic — assembly, dispatch, receive.
 All operations update both the position tables and the audit log.
 """
-import sys
 from datetime import date, datetime, timezone, timedelta
 from collections import defaultdict
 
@@ -17,6 +16,60 @@ def _own_wh_id():
 
 def _now():
     return datetime.now(IST).isoformat()
+
+def _date_str(d):
+    return d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)
+
+def _get_sku_cogs(sku_id, db):
+    """
+    Returns unit_cogs for sku_id.
+    Strategy 1: latest ASSEMBLY transaction (most accurate — uses real FIFO batch costs).
+    Strategy 2: BOM × latest item_batches.cost_per_unit (fallback for SKUs never assembled).
+    Raises ValueError if both strategies yield 0 — prevents silent zero-COGS shipments.
+    """
+    last_asm = (db.table("sku_inventory_transactions")
+                  .select("unit_cogs")
+                  .eq("sku_id", sku_id)
+                  .eq("type", "ASSEMBLY")
+                  .order("created_at", desc=True)
+                  .limit(1).execute().data)
+    if last_asm and last_asm[0]["unit_cogs"]:
+        return float(last_asm[0]["unit_cogs"])
+
+    bom_rows = (db.table("bom")
+                  .select("item_id, quantity_per_sku")
+                  .eq("sku_id", sku_id).execute().data)
+    if not bom_rows:
+        raise ValueError(f"No BOM found for {sku_id} — cannot calculate COGS")
+
+    item_ids = [b["item_id"] for b in bom_rows]
+    all_batches = (db.table("item_batches")
+                     .select("item_id, cost_per_unit")
+                     .in_("item_id", item_ids)
+                     .gt("cost_per_unit", 0)
+                     .order("received_date", desc=True)
+                     .execute().data)
+    # First occurrence per item_id = latest (results are already ordered desc)
+    latest_cost = {}
+    for row in all_batches:
+        if row["item_id"] not in latest_cost:
+            latest_cost[row["item_id"]] = float(row["cost_per_unit"])
+
+    total = 0.0
+    for b in bom_rows:
+        cost = latest_cost.get(b["item_id"])
+        if cost is None:
+            raise ValueError(
+                f"No cost data found for item_id={b['item_id']} in item_batches "
+                f"(BOM component of {sku_id}) — add a received batch before shipping"
+            )
+        total += b["quantity_per_sku"] * cost
+
+    if total == 0:
+        raise ValueError(
+            f"COGS calculated as 0 for {sku_id} — check item_batches costs before shipping"
+        )
+    return round(total, 4)
 
 
 # ── Read helpers ──────────────────────────────────────────────────────────────
@@ -274,8 +327,7 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
     """
     Record a drop-ship / direct sale: dispatches inventory AND writes to orders table.
     Use this for DROP_SHIP / DIRECT channel shipments instead of dispatch_sku().
-    COGS = qty × unit_cogs from the most recent ASSEMBLY transaction (valid because
-    assembly itself uses FIFO item costs, so latest assembly COGS = current FIFO cost).
+    COGS via _get_sku_cogs: latest ASSEMBLY txn, falling back to BOM × item_batches cost.
     """
     db  = get_client()
     qty = int(qty)
@@ -284,22 +336,16 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
     if order_date is None:
         order_date = date.today()
 
-    last_asm = (db.table("sku_inventory_transactions")
-                  .select("unit_cogs")
-                  .eq("sku_id", sku_id)
-                  .eq("type", "ASSEMBLY")
-                  .order("created_at", desc=True)
-                  .limit(1).execute().data)
-    unit_cogs = float(last_asm[0]["unit_cogs"] or 0) if last_asm else 0.0
+    unit_cogs = _get_sku_cogs(sku_id, db)
 
     dispatch_sku(sku_id, qty, channel_id,
                  reference=platform_order_id or "",
                  notes=notes, created_by=created_by,
-                 _txn_type="DISPATCH")
+                 txn_type="DISPATCH", unit_cogs=unit_cogs)
 
     db.table("orders").insert({
         "channel_id":        channel_id,
-        "order_date":        order_date.strftime("%Y-%m-%d") if hasattr(order_date, "strftime") else str(order_date),
+        "order_date":        _date_str(order_date),
         "sku_id":            sku_id,
         "quantity":          qty,
         "selling_price":     selling_price,
@@ -313,22 +359,70 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
     }).execute()
 
 
+def record_outright_transfer(sku_id, qty, channel_id, reference="",
+                             order_date=None, notes="", created_by="app"):
+    """
+    Record a bulk transfer to an OUTRIGHT channel (Peeko, Kiddo).
+    Dispatches inventory AND writes to orders table at catalog SP.
+    SP is auto-looked up from sku_pricing — blocks if missing.
+    COGS via _get_sku_cogs: latest ASSEMBLY txn, falling back to BOM × item_batches cost.
+    """
+    db  = get_client()
+    qty = int(qty)
+
+    if order_date is None:
+        order_date = date.today()
+    order_date_str = _date_str(order_date)
+
+    pricing = (db.table("sku_pricing")
+                 .select("sp")
+                 .eq("sku_id", sku_id)
+                 .lte("effective_date", order_date_str)
+                 .order("effective_date", desc=True)
+                 .limit(1).execute().data)
+    if not pricing or pricing[0]["sp"] is None:
+        raise ValueError(
+            f"No selling price found for {sku_id} in sku_pricing — "
+            "add pricing before shipping to an OUTRIGHT channel"
+        )
+    selling_price = float(pricing[0]["sp"])
+
+    unit_cogs = _get_sku_cogs(sku_id, db)
+
+    dispatch_sku(sku_id, qty, channel_id,
+                 reference=reference,
+                 notes=notes, created_by=created_by,
+                 txn_type="TRANSFER_OUT", unit_cogs=unit_cogs)
+
+    db.table("orders").insert({
+        "channel_id":        channel_id,
+        "order_date":        order_date_str,
+        "sku_id":            sku_id,
+        "quantity":          qty,
+        "selling_price":     selling_price,
+        "gross_value":       round(qty * selling_price, 2),
+        "cogs":              round(qty * unit_cogs, 2),
+        "fulfillment_type":  "OUTRIGHT",
+        "platform_order_id": reference or None,
+        "status":            "FULFILLED",
+        "source_file":       "warehouse_app",
+    }).execute()
+
+
 def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="app",
-                 _txn_type=None):
+                 txn_type=None, unit_cogs=None):
     """
     Dispatch assembled SKUs from OWN_WH.
     - DROP_SHIP / DIRECT channels → type = DISPATCH
     - FBA / SOR / OUTRIGHT channels → type = TRANSFER_OUT
-    Pass _txn_type to skip the channels lookup (used by record_dropship_sale).
+    Pass txn_type to override the channels lookup (used by record_dropship_sale).
     Raises ValueError if SKU stock is insufficient.
     """
     db = get_client()
     own_wh_id = _own_wh_id()
     qty = int(qty)
 
-    if _txn_type is not None:
-        txn_type = _txn_type
-    else:
+    if txn_type is None:
         ch = (db.table("channels").select("code, business_model")
                 .eq("channel_id", channel_id).single().execute().data)
         txn_type = (
@@ -346,7 +440,7 @@ def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="ap
     db.table("sku_inventory").update({"qty_on_hand": available - qty, "last_updated": _now()})\
       .eq("sku_inv_id", inv[0]["sku_inv_id"]).execute()
 
-    db.table("sku_inventory_transactions").insert({
+    txn = {
         "type":            txn_type,
         "sku_id":          sku_id,
         "from_channel_id": own_wh_id,
@@ -355,7 +449,10 @@ def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="ap
         "reference":       reference,
         "notes":           notes,
         "created_by":      created_by,
-    }).execute()
+    }
+    if unit_cogs is not None:
+        txn["unit_cogs"] = unit_cogs
+    db.table("sku_inventory_transactions").insert(txn).execute()
 
     return txn_type
 

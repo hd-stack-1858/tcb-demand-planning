@@ -120,15 +120,18 @@ class TestRecordDropshipSale:
     def test_cogs_positive_after_assembly(self, db, restore_sku, clean_test_orders):
         """
         COGS is sourced from the most recent ASSEMBLY transaction.
-        Dev seed stock was loaded directly (no assembly history), so we
-        assemble 1 unit first to create history, then verify COGS > 0.
+        Insert a fake ASSEMBLY txn directly (avoids needing real item_batches in dev)
+        so the COGS lookup finds a non-zero unit_cogs.
         """
-        from tcb.inventory import assemble_sku
-        assemble_sku(TEST_SKU, 1, notes="pytest-cogs-setup")
+        db.table("sku_inventory_transactions").insert({
+            "type": "ASSEMBLY", "sku_id": TEST_SKU,
+            "to_channel_id": 1,   # OWN_WH
+            "quantity": 1, "unit_cogs": 330.0,
+            "reference": "PYTEST_cogs_setup", "created_by": "pytest",
+        }).execute()
 
         record_dropship_sale(TEST_SKU, 1, DS_CHANNEL, SELL_PRICE,
                              platform_order_id="PYTEST_sale_003")
-        # restore_sku only for the sale dispatch (assembly is already consumed)
         restore_sku(TEST_SKU, 1, DS_CHANNEL)
 
         row = get_order(db, "PYTEST_sale_003")

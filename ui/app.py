@@ -12,7 +12,7 @@ from tcb.inventory import (
     get_item_stock, get_sku_stock, get_assemblable,
     check_assembly_feasibility, assemble_sku, dispatch_sku, receive_item,
     return_sku, return_item, writeoff_sku, writeoff_item,
-    record_dropship_sale,
+    record_dropship_sale, record_outright_transfer,
 )
 
 st.set_page_config(page_title="TCB Warehouse", page_icon="📦", layout="centered")
@@ -343,6 +343,13 @@ with tab_ship:
                             city=p.get("city") or None,
                             notes=p["notes"], created_by="app",
                         )
+                    elif p.get("is_outright"):
+                        record_outright_transfer(
+                            sku_id=row["sku"], qty=row["qty"],
+                            channel_id=p["channel_id"],
+                            reference=p["ref_str"],
+                            notes=p["notes"], created_by="app",
+                        )
                     else:
                         dispatch_sku(row["sku"], row["qty"], p["channel_id"],
                                      reference=p["ref_str"], notes=p["notes"], created_by="app")
@@ -649,6 +656,7 @@ with tab_ship:
                 "ref_str":     ref_str,
                 "notes":       notes,
                 "is_dropship": not is_bulk,
+                "is_outright": is_bulk and ch_data["business_model"] == "OUTRIGHT",
                 "city":        city,
                 "to_ship":     ship_rows,
             }
