@@ -284,33 +284,41 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
     if order_date is None:
         order_date = date.today()
 
-    last_asm = (db.table("sku_inventory_transactions")
-                  .select("unit_cogs")
-                  .eq("sku_id", sku_id)
-                  .eq("type", "ASSEMBLY")
-                  .order("created_at", desc=True)
-                  .limit(1).execute().data)
-    unit_cogs = float(last_asm[0]["unit_cogs"] or 0) if last_asm else 0.0
+    try:
+        last_asm = (db.table("sku_inventory_transactions")
+                      .select("unit_cogs")
+                      .eq("sku_id", sku_id)
+                      .eq("type", "ASSEMBLY")
+                      .order("created_at", desc=True)
+                      .limit(1).execute().data)
+        unit_cogs = float(last_asm[0]["unit_cogs"] or 0) if last_asm else 0.0
+    except Exception as e:
+        raise RuntimeError(f"[STEP1 cogs_lookup] {e}") from e
 
-    # Inventory movement first — raises ValueError on insufficient stock
-    dispatch_sku(sku_id, qty, channel_id,
-                 reference=platform_order_id or "",
-                 notes=notes, created_by=created_by)
+    try:
+        dispatch_sku(sku_id, qty, channel_id,
+                     reference=platform_order_id or "",
+                     notes=notes, created_by=created_by)
+    except Exception as e:
+        raise RuntimeError(f"[STEP2 dispatch] {e}") from e
 
-    db.table("orders").insert({
-        "channel_id":        channel_id,
-        "order_date":        order_date.strftime("%Y-%m-%d") if hasattr(order_date, "strftime") else str(order_date),
-        "sku_id":            sku_id,
-        "quantity":          qty,
-        "selling_price":     selling_price,
-        "gross_value":       round(qty * selling_price, 2),
-        "cogs":              round(qty * unit_cogs, 2),
-        "fulfillment_type":  "DROP_SHIP",
-        "city":              city or None,
-        "platform_order_id": platform_order_id or None,
-        "status":            "FULFILLED",
-        "source_file":       "warehouse_app",
-    }).execute()
+    try:
+        db.table("orders").insert({
+            "channel_id":        channel_id,
+            "order_date":        order_date.strftime("%Y-%m-%d") if hasattr(order_date, "strftime") else str(order_date),
+            "sku_id":            sku_id,
+            "quantity":          qty,
+            "selling_price":     selling_price,
+            "gross_value":       round(qty * selling_price, 2),
+            "cogs":              round(qty * unit_cogs, 2),
+            "fulfillment_type":  "DROP_SHIP",
+            "city":              city or None,
+            "platform_order_id": platform_order_id or None,
+            "status":            "FULFILLED",
+            "source_file":       "warehouse_app",
+        }).execute()
+    except Exception as e:
+        raise RuntimeError(f"[STEP3 orders_insert] {e}") from e
 
 
 def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="app"):
