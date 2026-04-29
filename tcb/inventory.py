@@ -298,7 +298,8 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
     try:
         dispatch_sku(sku_id, qty, channel_id,
                      reference=platform_order_id or "",
-                     notes=notes, created_by=created_by)
+                     notes=notes, created_by=created_by,
+                     _txn_type="DISPATCH")
     except Exception as e:
         raise RuntimeError(f"[STEP2 dispatch] {e}") from e
 
@@ -321,24 +322,29 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
         raise RuntimeError(f"[STEP3 orders_insert] {e}") from e
 
 
-def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="app"):
+def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="app",
+                 _txn_type=None):
     """
     Dispatch assembled SKUs from OWN_WH.
     - DROP_SHIP / DIRECT channels → type = DISPATCH
     - FBA / SOR / OUTRIGHT channels → type = TRANSFER_OUT
+    Pass _txn_type to skip the channels lookup (used by record_dropship_sale).
     Raises ValueError if SKU stock is insufficient.
     """
     db = get_client()
     own_wh_id = _own_wh_id()
     qty = int(qty)
 
-    ch = (db.table("channels").select("code, business_model, name")
-            .eq("channel_id", channel_id).single().execute().data)
-    txn_type = (
-        "TRANSFER_OUT"
-        if ch["business_model"] in ("FBA", "SOR", "OUTRIGHT")
-        else "DISPATCH"
-    )
+    if _txn_type is not None:
+        txn_type = _txn_type
+    else:
+        ch = (db.table("channels").select("code, business_model")
+                .eq("channel_id", channel_id).single().execute().data)
+        txn_type = (
+            "TRANSFER_OUT"
+            if ch["business_model"] in ("FBA", "SOR", "OUTRIGHT")
+            else "DISPATCH"
+        )
 
     inv = (db.table("sku_inventory").select("sku_inv_id, qty_on_hand")
              .eq("sku_id", sku_id).eq("channel_id", own_wh_id).execute().data)
