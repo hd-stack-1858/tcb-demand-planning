@@ -274,7 +274,8 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
     """
     Record a drop-ship / direct sale: dispatches inventory AND writes to orders table.
     Use this for DROP_SHIP / DIRECT channel shipments instead of dispatch_sku().
-    COGS pulled from most recent ASSEMBLY transaction for the SKU.
+    COGS = qty × unit_cogs from the most recent ASSEMBLY transaction (valid because
+    assembly itself uses FIFO item costs, so latest assembly COGS = current FIFO cost).
     """
     db  = get_client()
     qty = int(qty)
@@ -282,11 +283,6 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
 
     if order_date is None:
         order_date = date.today()
-
-    ch = (db.table("channels")
-            .select("commission_pct, name")
-            .eq("channel_id", channel_id).single().execute().data)
-    commission_pct = float(ch["commission_pct"] or 0)
 
     last_asm = (db.table("sku_inventory_transactions")
                   .select("unit_cogs")
@@ -301,22 +297,14 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
                  reference=platform_order_id or "",
                  notes=notes, created_by=created_by)
 
-    gross_value    = round(qty * selling_price, 2)
-    commission_amt = round(gross_value * commission_pct / 100, 2)
-    cogs_total     = round(qty * unit_cogs, 2)
-    net_margin     = round(gross_value - cogs_total - commission_amt, 2)
-
     db.table("orders").insert({
         "channel_id":        channel_id,
         "order_date":        order_date.strftime("%Y-%m-%d") if hasattr(order_date, "strftime") else str(order_date),
         "sku_id":            sku_id,
         "quantity":          qty,
         "selling_price":     selling_price,
-        "gross_value":       gross_value,
-        "commission_pct":    commission_pct,
-        "commission_amt":    commission_amt,
-        "cogs":              cogs_total,
-        "net_margin":        net_margin,
+        "gross_value":       round(qty * selling_price, 2),
+        "cogs":              round(qty * unit_cogs, 2),
         "fulfillment_type":  "DROP_SHIP",
         "city":              city or None,
         "platform_order_id": platform_order_id or None,
