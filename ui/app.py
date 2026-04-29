@@ -39,6 +39,7 @@ for _k, _v in [
     ("pending_assembly", None),
     ("ship_key",         0),
     ("ship_success",     None),
+    ("ship_error",       None),
     ("shipping",         False),
     ("pending_ship",     None),
     ("wo_key",           0),
@@ -352,8 +353,8 @@ with tab_ship:
                 label="Shipment recorded" if not errors else "Completed with errors",
                 state="complete" if not errors else "error",
             )
-        for msg in errors:
-            st.error(msg)
+        if errors:
+            st.session_state.ship_error = "\n".join(errors)
         if len(errors) < len(p["to_ship"]):
             skus_str = ", ".join(f"{r['qty']}× {r['sku']}" for r in p["to_ship"])
             st.session_state.ship_success = f"✅ Dispatched to **{p['ch_label']}** — {skus_str}"
@@ -405,6 +406,12 @@ with tab_ship:
         if st.button("Dismiss ✕", key="dismiss_ship"):
             pass
         st.session_state.ship_success = None
+
+    if st.session_state.ship_error:
+        st.error(st.session_state.ship_error)
+        if st.button("Dismiss ✕", key="dismiss_ship_err"):
+            pass
+        st.session_state.ship_error = None
 
     if st.session_state.wo_success:
         st.success(st.session_state.wo_success)

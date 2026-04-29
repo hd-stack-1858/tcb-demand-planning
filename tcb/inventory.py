@@ -290,7 +290,7 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
                   .eq("type", "ASSEMBLY")
                   .order("created_at", desc=True)
                   .limit(1).execute().data)
-    unit_cogs = float(last_asm[0]["unit_cogs"]) if last_asm else 0.0
+    unit_cogs = float(last_asm[0]["unit_cogs"] or 0) if last_asm else 0.0
 
     # Inventory movement first — raises ValueError on insufficient stock
     dispatch_sku(sku_id, qty, channel_id,
