@@ -576,6 +576,8 @@ def writeoff_sku(sku_id, qty, reason, notes="", created_by="app"):
     if available < qty:
         raise ValueError(f"Insufficient SKU stock: need {qty}, have {available}")
 
+    unit_cogs = _get_sku_cogs(sku_id, db)
+
     db.table("sku_inventory").update(
         {"qty_on_hand": available - qty, "last_updated": _now()}
     ).eq("sku_inv_id", inv[0]["sku_inv_id"]).execute()
@@ -585,6 +587,7 @@ def writeoff_sku(sku_id, qty, reason, notes="", created_by="app"):
         "sku_id":          sku_id,
         "from_channel_id": own_wh_id,
         "quantity":        qty,
+        "unit_cogs":       unit_cogs,
         "notes":           f"[WRITE-OFF: {reason}] {notes}".strip(),
         "created_by":      created_by,
     }).execute()
