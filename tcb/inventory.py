@@ -486,7 +486,7 @@ def return_sku(sku_id, qty, from_channel_id, notes="", created_by="app"):
     }).execute()
 
 
-def return_item(item_id, qty, notes="", created_by="app"):
+def return_item(item_id, qty, from_channel_id=None, notes="", created_by="app"):
     """
     Return individual item/packaging component to OWN_WH.
     Added to today's batch. Carries last known purchase cost so re-assembled
@@ -553,13 +553,14 @@ def return_item(item_id, qty, notes="", created_by="app"):
         }).execute()
 
     db.table("inventory_transactions").insert({
-        "type":          "SALE_RETURN",
-        "item_id":       item_id,
-        "batch_id":      batch_id,
-        "to_channel_id": own_wh_id,
-        "quantity":      qty,
-        "notes":         notes,
-        "created_by":    created_by,
+        "type":            "SALE_RETURN",
+        "item_id":         item_id,
+        "batch_id":        batch_id,
+        "from_channel_id": from_channel_id,
+        "to_channel_id":   own_wh_id,
+        "quantity":        qty,
+        "notes":           notes,
+        "created_by":      created_by,
     }).execute()
 
 

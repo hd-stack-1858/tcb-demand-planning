@@ -784,10 +784,11 @@ with tab_returns:
                         st.write(f"Returned {row['qty']}× {row['sku']}")
                     else:
                         return_item(
-                            item_id    = row["item_id"],
-                            qty        = row["qty"],
-                            notes      = p["full_notes"],
-                            created_by = "app",
+                            item_id         = row["item_id"],
+                            qty             = row["qty"],
+                            from_channel_id = p["ch_ret_channel_id"],
+                            notes           = p["full_notes"],
+                            created_by      = "app",
                         )
                         st.write(f"Returned {row['qty']}× {row['item_name']}")
                 except Exception as e:
