@@ -93,11 +93,13 @@ def load_sku_prices():
     return prices  # sku_id → sp
 
 @st.cache_data(ttl=60)
-def load_blinkit_whs():
-    return db.table("blinkit_locations")\
-             .select("location_id, name, code")\
+def load_sor_whs(channel_id: int):
+    """Return active WH-type locations for any SOR channel from the unified table."""
+    return db.table("partner_locations")\
+             .select("location_id, name, code, city")\
+             .eq("channel_id", channel_id)\
              .eq("location_type", "WH")\
-             .eq("stock_sent", True)\
+             .eq("is_active", True)\
              .order("name").execute().data
 
 @st.cache_data(ttl=60)
@@ -352,7 +354,8 @@ with tab_ship:
                         )
                     else:
                         dispatch_sku(row["sku"], row["qty"], p["channel_id"],
-                                     reference=p["ref_str"], notes=p["notes"], created_by="app")
+                                     reference=p["ref_str"], notes=p["notes"], created_by="app",
+                                     partner_location_id=p.get("partner_location_id"))
                     st.write(f"Dispatched {row['qty']}× {row['sku']}")
                 except Exception as e:
                     errors.append(f"❌ {row['sku']}: {e}")
@@ -430,7 +433,6 @@ with tab_ship:
     all_channels = load_channels()
     sku_stock    = {r["sku_id"]: r["qty_on_hand"] for r in get_sku_stock()}
     skus         = load_skus()
-    blinkit_whs  = load_blinkit_whs()
     sku_prices   = load_sku_prices()
 
     DROPSHIP_MODELS = {"DROP_SHIP", "DIRECT"}
@@ -561,18 +563,24 @@ with tab_ship:
     )
     ch_data = ch_opts[ch_label]
 
-    # ── Step 3: Blinkit WH ────────────────────────────────────────────────────
-    blk_wh_label = None
-    if ch_data["code"] == "BLK" and blinkit_whs:
-        blk_opts     = {w["name"]: w for w in blinkit_whs}
-        blk_wh_label = st.selectbox(
-            "Blinkit Warehouse", list(blk_opts.keys()),
-            key=f"ship_blk_wh_{st.session_state.ship_key}",
-        )
+    # ── Step 3: Partner WH (all SOR channels) ────────────────────────────────
+    partner_location_id = None
+    if ch_data["business_model"] == "SOR":
+        sor_whs = load_sor_whs(ch_data["channel_id"])
+        if sor_whs:
+            wh_opts = {f"{w['name']} ({w['city']})": w for w in sor_whs}
+            wh_label = st.selectbox(
+                f"{ch_data['name']} Warehouse",
+                list(wh_opts.keys()),
+                key=f"ship_sor_wh_{st.session_state.ship_key}",
+            )
+            partner_location_id = wh_opts[wh_label]["location_id"]
+        else:
+            st.warning(f"No active warehouses found for {ch_data['name']}. Add one in partner_locations.")
 
     # ── Step 4: reference doc ─────────────────────────────────────────────────
     if is_bulk:
-        ref_label    = "Delivery Challan #" if ch_data["code"] == "AZ_FBA" else "Invoice #"
+        ref_label    = "Delivery Challan #" if ch_data["code"] == "AZ" else "Invoice #"
         ref_required = True
     else:
         ref_label    = "Order # (optional — can reconcile later)"
@@ -640,9 +648,7 @@ with tab_ship:
         elif len(to_ship) == 0:
             st.error("❌ Enter at least one quantity to ship.")
         else:
-            ref_str = reference.strip()
-            if blk_wh_label:
-                ref_str = f"{ref_str} | WH: {blk_wh_label}".strip(" |")
+            ref_str   = reference.strip()
             ship_rows = []
             for _, r in to_ship.iterrows():
                 row = {"sku": r["SKU"], "qty": int(r["Ship Qty"]), "in_stock": int(r["In Stock"])}
@@ -656,9 +662,10 @@ with tab_ship:
                 "ref_str":     ref_str,
                 "notes":       notes,
                 "is_dropship": not is_bulk,
-                "is_outright": is_bulk and ch_data["business_model"] == "OUTRIGHT",
-                "city":        city,
-                "to_ship":     ship_rows,
+                "is_outright":        is_bulk and ch_data["business_model"] == "OUTRIGHT",
+                "city":               city,
+                "partner_location_id": partner_location_id,
+                "to_ship":            ship_rows,
             }
             st.rerun()
 

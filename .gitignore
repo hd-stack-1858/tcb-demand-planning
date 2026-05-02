@@ -24,3 +24,6 @@ build/
 
 # Streamlit local config
 .streamlit/secrets.toml
+
+# Claude Code local directory — memory, settings, lock files — all local, not committed
+.claude/

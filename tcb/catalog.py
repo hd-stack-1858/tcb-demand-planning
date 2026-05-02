@@ -1,11 +1,15 @@
-# Approximate catalog COGS per SKU — used only for dev seeding when no
-# ASSEMBLY transaction history exists. Values sourced from CLAUDE.md.
-# Update here when COGS changes; setup/07 and tests/conftest both import this.
+# Historical baseline COGS per SKU — used for dev seeding and synthetic lots.
+# These are pre-app values (before new item batches / price changes in Apr 2026).
+# Authoritative source: Himanshu (May 2026). Do not derive from BOM — item batch
+# costs drift over time; this dict captures what the stock was actually worth.
 CATALOG_COGS = {
-    "TCB001": 477.0, "TCB002": 477.0,
-    "TCB003": 774.0, "TCB004": 774.0,
-    "TCB005": 518.0, "TCB006": 518.0,
-    "TCB008": 306.0, "TCB009_1": 372.0,
-    "TCB010": 931.0, "TCB011": 330.0,
-    "TCB012": 339.0,
+    "TCB001": 441.3, "TCB002": 441.3,
+    "TCB003": 700.8, "TCB004": 700.8,
+    "TCB005": 472.7, "TCB006": 472.7,
+    "TCB007": 609.2,
+    "TCB008": 276.3,
+    "TCB009": 334.2, "TCB009_1": 334.2,
+    "TCB010": 840.2,
+    "TCB011": 297.3,
+    "TCB012": 305.5,
 }

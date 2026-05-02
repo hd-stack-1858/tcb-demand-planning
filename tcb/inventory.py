@@ -7,6 +7,7 @@ from collections import defaultdict
 
 IST = timezone(timedelta(hours=5, minutes=30))
 from tcb.db import get_client
+from tcb.geo import city_to_state
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -20,36 +21,125 @@ def _now():
 def _date_str(d):
     return d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)
 
-def _get_sku_cogs(sku_id, db):
+
+def _upsert_lot(db, sku_id, channel_id, partner_location_id, assembled_at, unit_cogs, add_qty):
     """
-    Returns unit_cogs for sku_id.
-    Strategy 1: latest ASSEMBLY transaction (most accurate — uses real FIFO batch costs).
-    Strategy 2: BOM × latest item_batches.cost_per_unit (fallback for SKUs never assembled).
-    Raises ValueError if both strategies yield 0 — prevents silent zero-COGS shipments.
+    Add add_qty to an existing COGS lot, or create it if none exists.
+    Lot identity: (sku_id, channel_id, partner_location_id, assembled_at, unit_cogs).
+    """
+    q = (db.table("sku_cogs_lots")
+           .select("lot_id, qty_assembled, qty_remaining")
+           .eq("sku_id", sku_id)
+           .eq("channel_id", channel_id)
+           .eq("assembled_at", str(assembled_at))
+           .eq("unit_cogs", unit_cogs))
+    if partner_location_id is None:
+        q = q.is_("partner_location_id", "null")
+    else:
+        q = q.eq("partner_location_id", partner_location_id)
+
+    existing = q.execute().data
+    if existing:
+        row = existing[0]
+        db.table("sku_cogs_lots").update({
+            "qty_assembled": row["qty_assembled"] + add_qty,
+            "qty_remaining": row["qty_remaining"] + add_qty,
+        }).eq("lot_id", row["lot_id"]).execute()
+    else:
+        data = {
+            "sku_id":       sku_id,
+            "channel_id":   channel_id,
+            "assembled_at": str(assembled_at),
+            "unit_cogs":    unit_cogs,
+            "qty_assembled": add_qty,
+            "qty_remaining": add_qty,
+        }
+        if partner_location_id is not None:
+            data["partner_location_id"] = partner_location_id
+        db.table("sku_cogs_lots").insert(data).execute()
+
+
+def _consume_lots_fifo(db, sku_id, channel_id, qty, partner_location_id=None):
+    """
+    FIFO-consume qty units from lots at (sku_id, channel_id[, partner_location_id]).
+    Decrements qty_remaining on consumed lots immediately.
+    Returns (plan, weighted_avg_cogs).
+      plan = [{"lot_id", "assembled_at", "unit_cogs", "qty"}, ...]
+    Raises ValueError if available lot qty < qty requested.
+    """
+    q = (db.table("sku_cogs_lots")
+           .select("lot_id, assembled_at, unit_cogs, qty_remaining")
+           .eq("sku_id", sku_id)
+           .eq("channel_id", channel_id)
+           .gt("qty_remaining", 0)
+           .order("assembled_at"))
+    if partner_location_id is None:
+        q = q.is_("partner_location_id", "null")
+    else:
+        q = q.eq("partner_location_id", partner_location_id)
+
+    lots = q.execute().data
+    available = sum(l["qty_remaining"] for l in lots)
+    if available < qty:
+        loc_hint = f" location_id={partner_location_id}" if partner_location_id else ""
+        raise ValueError(
+            f"Insufficient COGS lots for {sku_id}: need {qty}, have {available} "
+            f"(channel_id={channel_id}{loc_hint}). "
+            "Run setup/seed_sku_cogs_lots.py or check assembly history."
+        )
+
+    lot_qty = {l["lot_id"]: int(l["qty_remaining"]) for l in lots}
+    plan = []
+    remaining = qty
+    for lot in lots:
+        if remaining <= 0:
+            break
+        consume = min(lot_qty[lot["lot_id"]], remaining)
+        plan.append({
+            "lot_id":       lot["lot_id"],
+            "assembled_at": lot["assembled_at"],
+            "unit_cogs":    float(lot["unit_cogs"]),
+            "qty":          consume,
+        })
+        remaining -= consume
+
+    for p in plan:
+        new_qty = lot_qty[p["lot_id"]] - p["qty"]
+        db.table("sku_cogs_lots").update({"qty_remaining": new_qty})\
+          .eq("lot_id", p["lot_id"]).execute()
+        lot_qty[p["lot_id"]] = new_qty
+
+    total_cost = sum(p["unit_cogs"] * p["qty"] for p in plan)
+    return plan, round(total_cost / qty, 4) if qty else 0.0
+
+
+def _get_sku_cogs_fallback(sku_id, db):
+    """
+    Fallback COGS when no lots exist (e.g. pre-migration returns).
+    Uses latest ASSEMBLY txn unit_cogs, then BOM × item_batches.
     """
     last_asm = (db.table("sku_inventory_transactions")
                   .select("unit_cogs")
                   .eq("sku_id", sku_id)
                   .eq("type", "ASSEMBLY")
+                  .gt("unit_cogs", 0)
                   .order("created_at", desc=True)
                   .limit(1).execute().data)
-    if last_asm and last_asm[0]["unit_cogs"]:
+    if last_asm:
         return float(last_asm[0]["unit_cogs"])
 
-    bom_rows = (db.table("bom")
-                  .select("item_id, quantity_per_sku")
+    bom_rows = (db.table("bom").select("item_id, quantity_per_sku")
                   .eq("sku_id", sku_id).execute().data)
     if not bom_rows:
-        raise ValueError(f"No BOM found for {sku_id} — cannot calculate COGS")
+        return 0.0
 
-    item_ids = [b["item_id"] for b in bom_rows]
+    item_ids   = [b["item_id"] for b in bom_rows]
     all_batches = (db.table("item_batches")
                      .select("item_id, cost_per_unit")
                      .in_("item_id", item_ids)
                      .gt("cost_per_unit", 0)
                      .order("received_date", desc=True)
                      .execute().data)
-    # First occurrence per item_id = latest (results are already ordered desc)
     latest_cost = {}
     for row in all_batches:
         if row["item_id"] not in latest_cost:
@@ -57,19 +147,19 @@ def _get_sku_cogs(sku_id, db):
 
     total = 0.0
     for b in bom_rows:
-        cost = latest_cost.get(b["item_id"])
-        if cost is None:
-            raise ValueError(
-                f"No cost data found for item_id={b['item_id']} in item_batches "
-                f"(BOM component of {sku_id}) — add a received batch before shipping"
-            )
-        total += b["quantity_per_sku"] * cost
-
-    if total == 0:
-        raise ValueError(
-            f"COGS calculated as 0 for {sku_id} — check item_batches costs before shipping"
-        )
+        total += b["quantity_per_sku"] * latest_cost.get(b["item_id"], 0.0)
     return round(total, 4)
+
+
+def _lookup_mrp(db, sku_id, order_date_str):
+    """Latest MRP from sku_pricing on or before order_date. Returns None if missing."""
+    row = (db.table("sku_pricing")
+             .select("mrp")
+             .eq("sku_id", sku_id)
+             .lte("effective_date", order_date_str)
+             .order("effective_date", desc=True)
+             .limit(1).execute().data)
+    return float(row[0]["mrp"]) if row and row[0].get("mrp") else None
 
 
 # ── Read helpers ──────────────────────────────────────────────────────────────
@@ -96,25 +186,22 @@ def get_item_stock():
         agg[r["item_id"]]["lead_time_days"] = it["lead_time_days"] or 7
         agg[r["item_id"]]["supplier"]       = (it.get("suppliers") or {}).get("name", "")
         agg[r["item_id"]]["qty"]           += r["quantity_on_hand"]
-    return dict(agg)  # item_id → {...}
+    return dict(agg)
 
 
 def get_reorder_alerts():
     """
-    All items where stock < reorder_point, including items with zero stock
-    (no inventory row yet). Queries items table directly then overlays stock.
+    All items where stock < reorder_point, including items with zero stock.
     """
     db = get_client()
     own_wh_id = _own_wh_id()
 
-    # All items with a meaningful ROP
     all_items = (db.table("items")
                    .select("item_id, item_code, name, unit, reorder_point, moq, lead_time_days, suppliers(name)")
                    .gt("reorder_point", 0)
                    .eq("is_active", True)
                    .execute().data)
 
-    # Current stock summed per item at OWN_WH
     inv_rows = (db.table("inventory")
                   .select("item_id, quantity_on_hand")
                   .eq("channel_id", own_wh_id)
@@ -181,7 +268,6 @@ def get_assemblable():
 def check_assembly_feasibility(sku_id, qty_to_pack):
     """
     Returns (feasible: bool, detail: list of dicts per BOM line).
-    detail = [{"item_id", "name", "unit", "needed", "available", "ok"}]
     """
     db = get_client()
     item_stock = get_item_stock()
@@ -214,7 +300,7 @@ def assemble_sku(sku_id, qty_to_pack, notes="", created_by="app"):
     """
     Pack qty_to_pack units of sku_id.
     Consumes items FIFO (oldest batch first), updates inventory + sku_inventory,
-    logs ASSEMBLY transactions.
+    logs ASSEMBLY transactions, and creates/grows a COGS lot at OWN_WH.
     Raises ValueError if stock is insufficient.
     """
     db = get_client()
@@ -224,13 +310,12 @@ def assemble_sku(sku_id, qty_to_pack, notes="", created_by="app"):
     bom = (db.table("bom").select("item_id, quantity_per_sku")
              .eq("sku_id", sku_id).execute().data)
 
-    # ── Plan FIFO consumption ─────────────────────────────────
-    consumption_plan = {}  # item_id → [(inv_id, batch_id, consume_qty, cost_per_unit)]
+    consumption_plan = {}
     total_cogs = 0.0
 
     for b in bom:
-        item_id  = b["item_id"]
-        needed   = int(b["quantity_per_sku"]) * qty_to_pack
+        item_id = b["item_id"]
+        needed  = int(b["quantity_per_sku"]) * qty_to_pack
 
         inv_rows = (db.table("inventory")
                       .select("inv_id, batch_id, quantity_on_hand, "
@@ -270,10 +355,8 @@ def assemble_sku(sku_id, qty_to_pack, notes="", created_by="app"):
 
     unit_cogs = round(total_cogs / qty_to_pack, 4) if qty_to_pack else 0
 
-    # ── Execute ───────────────────────────────────────────────
     for item_id, (plan, _) in consumption_plan.items():
         for p in plan:
-            # Fetch current qty (re-fetch to be safe)
             cur = (db.table("inventory").select("quantity_on_hand")
                      .eq("inv_id", p["inv_id"]).single().execute().data)
             new_qty = int(cur["quantity_on_hand"]) - int(p["consume"])
@@ -294,7 +377,6 @@ def assemble_sku(sku_id, qty_to_pack, notes="", created_by="app"):
                 "created_by":      created_by,
             }).execute()
 
-    # Update sku_inventory
     existing = (db.table("sku_inventory").select("sku_inv_id, qty_on_hand")
                   .eq("sku_id", sku_id).eq("channel_id", own_wh_id).execute().data)
     if existing:
@@ -318,105 +400,19 @@ def assemble_sku(sku_id, qty_to_pack, notes="", created_by="app"):
         "created_by":    created_by,
     }).execute()
 
+    _upsert_lot(db, sku_id, own_wh_id, None, date.today(), unit_cogs, qty_to_pack)
+
     return unit_cogs
 
 
-def record_dropship_sale(sku_id, qty, channel_id, selling_price,
-                         order_date=None, platform_order_id=None,
-                         city=None, notes="", created_by="app"):
-    """
-    Record a drop-ship / direct sale: dispatches inventory AND writes to orders table.
-    Use this for DROP_SHIP / DIRECT channel shipments instead of dispatch_sku().
-    COGS via _get_sku_cogs: latest ASSEMBLY txn, falling back to BOM × item_batches cost.
-    """
-    db  = get_client()
-    qty = int(qty)
-    selling_price = float(selling_price)
-
-    if order_date is None:
-        order_date = date.today()
-
-    unit_cogs = _get_sku_cogs(sku_id, db)
-
-    dispatch_sku(sku_id, qty, channel_id,
-                 reference=platform_order_id or "",
-                 notes=notes, created_by=created_by,
-                 txn_type="DISPATCH", unit_cogs=unit_cogs)
-
-    db.table("orders").insert({
-        "channel_id":        channel_id,
-        "order_date":        _date_str(order_date),
-        "sku_id":            sku_id,
-        "quantity":          qty,
-        "selling_price":     selling_price,
-        "gross_value":       round(qty * selling_price, 2),
-        "cogs":              round(qty * unit_cogs, 2),
-        "fulfillment_type":  "DROP_SHIP",
-        "city":              city or None,
-        "platform_order_id": platform_order_id or None,
-        "status":            "FULFILLED",
-        "source_file":       "warehouse_app",
-    }).execute()
-
-
-def record_outright_transfer(sku_id, qty, channel_id, reference="",
-                             order_date=None, notes="", created_by="app"):
-    """
-    Record a bulk transfer to an OUTRIGHT channel (Peeko, Kiddo).
-    Dispatches inventory AND writes to orders table at catalog SP.
-    SP is auto-looked up from sku_pricing — blocks if missing.
-    COGS via _get_sku_cogs: latest ASSEMBLY txn, falling back to BOM × item_batches cost.
-    """
-    db  = get_client()
-    qty = int(qty)
-
-    if order_date is None:
-        order_date = date.today()
-    order_date_str = _date_str(order_date)
-
-    pricing = (db.table("sku_pricing")
-                 .select("sp")
-                 .eq("sku_id", sku_id)
-                 .lte("effective_date", order_date_str)
-                 .order("effective_date", desc=True)
-                 .limit(1).execute().data)
-    if not pricing or pricing[0]["sp"] is None:
-        raise ValueError(
-            f"No selling price found for {sku_id} in sku_pricing — "
-            "add pricing before shipping to an OUTRIGHT channel"
-        )
-    selling_price = float(pricing[0]["sp"])
-
-    unit_cogs = _get_sku_cogs(sku_id, db)
-
-    dispatch_sku(sku_id, qty, channel_id,
-                 reference=reference,
-                 notes=notes, created_by=created_by,
-                 txn_type="TRANSFER_OUT", unit_cogs=unit_cogs)
-
-    db.table("orders").insert({
-        "channel_id":        channel_id,
-        "order_date":        order_date_str,
-        "sku_id":            sku_id,
-        "quantity":          qty,
-        "selling_price":     selling_price,
-        "gross_value":       round(qty * selling_price, 2),
-        "cogs":              round(qty * unit_cogs, 2),
-        "fulfillment_type":  "OUTRIGHT",
-        "platform_order_id": reference or None,
-        "status":            "FULFILLED",
-        "source_file":       "warehouse_app",
-    }).execute()
-
-
 def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="app",
-                 txn_type=None, unit_cogs=None):
+                 txn_type=None, partner_location_id=None):
     """
-    Dispatch assembled SKUs from OWN_WH.
+    Dispatch assembled SKUs from OWN_WH. Consumes COGS lots FIFO.
     - DROP_SHIP / DIRECT channels → type = DISPATCH
-    - FBA / SOR / OUTRIGHT channels → type = TRANSFER_OUT
-    Pass txn_type to override the channels lookup (used by record_dropship_sale).
-    Raises ValueError if SKU stock is insufficient.
+    - FBA / SOR / OUTRIGHT channels → type = TRANSFER_OUT; mirrors lots to partner channel
+    Returns (txn_type, unit_cogs).
+    Raises ValueError if SKU stock or COGS lots are insufficient.
     """
     db = get_client()
     own_wh_id = _own_wh_id()
@@ -437,6 +433,8 @@ def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="ap
     if available < qty:
         raise ValueError(f"Insufficient SKU stock: need {qty}, have {available}")
 
+    plan, unit_cogs = _consume_lots_fifo(db, sku_id, own_wh_id, qty)
+
     db.table("sku_inventory").update({"qty_on_hand": available - qty, "last_updated": _now()})\
       .eq("sku_inv_id", inv[0]["sku_inv_id"]).execute()
 
@@ -446,22 +444,156 @@ def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="ap
         "from_channel_id": own_wh_id,
         "to_channel_id":   channel_id if txn_type == "TRANSFER_OUT" else None,
         "quantity":        qty,
+        "unit_cogs":       unit_cogs,
         "reference":       reference,
         "notes":           notes,
         "created_by":      created_by,
     }
-    if unit_cogs is not None:
-        txn["unit_cogs"] = unit_cogs
+    if partner_location_id is not None:
+        txn["partner_location_id"] = partner_location_id
     db.table("sku_inventory_transactions").insert(txn).execute()
 
-    return txn_type
+    if txn_type == "TRANSFER_OUT":
+        for p in plan:
+            _upsert_lot(db, sku_id, channel_id, partner_location_id,
+                        p["assembled_at"], p["unit_cogs"], p["qty"])
+
+    return txn_type, unit_cogs
 
 
-def return_sku(sku_id, qty, from_channel_id, notes="", created_by="app"):
-    """Return assembled SKU from a partner back into OWN_WH stock."""
+def record_dropship_sale(sku_id, qty, channel_id, selling_price,
+                         order_date=None, platform_order_id=None,
+                         city=None, notes="", created_by="app"):
+    """
+    Record a drop-ship / direct sale: dispatches inventory AND writes to orders.
+    COGS from OWN_WH lots (FIFO). MRP auto-fetched from sku_pricing.
+    State auto-resolved from city via geo lookup.
+    """
+    db  = get_client()
+    qty = int(qty)
+    selling_price = float(selling_price)
+
+    if order_date is None:
+        order_date = date.today()
+    order_date_str = _date_str(order_date)
+
+    _, unit_cogs = dispatch_sku(sku_id, qty, channel_id,
+                                reference=platform_order_id or "",
+                                notes=notes, created_by=created_by,
+                                txn_type="DISPATCH")
+
+    mrp = _lookup_mrp(db, sku_id, order_date_str)
+    discount_pct = (
+        round((mrp - selling_price) / mrp * 100, 2)
+        if mrp and mrp > 0 else None
+    )
+    state = city_to_state(city)
+
+    db.table("orders").insert({
+        "channel_id":        channel_id,
+        "order_date":        order_date_str,
+        "sku_id":            sku_id,
+        "quantity":          qty,
+        "mrp":               mrp,
+        "selling_price":     selling_price,
+        "gross_value":       round(qty * selling_price, 2),
+        "discount_pct":      discount_pct,
+        "cogs":              round(qty * unit_cogs, 2),
+        "fulfillment_type":  "DROP_SHIP",
+        "city":              city or None,
+        "state":             state,
+        "platform_order_id": platform_order_id or None,
+        "status":            "FULFILLED",
+        "source_file":       "warehouse_app",
+    }).execute()
+
+
+def record_outright_transfer(sku_id, qty, channel_id, reference="",
+                             order_date=None, notes="", created_by="app"):
+    """
+    Record a bulk transfer to an OUTRIGHT channel (Peeko, Kiddo).
+    Dispatches inventory AND writes to orders at catalog SP.
+    SP + MRP auto-looked up from sku_pricing — blocks if SP missing.
+    COGS from OWN_WH lots (FIFO).
+    """
+    db  = get_client()
+    qty = int(qty)
+
+    if order_date is None:
+        order_date = date.today()
+    order_date_str = _date_str(order_date)
+
+    pricing = (db.table("sku_pricing")
+                 .select("sp, mrp")
+                 .eq("sku_id", sku_id)
+                 .lte("effective_date", order_date_str)
+                 .order("effective_date", desc=True)
+                 .limit(1).execute().data)
+    if not pricing or pricing[0].get("sp") is None:
+        raise ValueError(
+            f"No selling price found for {sku_id} in sku_pricing — "
+            "add pricing before shipping to an OUTRIGHT channel"
+        )
+    selling_price = float(pricing[0]["sp"])
+    mrp = float(pricing[0]["mrp"]) if pricing[0].get("mrp") else None
+    discount_pct = (
+        round((mrp - selling_price) / mrp * 100, 2)
+        if mrp and mrp > 0 else None
+    )
+
+    _, unit_cogs = dispatch_sku(sku_id, qty, channel_id,
+                                reference=reference,
+                                notes=notes, created_by=created_by,
+                                txn_type="TRANSFER_OUT")
+
+    db.table("orders").insert({
+        "channel_id":        channel_id,
+        "order_date":        order_date_str,
+        "sku_id":            sku_id,
+        "quantity":          qty,
+        "mrp":               mrp,
+        "selling_price":     selling_price,
+        "gross_value":       round(qty * selling_price, 2),
+        "discount_pct":      discount_pct,
+        "cogs":              round(qty * unit_cogs, 2),
+        "fulfillment_type":  "OUTRIGHT",
+        "platform_order_id": reference or None,
+        "status":            "FULFILLED",
+        "source_file":       "warehouse_app",
+    }).execute()
+
+
+def return_sku(sku_id, qty, from_channel_id, partner_location_id=None,
+               notes="", created_by="app"):
+    """
+    Return assembled SKU from a partner back into OWN_WH stock.
+    For TRANSFER_OUT channels (SOR/FBA/OUTRIGHT): consumes partner lots and
+    restores to OWN_WH lots at original COGS.
+    For DISPATCH channels (end-customer RTOs): creates OWN_WH lot at fallback COGS.
+    """
     db = get_client()
     own_wh_id = _own_wh_id()
     qty = int(qty)
+
+    ch = (db.table("channels").select("business_model")
+            .eq("channel_id", from_channel_id).single().execute().data)
+    is_transfer_channel = ch["business_model"] in ("FBA", "SOR", "OUTRIGHT")
+
+    if is_transfer_channel:
+        try:
+            plan, unit_cogs = _consume_lots_fifo(
+                db, sku_id, from_channel_id, qty,
+                partner_location_id=partner_location_id
+            )
+            for p in plan:
+                _upsert_lot(db, sku_id, own_wh_id, None,
+                            p["assembled_at"], p["unit_cogs"], p["qty"])
+        except ValueError:
+            unit_cogs = _get_sku_cogs_fallback(sku_id, db)
+            _upsert_lot(db, sku_id, own_wh_id, None, date.today(), unit_cogs, qty)
+    else:
+        unit_cogs = _get_sku_cogs_fallback(sku_id, db)
+        _upsert_lot(db, sku_id, own_wh_id, None, date.today(), unit_cogs, qty)
 
     existing = (db.table("sku_inventory").select("sku_inv_id, qty_on_hand")
                   .eq("sku_id", sku_id).eq("channel_id", own_wh_id).execute().data)
@@ -475,22 +607,25 @@ def return_sku(sku_id, qty, from_channel_id, notes="", created_by="app"):
             "qty_on_hand": qty, "qty_reserved": 0,
         }).execute()
 
-    db.table("sku_inventory_transactions").insert({
+    txn = {
         "type":            "RETURN",
         "sku_id":          sku_id,
         "from_channel_id": from_channel_id,
         "to_channel_id":   own_wh_id,
         "quantity":        qty,
+        "unit_cogs":       unit_cogs,
         "notes":           notes,
         "created_by":      created_by,
-    }).execute()
+    }
+    if partner_location_id is not None:
+        txn["partner_location_id"] = partner_location_id
+    db.table("sku_inventory_transactions").insert(txn).execute()
 
 
 def return_item(item_id, qty, from_channel_id=None, notes="", created_by="app"):
     """
     Return individual item/packaging component to OWN_WH.
-    Added to today's batch. Carries last known purchase cost so re-assembled
-    hampers reflect correct COGS.
+    Added to today's batch. Carries last known purchase cost.
     """
     db = get_client()
     own_wh_id = _own_wh_id()
@@ -498,7 +633,6 @@ def return_item(item_id, qty, from_channel_id=None, notes="", created_by="app"):
     today      = date.today()
     batch_code = today.strftime("%Y%m%d")
 
-    # Use last real purchase cost so re-assembled COGS is correct
     last = (db.table("item_batches")
               .select("cost_per_unit")
               .eq("item_id", item_id)
@@ -565,7 +699,8 @@ def return_item(item_id, qty, from_channel_id=None, notes="", created_by="app"):
 
 
 def writeoff_sku(sku_id, qty, reason, notes="", created_by="app"):
-    """Write off assembled SKU qty from OWN_WH (Lost / Damaged / QC Reject)."""
+    """Write off assembled SKU qty from OWN_WH (Lost / Damaged / QC Reject).
+    Consumes COGS lots FIFO."""
     db = get_client()
     own_wh_id = _own_wh_id()
     qty = int(qty)
@@ -576,7 +711,7 @@ def writeoff_sku(sku_id, qty, reason, notes="", created_by="app"):
     if available < qty:
         raise ValueError(f"Insufficient SKU stock: need {qty}, have {available}")
 
-    unit_cogs = _get_sku_cogs(sku_id, db)
+    _, unit_cogs = _consume_lots_fifo(db, sku_id, own_wh_id, qty)
 
     db.table("sku_inventory").update(
         {"qty_on_hand": available - qty, "last_updated": _now()}
@@ -637,8 +772,7 @@ def receive_item(item_id, qty, cost_per_unit, supplier_id=None,
                  receipt_date=None, notes="", created_by="app"):
     """
     Record an inward stock receipt at OWN_WH.
-    Batch auto-created from receipt_date (YYYYMMDD). If same-date batch exists,
-    quantities are merged and cost updated.
+    Batch auto-created from receipt_date (YYYYMMDD). Same-date batches are merged.
     """
     db = get_client()
     own_wh_id = _own_wh_id()

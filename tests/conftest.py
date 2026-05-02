@@ -18,33 +18,69 @@ def db():
     return get_client()
 
 
+@pytest.fixture(scope="session")
+def own_wh_id(db):
+    return db.table("channels").select("channel_id").eq("code", "OWN_WH").single().execute().data["channel_id"]
+
+
 @pytest.fixture(scope="session", autouse=True)
-def seed_dev_cogs(db):
+def seed_dev_cogs(db, own_wh_id):
     """
-    Ensure every active SKU has at least one ASSEMBLY txn so _get_sku_cogs()
-    never hits zero on dev (where item_batches is empty).
-    Skips any SKU that already has ASSEMBLY history.
+    Ensure every active SKU has:
+      1. At least one ASSEMBLY txn so fallback COGS lookups work.
+      2. At least one open sku_cogs_lots row so _consume_lots_fifo() never
+         hits zero on dev (where item_batches is empty).
+    Skips any SKU that already has ASSEMBLY history or an open lot.
     Non-PYTEST_ reference keeps clean_test_orders from wiping it mid-session.
     """
-    existing = {
+    # ── ASSEMBLY txns ────────────────────────────────────────────────────────
+    existing_asm = {
         r["sku_id"]
         for r in db.table("sku_inventory_transactions")
                    .select("sku_id").eq("type", "ASSEMBLY").execute().data
     }
-    rows = [
-        {"type": "ASSEMBLY", "sku_id": sku_id, "to_channel_id": 1,
+    asm_rows = [
+        {"type": "ASSEMBLY", "sku_id": sku_id, "to_channel_id": own_wh_id,
          "quantity": 1, "unit_cogs": unit_cogs,
          "reference": "SEED_DEV_COGS_PYTEST", "created_by": "pytest"}
         for sku_id, unit_cogs in CATALOG_COGS.items()
-        if sku_id not in existing
+        if sku_id not in existing_asm
     ]
-    if rows:
-        db.table("sku_inventory_transactions").insert(rows).execute()
+    if asm_rows:
+        db.table("sku_inventory_transactions").insert(asm_rows).execute()
+
+    # ── sku_cogs_lots ────────────────────────────────────────────────────────
+    existing_lots = {
+        r["sku_id"]
+        for r in db.table("sku_cogs_lots")
+                   .select("sku_id")
+                   .eq("channel_id", own_wh_id)
+                   .gt("qty_remaining", 0)
+                   .execute().data
+    }
+    seeded_lot_ids = []
+    for sku_id, unit_cogs in CATALOG_COGS.items():
+        if sku_id in existing_lots:
+            continue
+        result = db.table("sku_cogs_lots").insert({
+            "sku_id":       sku_id,
+            "channel_id":   own_wh_id,
+            "assembled_at": "2025-12-01",
+            "unit_cogs":    unit_cogs,
+            "qty_assembled": 50,
+            "qty_remaining": 50,
+        }).execute()
+        if result.data:
+            seeded_lot_ids.append(result.data[0]["lot_id"])
+
     yield
-    # Only remove entries this session created; never touch SEED_DEV_COGS (setup_script)
-    if rows:
+
+    # ── Teardown ─────────────────────────────────────────────────────────────
+    if asm_rows:
         db.table("sku_inventory_transactions").delete() \
           .eq("reference", "SEED_DEV_COGS_PYTEST").execute()
+    for lot_id in seeded_lot_ids:
+        db.table("sku_cogs_lots").delete().eq("lot_id", lot_id).execute()
 
 
 @pytest.fixture
@@ -77,5 +113,4 @@ def clean_test_orders(db):
               .execute().data)
     for r in rows:
         db.table("orders").delete().eq("order_id", r["order_id"]).execute()
-    # Also clean up any sku_inventory_transactions with pytest references
     db.table("sku_inventory_transactions").delete().like("reference", "PYTEST_%").execute()

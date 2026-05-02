@@ -22,7 +22,7 @@ wb = openpyxl.load_workbook(EXCEL, data_only=True)
 print("Seeding channels...")
 CHANNELS = [
     {"name": "Own Warehouse",  "code": "OWN_WH",   "business_model": None,         "fulfillment_from": "OWN_WH",             "is_location": True,  "is_active": True,  "legal_name": "Goodsense Trading India Private Limited"},
-    {"name": "Amazon FBA",     "code": "AZ_FBA",   "business_model": "FBA",        "fulfillment_from": "FBA",                "is_location": False, "is_active": True,  "legal_name": "Amazon Seller Services Private Limited"},
+    {"name": "Amazon",         "code": "AZ",       "business_model": "SOR",        "fulfillment_from": "FBA",                "is_location": False, "is_active": True,  "legal_name": "Amazon Seller Services Private Limited"},
     {"name": "Amazon FBM",     "code": "AZ_FBM",  "business_model": "DROP_SHIP",  "fulfillment_from": "OWN_WH",             "is_location": False, "is_active": True,  "legal_name": "Amazon Seller Services Private Limited",
      "notes": "Az SKU for TCB001=TCB002 and TCB002=TCB001 in platform (reversed at listing, cannot change)"},
     {"name": "Blinkit",        "code": "BLK",      "business_model": "SOR",        "fulfillment_from": "BLK_DARKSTORE",      "is_location": False, "is_active": True,  "legal_name": "Blink Commerce Private Limited"},
@@ -98,7 +98,7 @@ for row in rows[1:]:
     # TCB006 note: Amazon UPC (8904492390033) ≠ Blinkit UPC (8904492390064) — listing mix-up, cannot change
     # platform_sku: BLK/FNP/FC have no separate SKU code on platform, use our own sku_id
     for ch_code, sku_col, pid_col, pid_additional_col, upc_col, use_sku_as_pid in [
-        ("AZ_FBM","Az SKU",   "Az ASIN",             "Amazon FNSKU",    "Amazon UPC",   False),
+        ("AZ",    "Az SKU",   "Az ASIN",             "Amazon FNSKU",    "Amazon UPC",   False),
         ("BLK",   None,       "Blinkit PID",          "Blinkit Item ID", "Blinkit UPC",  False),
         ("FNP",   None,       "FnP PID",              None,              None,           False),
         ("FC",    None,       "First Cry Product ID", None,              None,           False),
