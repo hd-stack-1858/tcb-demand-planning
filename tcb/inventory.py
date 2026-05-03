@@ -402,6 +402,36 @@ def assemble_sku(sku_id, qty_to_pack, notes="", created_by="app"):
 
     _upsert_lot(db, sku_id, own_wh_id, None, date.today(), unit_cogs, qty_to_pack)
 
+    # Verify lot sync: total lot qty must match sku_inventory after assembly.
+    # Catches silent insert failures before they cause dispatch errors later.
+    lot_total = sum(
+        r["qty_remaining"]
+        for r in (
+            db.table("sku_cogs_lots")
+            .select("qty_remaining")
+            .eq("sku_id", sku_id)
+            .eq("channel_id", own_wh_id)
+            .is_("partner_location_id", "null")
+            .gt("qty_remaining", 0)
+            .execute().data or []
+        )
+    )
+    inv_row = (
+        db.table("sku_inventory")
+        .select("qty_on_hand")
+        .eq("sku_id", sku_id)
+        .eq("channel_id", own_wh_id)
+        .execute().data
+    )
+    inv_qty = int(inv_row[0]["qty_on_hand"]) if inv_row else 0
+    if lot_total != inv_qty:
+        raise RuntimeError(
+            f"COGS lot sync failed after assembly of {sku_id}: "
+            f"lots total {lot_total} != inventory {inv_qty}. "
+            f"Assembly is recorded but COGS tracking is inconsistent — "
+            f"manually reconcile sku_cogs_lots before dispatching."
+        )
+
     return unit_cogs
 
 
