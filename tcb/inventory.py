@@ -651,6 +651,32 @@ def return_sku(sku_id, qty, from_channel_id, partner_location_id=None,
         txn["partner_location_id"] = partner_location_id
     db.table("sku_inventory_transactions").insert(txn).execute()
 
+    lot_total = sum(
+        r["qty_remaining"]
+        for r in (
+            db.table("sku_cogs_lots")
+            .select("qty_remaining")
+            .eq("sku_id", sku_id)
+            .eq("channel_id", own_wh_id)
+            .is_("partner_location_id", "null")
+            .gt("qty_remaining", 0)
+            .execute().data or []
+        )
+    )
+    sku_inv_qty = (
+        db.table("sku_inventory")
+        .select("qty_on_hand")
+        .eq("sku_id", sku_id)
+        .eq("channel_id", own_wh_id)
+        .execute().data or [{}]
+    )[0].get("qty_on_hand", 0)
+    if lot_total != sku_inv_qty:
+        raise RuntimeError(
+            f"COGS lot sync failed after return of {sku_id}: "
+            f"lots={lot_total} but sku_inventory={sku_inv_qty}. "
+            f"Return was recorded but lot update may have failed — check sku_cogs_lots."
+        )
+
 
 def return_item(item_id, qty, from_channel_id=None, notes="", created_by="app"):
     """
