@@ -58,7 +58,7 @@ class TestDispatchSku:
         assert txn["type"] == "DISPATCH"
         assert txn["sku_id"] == TEST_SKU
         assert txn["quantity"] == 1
-        assert txn["to_channel_id"] is None     # drop-ship goes to customer, not a WH
+        assert txn["to_channel_id"] == DS_CHANNEL
 
     def test_bulk_logs_transfer_out_with_destination(self, db, restore_sku):
         dispatch_sku(TEST_SKU, 1, BULK_CHANNEL, reference="PYTEST_bulk_txn")

@@ -475,7 +475,7 @@ def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="ap
         "type":            txn_type,
         "sku_id":          sku_id,
         "from_channel_id": own_wh_id,
-        "to_channel_id":   channel_id if txn_type == "TRANSFER_OUT" else None,
+        "to_channel_id":   channel_id,
         "quantity":        qty,
         "unit_cogs":       unit_cogs,
         "reference":       reference,
