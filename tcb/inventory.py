@@ -547,7 +547,8 @@ def record_outright_transfer(sku_id, qty, channel_id, reference="",
     Record a bulk transfer to an OUTRIGHT channel (Peeko, Kiddo).
     Dispatches inventory AND writes to orders at catalog SP.
     SP + MRP auto-looked up from sku_pricing — blocks if SP missing.
-    COGS from OWN_WH lots (FIFO).
+    TP looked up from sku_channel_tp and stored as transfer_price for P&L.
+    COGS from OWN_WH lots (FIFO), locked in at dispatch (lot_cogs_finalized=TRUE).
     """
     db  = get_client()
     qty = int(qty)
@@ -574,6 +575,17 @@ def record_outright_transfer(sku_id, qty, channel_id, reference="",
         if mrp and mrp > 0 else None
     )
 
+    ch_code = (db.table("channels").select("code")
+                 .eq("channel_id", channel_id).single().execute().data["code"])
+    tp_row = (db.table("sku_channel_tp")
+                .select("transfer_price")
+                .eq("sku_id", sku_id)
+                .eq("channel_code", ch_code)
+                .lte("effective_date", order_date_str)
+                .order("effective_date", desc=True)
+                .limit(1).execute().data)
+    transfer_price = float(tp_row[0]["transfer_price"]) if tp_row else None
+
     _, unit_cogs = dispatch_sku(sku_id, qty, channel_id,
                                 reference=reference,
                                 notes=notes, created_by=created_by,
@@ -589,10 +601,12 @@ def record_outright_transfer(sku_id, qty, channel_id, reference="",
         "gross_value":       round(qty * selling_price, 2),
         "discount_pct":      discount_pct,
         "cogs":              round(qty * unit_cogs, 2),
+        "transfer_price":    transfer_price,
         "fulfillment_type":  "OUTRIGHT",
         "platform_order_id": reference or None,
         "status":            "FULFILLED",
         "source_file":       "warehouse_app",
+        "lot_cogs_finalized": True,
     }).execute()
 
 
