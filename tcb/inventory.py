@@ -2,12 +2,15 @@
 Inventory business logic — assembly, dispatch, receive.
 All operations update both the position tables and the audit log.
 """
+import logging
 from datetime import date, datetime, timezone, timedelta
 from collections import defaultdict
 
 IST = timezone(timedelta(hours=5, minutes=30))
 from tcb.db import get_client
 from tcb.geo import city_to_state
+
+logger = logging.getLogger(__name__)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -899,3 +902,83 @@ def receive_item(item_id, qty, cost_per_unit, supplier_id=None,
     }).execute()
 
     return batch_id
+
+
+# ── SOR sell-out lot consumption ──────────────────────────────────────────────
+
+def _consume_from_lots(db, lots: list, qty: int) -> float:
+    """FIFO-consume qty units from an ordered lot list. Returns weighted avg unit_cogs."""
+    remaining = qty
+    total_cost = 0.0
+    for lot in lots:
+        if remaining <= 0:
+            break
+        take = min(int(lot["qty_remaining"]), remaining)
+        db.table("sku_cogs_lots").update(
+            {"qty_remaining": int(lot["qty_remaining"]) - take}
+        ).eq("lot_id", lot["lot_id"]).execute()
+        total_cost += take * float(lot["unit_cogs"])
+        remaining -= take
+    return round(total_cost / qty, 4)
+
+
+def consume_sor_sale(sku_id: str, qty: int, channel_id: int,
+                     supply_state: str | None = None) -> float | None:
+    """
+    FIFO-consume sku_cogs_lots for a confirmed SOR sell-out (Blinkit, Amazon FBA).
+
+    Tier-1 (preferred): if supply_state given, pool all lots for partner locations
+    in that state and consume FIFO. This gives state-level FIFO accuracy without
+    needing the specific dark store — Blinkit WHs serve all dark stores in their state.
+
+    Tier-2 (fallback): if tier-1 has insufficient qty, or no supply_state given,
+    pool ALL lots for the channel and consume FIFO. Logs a warning when falling back.
+
+    Returns weighted avg unit_cogs of consumed lots, or None if even tier-2 is
+    insufficient (logs warning, does not raise — caller records the order regardless).
+    """
+    db = get_client()
+    qty = int(qty)
+
+    def _fetch_lots(location_ids: list | None) -> list:
+        q = (db.table("sku_cogs_lots")
+               .select("lot_id, assembled_at, unit_cogs, qty_remaining")
+               .eq("sku_id", sku_id)
+               .eq("channel_id", channel_id)
+               .gt("qty_remaining", 0)
+               .order("assembled_at")
+               .order("lot_id"))
+        if location_ids is not None:
+            q = q.in_("partner_location_id", location_ids)
+        return q.execute().data
+
+    # Tier-1: state-level
+    if supply_state:
+        loc_rows = (db.table("partner_locations")
+                      .select("location_id")
+                      .eq("channel_id", channel_id)
+                      .eq("state", supply_state)
+                      .execute().data)
+        loc_ids = [r["location_id"] for r in loc_rows]
+        if loc_ids:
+            lots_t1 = _fetch_lots(loc_ids)
+            if sum(l["qty_remaining"] for l in lots_t1) >= qty:
+                return _consume_from_lots(db, lots_t1, qty)
+            logger.warning(
+                "consume_sor_sale: tier-1 insufficient for %s state=%s "
+                "(need %s have %s) — falling back to channel pool",
+                sku_id, supply_state, qty,
+                sum(l["qty_remaining"] for l in lots_t1),
+            )
+
+    # Tier-2: full channel pool
+    lots_t2 = _fetch_lots(None)
+    available = sum(l["qty_remaining"] for l in lots_t2)
+    if available < qty:
+        logger.warning(
+            "consume_sor_sale: insufficient lots for %s channel_id=%s "
+            "(need %s have %s) — COGS not updated for this order",
+            sku_id, channel_id, qty, available,
+        )
+        return None
+    return _consume_from_lots(db, lots_t2, qty)

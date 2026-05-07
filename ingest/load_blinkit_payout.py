@@ -50,6 +50,20 @@ BLK_CHANNEL_ID = 4
 _PAYOUT_FILE = "Forward & Return Cancelled Orders.xlsx"
 _UPSERT_BATCH = 100
 
+# Forward Orders column indices (0-based, header row 5, data from row 7)
+_COL_INVOICE_ID   = 1
+_COL_ORDER_ID     = 2
+_COL_ORDER_DATE   = 4
+_COL_SUPPLY_STATE = 8   # "Supply State" — used for state-level FIFO lot consumption
+_COL_CUST_CITY    = 10
+_COL_CUST_STATE   = 11
+_COL_ITEM_ID      = 13
+_COL_ORDER_STATUS = 20
+_COL_QTY          = 22
+_COL_MRP          = 23
+_COL_SP           = 24
+_COL_GROSS_BILL   = 34
+
 
 def _parse_date(val) -> date:
     if isinstance(val, datetime):
@@ -67,7 +81,7 @@ def _parse_date(val) -> date:
 
 def _load_forward_orders(
     ws, source_file: str
-) -> tuple[list[dict], list[dict], dict[str, dict[str, str]], set[tuple[str, str]]]:
+) -> tuple[list[dict], list[dict], dict[str, dict[str, str]], set[tuple[str, str]], dict[str, str]]:
     """Parse Forward Orders sheet.
 
     Returns:
@@ -75,21 +89,24 @@ def _load_forward_orders(
         cancelled_rows    — CANCELLED order dicts (force-upserted to fix any prior mis-tagging)
         inv_map           — {invoice_id: {str(item_id): order_id}} for linking returns
         cancelled_inv_ids — {(invoice_id, str(item_id))} of cancelled line items
+        supply_state_map  — {order_id: supply_state} for FIFO lot consumption
     """
     delivered_rows: list[dict] = []
     cancelled_rows: list[dict] = []
     inv_map: dict[str, dict[str, str]] = {}
     cancelled_inv_ids: set[tuple[str, str]] = set()
+    supply_state_map: dict[str, str] = {}
 
     for raw in ws.iter_rows(min_row=7, values_only=True):
         if raw[0] is None:
             continue
 
-        invoice_id    = str(raw[1]) if raw[1] else None
-        order_id_raw  = raw[2]
-        order_date_raw = raw[4]
-        blinkit_item_id = raw[13]
-        order_status  = str(raw[20]).strip().upper() if raw[20] else "FULFILLED"
+        invoice_id      = str(raw[_COL_INVOICE_ID])   if raw[_COL_INVOICE_ID]   else None
+        order_id_raw    = raw[_COL_ORDER_ID]
+        order_date_raw  = raw[_COL_ORDER_DATE]
+        supply_state    = str(raw[_COL_SUPPLY_STATE]).strip() if raw[_COL_SUPPLY_STATE] else None
+        blinkit_item_id = raw[_COL_ITEM_ID]
+        order_status    = str(raw[_COL_ORDER_STATUS]).strip().upper() if raw[_COL_ORDER_STATUS] else "FULFILLED"
 
         if not order_id_raw or not blinkit_item_id:
             continue
@@ -109,9 +126,9 @@ def _load_forward_orders(
         if invoice_id:
             inv_map.setdefault(invoice_id, {})[str(blinkit_item_id)] = order_id
 
-        mrp = float(raw[23]) if raw[23] is not None else None
-        sp  = float(raw[24]) if raw[24] is not None else None
-        qty = int(raw[22])   if raw[22] is not None else 1
+        mrp = float(raw[_COL_MRP]) if raw[_COL_MRP] is not None else None
+        sp  = float(raw[_COL_SP])  if raw[_COL_SP]  is not None else None
+        qty = int(raw[_COL_QTY])   if raw[_COL_QTY]  is not None else 1
 
         base = {
             "order_id":          order_id,
@@ -120,29 +137,30 @@ def _load_forward_orders(
             "sku_id":            sku_id,
             "quantity":          qty,
             "mrp":               mrp,
-            "city":              raw[10],
-            "state":             raw[11],
+            "city":              raw[_COL_CUST_CITY],
+            "state":             raw[_COL_CUST_STATE],
             "fulfillment_type":  "SOR",
             "platform_order_id": str(order_id_raw),
             "source_file":       source_file,
         }
 
         if order_status == "CANCELLED":
-            # Never appeared in daily sales files; no revenue settled, no COGS incurred.
             if invoice_id:
                 cancelled_inv_ids.add((invoice_id, str(blinkit_item_id)))
             cancelled_rows.append({**base, "status": "CANCELLED",
                                    "selling_price": None, "gross_value": None,
                                    "discount_pct": None, "cogs": None})
         else:
-            gv = float(raw[34]) if raw[34] is not None else None
+            gv = float(raw[_COL_GROSS_BILL]) if raw[_COL_GROSS_BILL] is not None else None
             discount_pct = round((mrp - sp) / mrp * 100, 2) if mrp and sp and mrp > 0 else None
             delivered_rows.append({**base, "status": "FULFILLED",
                                    "selling_price": sp, "gross_value": gv,
                                    "discount_pct": discount_pct,
                                    "cogs": get_sku_cogs_at_date(sku_id, order_date)})
+            if supply_state:
+                supply_state_map[order_id] = supply_state
 
-    return delivered_rows, cancelled_rows, inv_map, cancelled_inv_ids
+    return delivered_rows, cancelled_rows, inv_map, cancelled_inv_ids, supply_state_map
 
 
 def _load_returns(
@@ -193,6 +211,85 @@ def _load_returns(
     return updates
 
 
+def _apply_lot_cogs(db, delivered_rows: list[dict],
+                    supply_state_map: dict[str, str]) -> tuple[int, int]:
+    """
+    For each FULFILLED order not yet lot-finalized: consume sku_cogs_lots FIFO
+    and update orders.cogs + lot_cogs_finalized.
+
+    Returns (finalized_count, skipped_already_done).
+    """
+    from tcb.inventory import consume_sor_sale
+
+    # Fetch which order_ids are already finalized to avoid double-consumption.
+    all_ids = [r["order_id"] for r in delivered_rows]
+    already_done: set[str] = set()
+    for i in range(0, len(all_ids), 500):
+        rows = (db.table("orders")
+                  .select("order_id")
+                  .in_("order_id", all_ids[i : i + 500])
+                  .eq("lot_cogs_finalized", True)
+                  .execute().data)
+        already_done.update(r["order_id"] for r in rows)
+
+    finalized = 0
+    skipped   = 0
+    for row in delivered_rows:
+        oid = row["order_id"]
+        if oid in already_done:
+            skipped += 1
+            continue
+
+        supply_state = supply_state_map.get(oid)
+        unit_cogs = consume_sor_sale(
+            sku_id=row["sku_id"],
+            qty=row["quantity"],
+            channel_id=BLK_CHANNEL_ID,
+            supply_state=supply_state,
+        )
+
+        update: dict = {"lot_cogs_finalized": True}
+        if unit_cogs is not None:
+            update["cogs"] = round(unit_cogs * row["quantity"], 2)
+
+        db.table("orders").update(update).eq("order_id", oid).eq("channel_id", BLK_CHANNEL_ID).execute()
+        finalized += 1
+
+    return finalized, skipped
+
+
+def _flag_daily_not_in_payout(db, delivered_rows: list[dict]) -> int:
+    """
+    Warn about orders loaded from daily sales files (lot_cogs_finalized=False)
+    whose order_date falls within the payout period but are absent from the payout.
+    Returns count of flagged orders.
+    """
+    if not delivered_rows:
+        return 0
+
+    payout_ids = {r["order_id"] for r in delivered_rows}
+    dates = [r["order_date"] for r in delivered_rows]
+    min_date, max_date = min(dates), max(dates)
+
+    db_rows = (db.table("orders")
+                 .select("order_id")
+                 .eq("channel_id", BLK_CHANNEL_ID)
+                 .eq("status", "FULFILLED")
+                 .eq("lot_cogs_finalized", False)
+                 .gte("order_date", min_date)
+                 .lte("order_date", max_date)
+                 .execute().data)
+
+    missing = [r["order_id"] for r in db_rows if r["order_id"] not in payout_ids]
+    if missing:
+        logger.warning(
+            "%d order(s) in DB for %s–%s are FULFILLED but absent from this payout — "
+            "review manually: %s",
+            len(missing), min_date, max_date, missing[:10],
+        )
+    return len(missing)
+
+
 def load_payout_folder(folder: Path, db, dry_run: bool = False) -> tuple[int, int, int]:
     """Load one payout folder. Returns (new_orders, skipped_orders, returns_marked)."""
     payout_file = folder / _PAYOUT_FILE
@@ -203,7 +300,8 @@ def load_payout_folder(folder: Path, db, dry_run: bool = False) -> tuple[int, in
     ws_fwd = wb["Forward Orders"]
     ws_ret = wb["Cancelled or Returned Orders"]
 
-    delivered_rows, cancelled_rows, inv_map, cancelled_inv_ids = _load_forward_orders(ws_fwd, payout_file.name)
+    delivered_rows, cancelled_rows, inv_map, cancelled_inv_ids, supply_state_map = \
+        _load_forward_orders(ws_fwd, payout_file.name)
     return_updates = _load_returns(ws_ret, inv_map, cancelled_inv_ids)
 
     wb.close()
@@ -211,7 +309,8 @@ def load_payout_folder(folder: Path, db, dry_run: bool = False) -> tuple[int, in
     if dry_run:
         print(
             f"[DRY RUN] Forward Orders: {len(delivered_rows)} delivered, "
-            f"{len(cancelled_rows)} cancelled | Returns: {len(return_updates)} matched"
+            f"{len(cancelled_rows)} cancelled | Returns: {len(return_updates)} matched | "
+            f"Supply states captured: {len(supply_state_map)}"
         )
         return len(delivered_rows) + len(cancelled_rows), 0, len(return_updates)
 
@@ -229,7 +328,7 @@ def load_payout_folder(folder: Path, db, dry_run: bool = False) -> tuple[int, in
 
     skipped = len(delivered_rows) - new_count
 
-    # Force-upsert cancelled orders — overwrites any row mis-tagged as SALE_RETURN or FULFILLED
+    # Force-upsert cancelled orders
     for i in range(0, len(cancelled_rows), _UPSERT_BATCH):
         result = (
             db.table("orders")
@@ -240,12 +339,20 @@ def load_payout_folder(folder: Path, db, dry_run: bool = False) -> tuple[int, in
         )
         new_count += len(result.data) if result.data else 0
 
+    # Consume FIFO lots and finalize COGS for all delivered orders
+    finalized, already_done = _apply_lot_cogs(db, delivered_rows, supply_state_map)
+    logger.info("Lot COGS finalized: %d | already done: %d", finalized, already_done)
+
+    # Flag daily-loaded orders absent from this payout
+    _flag_daily_not_in_payout(db, delivered_rows)
+
     # Mark genuine customer returns
     returns_marked = 0
     for upd in return_updates:
         result = (
             db.table("orders")
-            .update({"status": "SALE_RETURN", "return_date": upd["return_date"].isoformat() if upd["return_date"] else None})
+            .update({"status": "SALE_RETURN",
+                     "return_date": upd["return_date"].isoformat() if upd["return_date"] else None})
             .eq("order_id", upd["order_id"])
             .eq("channel_id", BLK_CHANNEL_ID)
             .execute()
