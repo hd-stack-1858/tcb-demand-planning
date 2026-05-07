@@ -52,6 +52,89 @@ def resolve_blinkit_sku(blinkit_item_id: int, order_date: date) -> str | None:
     return sku_id
 
 
+# ── Amazon helpers ────────────────────────────────────────────────────────────
+
+# Indian state normalisation: handles abbreviations AND all-caps full names.
+_STATE_NORM: dict[str, str] = {
+    # Abbreviations
+    "AP": "Andhra Pradesh", "AR": "Arunachal Pradesh", "AS": "Assam",
+    "BR": "Bihar", "CG": "Chhattisgarh", "GA": "Goa", "GJ": "Gujarat",
+    "HR": "Haryana", "HP": "Himachal Pradesh", "JK": "Jammu & Kashmir",
+    "JH": "Jharkhand", "KA": "Karnataka", "KL": "Kerala",
+    "MP": "Madhya Pradesh", "MH": "Maharashtra", "MN": "Manipur",
+    "ML": "Meghalaya", "MZ": "Mizoram", "NL": "Nagaland",
+    "OD": "Odisha", "OR": "Odisha", "PB": "Punjab", "RJ": "Rajasthan",
+    "SK": "Sikkim", "TN": "Tamil Nadu", "TG": "Telangana", "TR": "Tripura",
+    "UP": "Uttar Pradesh", "UK": "Uttarakhand", "WB": "West Bengal",
+    "DL": "Delhi", "CH": "Chandigarh", "PY": "Puducherry",
+    "DN": "Dadra & Nagar Haveli", "DD": "Daman & Diu", "LD": "Lakshadweep",
+    "AN": "Andaman & Nicobar Islands",
+}
+
+
+def normalise_state(raw: str | None) -> str | None:
+    """Return a consistently-cased state name from Amazon ship-state values."""
+    if not raw:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    upper = s.upper()
+    # Try abbreviation map first (2–3 char codes)
+    if upper in _STATE_NORM:
+        return _STATE_NORM[upper]
+    # Already a full name (possibly all-caps) — title-case it
+    return s.title()
+
+
+@lru_cache(maxsize=1)
+def _load_amazon_asin_map() -> dict[str, str]:
+    """Return {asin: sku_id} from sku_channel_ids for channel AZ."""
+    from tcb.db import get_client
+    rows = (
+        get_client()
+        .table("sku_channel_ids")
+        .select("sku_id, platform_pid")
+        .eq("channel_code", "AZ")
+        .execute()
+        .data
+    )
+    result: dict[str, str] = {}
+    for r in rows:
+        pid = (r.get("platform_pid") or "").strip()
+        if pid and pid not in ("Not listed", "NA"):
+            result[pid] = r["sku_id"]
+    return result
+
+
+def resolve_amazon_sku(asin: str) -> str | None:
+    """Return our sku_id for an Amazon ASIN. Returns None if not mapped."""
+    sku_id = _load_amazon_asin_map().get(asin.strip())
+    if sku_id is None:
+        logger.warning("Unknown ASIN %s — row skipped", asin)
+    return sku_id
+
+
+@lru_cache(maxsize=256)
+def get_sku_mrp_at_date(sku_id: str, as_of_date: date) -> float | None:
+    """Return the MRP effective on as_of_date from sku_pricing."""
+    from tcb.db import get_client
+    rows = (
+        get_client()
+        .table("sku_pricing")
+        .select("mrp")
+        .eq("sku_id", sku_id)
+        .lte("effective_date", str(as_of_date))
+        .order("effective_date", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    return float(rows[0]["mrp"]) if rows else None
+
+
+# ── SKU COGS helper ────────────────────────────────────────────────────────────
+
 @lru_cache(maxsize=512)
 def get_sku_cogs_at_date(sku_id: str, as_of_date: date) -> float | None:
     """Compute SKU COGS at a point in time: BOM × most-recent batch cost per item.
