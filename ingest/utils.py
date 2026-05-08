@@ -133,6 +133,73 @@ def get_sku_mrp_at_date(sku_id: str, as_of_date: date) -> float | None:
     return float(rows[0]["mrp"]) if rows else None
 
 
+# ── First Cry helpers ─────────────────────────────────────────────────────────
+
+@lru_cache(maxsize=1)
+def _load_fc_product_map() -> dict[str, str]:
+    """Return {platform_pid: sku_id} for all FC SKUs with a mapped Product ID."""
+    from tcb.db import get_client
+    rows = (
+        get_client()
+        .table("sku_channel_ids")
+        .select("sku_id, platform_pid")
+        .eq("channel_code", "FC")
+        .execute()
+        .data
+    )
+    result: dict[str, str] = {}
+    for r in rows:
+        pid = str(r.get("platform_pid") or "").strip()
+        if pid and pid not in ("Not listed", "NA", ""):
+            result[pid] = r["sku_id"]
+    return result
+
+
+def resolve_fc_sku(product_id: str | int) -> str | None:
+    """Return our sku_id for a First Cry Product ID. Returns None if not mapped."""
+    sku_id = _load_fc_product_map().get(str(product_id).strip())
+    if sku_id is None:
+        logger.warning("Unknown FC Product ID %s — row skipped", product_id)
+    return sku_id
+
+
+@lru_cache(maxsize=256)
+def get_sku_sp_at_date(sku_id: str, as_of_date: date) -> float | None:
+    """Return the selling price (sp) effective on as_of_date from sku_pricing."""
+    from tcb.db import get_client
+    rows = (
+        get_client()
+        .table("sku_pricing")
+        .select("sp")
+        .eq("sku_id", sku_id)
+        .lte("effective_date", str(as_of_date))
+        .order("effective_date", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    return float(rows[0]["sp"]) if rows else None
+
+
+@lru_cache(maxsize=512)
+def get_channel_tp_at_date(sku_id: str, channel_code: str, as_of_date: date) -> float | None:
+    """Return the transfer price effective on as_of_date from sku_channel_tp."""
+    from tcb.db import get_client
+    rows = (
+        get_client()
+        .table("sku_channel_tp")
+        .select("transfer_price")
+        .eq("sku_id", sku_id)
+        .eq("channel_code", channel_code)
+        .lte("effective_date", str(as_of_date))
+        .order("effective_date", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    return float(rows[0]["transfer_price"]) if rows else None
+
+
 # ── SKU COGS helper ────────────────────────────────────────────────────────────
 
 @lru_cache(maxsize=512)
