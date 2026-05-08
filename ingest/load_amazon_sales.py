@@ -33,7 +33,7 @@ import csv
 import logging
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -47,6 +47,8 @@ from ingest.utils import (
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 AZ_FBA_CHANNEL_ID = 2
 AZ_FBM_CHANNEL_ID = 3
@@ -65,12 +67,16 @@ _UPSERT_BATCH = 100
 
 
 def _parse_date(val: str) -> date:
-    """Parse ISO-8601 datetime string from Amazon report to date."""
+    """Parse ISO-8601 datetime string from Amazon report to IST date.
+
+    Amazon reports purchase-date in UTC. Convert to IST (+5:30) before
+    extracting the date so late-evening UTC orders land on the correct
+    Indian calendar date.
+    """
     s = val.strip()
     if not s:
         raise ValueError("Empty date")
-    # Format: 2025-11-24T06:34:56+00:00
-    return datetime.fromisoformat(s).date()
+    return datetime.fromisoformat(s).astimezone(_IST).date()
 
 
 def _flt(val: str) -> float | None:
