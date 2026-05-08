@@ -1,11 +1,13 @@
-"""Load Amazon FBA sell-out TSV report files into the orders table.
+"""Load Amazon sell-out TSV report files into the orders table.
 
-Filter logic
-  sales-channel = Amazon.in  AND  order-status = Shipped  (FBA only)
-  Excluded:
-    Cancelled              — no shipment, no sale
-    Pending                — not yet shipped; will appear in next month's file
-    Shipped - Delivered to Buyer — FBM (fulfilled via own WH), already in App
+Loads all sales-channel = Amazon.in rows across four order statuses:
+  Shipped                    → FULFILLED, channel_id=2 (FBA)
+  Shipped - Delivered to Buyer → FULFILLED, channel_id=3 (FBM, own-WH dispatch)
+  Cancelled                  → CANCELLED,  channel_id=2 (FBA)
+  Pending                    → PENDING,    channel_id=2 (FBA, end-of-month snapshot)
+
+Excluded (sales-channel = Non-Amazon):
+  Removal orders — stock Amazon sends back to own WH; handled via App inward.
 
 ASIN -> sku_id  via  sku_channel_ids.platform_pid  (channel_code = AZ)
 Do NOT use the sku column in the Amazon report — Amazon SKU codes do not match
@@ -47,14 +49,17 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 AZ_FBA_CHANNEL_ID = 2
+AZ_FBM_CHANNEL_ID = 3
 
 # AZ seed lots were created on this date. Orders before it are pre-seed:
 # COGS already accounted for in opening inventory, lot_cogs_finalized=TRUE.
 AZ_LOT_PIVOT = date(2026, 5, 2)
 
-_FULFILLED_STATUS  = "Shipped"
-_CANCELLED_STATUS  = "Cancelled"
-_LOAD_ORDER_STATUSES = {_FULFILLED_STATUS, _CANCELLED_STATUS}
+_STATUS_SHIPPED    = "Shipped"
+_STATUS_FBM        = "Shipped - Delivered to Buyer"
+_STATUS_CANCELLED  = "Cancelled"
+_STATUS_PENDING    = "Pending"
+_LOAD_ORDER_STATUSES = {_STATUS_SHIPPED, _STATUS_FBM, _STATUS_CANCELLED, _STATUS_PENDING}
 _INCLUDE_SALES_CHANNEL = "Amazon.in"
 _UPSERT_BATCH = 100
 
@@ -75,18 +80,13 @@ def _flt(val: str) -> float | None:
 
 def _build_row(row: dict, source_file: str) -> dict | None:
     """Build an orders dict from one TSV row. Returns None to skip."""
-    # Channel filter
+    # Exclude Non-Amazon channel (removal orders — stock sent back from AZ WH to own WH)
     if row.get("sales-channel", "").strip() != _INCLUDE_SALES_CHANNEL:
         return None
 
-    # Status filter — load Shipped (FBA fulfilled) and Cancelled only.
-    # Skip Pending/Shipping (not final) and "Shipped - Delivered to Buyer" (FBM,
-    # already captured via App dispatch to avoid double-counting).
     order_status = row.get("order-status", "").strip()
     if order_status not in _LOAD_ORDER_STATUSES:
         return None
-
-    is_cancelled = order_status == _CANCELLED_STATUS
 
     # ASIN → sku_id
     asin = row.get("asin", "").strip()
@@ -106,7 +106,8 @@ def _build_row(row: dict, source_file: str) -> dict | None:
 
     amazon_order_id = row.get("amazon-order-id", "").strip()
 
-    if is_cancelled:
+    # Cancelled — zero-value placeholder for MIS visibility
+    if order_status == _STATUS_CANCELLED:
         return {
             "order_id":           f"AZ-{amazon_order_id}-{sku_id}",
             "channel_id":         AZ_FBA_CHANNEL_ID,
@@ -127,7 +128,33 @@ def _build_row(row: dict, source_file: str) -> dict | None:
             "lot_cogs_finalized": True,
         }
 
-    # Fulfilled path (Shipped)
+    # Pending — end-of-month snapshot; will become Shipped or Cancelled in next file
+    if order_status == _STATUS_PENDING:
+        return {
+            "order_id":           f"AZ-{amazon_order_id}-{sku_id}",
+            "channel_id":         AZ_FBA_CHANNEL_ID,
+            "order_date":         order_date.isoformat(),
+            "sku_id":             sku_id,
+            "quantity":           int(row.get("quantity", "") or 0),
+            "mrp":                get_sku_mrp_at_date(sku_id, order_date),
+            "selling_price":      _flt(row.get("item-price", "")) or 0.0,
+            "gross_value":        0.0,
+            "discount_pct":       None,
+            "cogs":               None,
+            "city":               None,
+            "state":              None,
+            "fulfillment_type":   "SOR",
+            "status":             "PENDING",
+            "platform_order_id":  amazon_order_id,
+            "source_file":        source_file,
+            "lot_cogs_finalized": False,
+        }
+
+    # Fulfilled path — both FBA (Shipped) and FBM (Shipped - Delivered to Buyer)
+    is_fbm = order_status == _STATUS_FBM
+    channel_id = AZ_FBM_CHANNEL_ID if is_fbm else AZ_FBA_CHANNEL_ID
+    fulfillment_type = "OUTRIGHT" if is_fbm else "SOR"
+
     qty_raw = row.get("quantity", "").strip()
     qty = int(qty_raw) if qty_raw else 1
     if qty <= 0:
@@ -153,7 +180,7 @@ def _build_row(row: dict, source_file: str) -> dict | None:
 
     return {
         "order_id":           f"AZ-{amazon_order_id}-{sku_id}",
-        "channel_id":         AZ_FBA_CHANNEL_ID,
+        "channel_id":         channel_id,
         "order_date":         order_date.isoformat(),
         "sku_id":             sku_id,
         "quantity":           qty,
@@ -164,7 +191,7 @@ def _build_row(row: dict, source_file: str) -> dict | None:
         "cogs":               cogs,
         "city":               city,
         "state":              state,
-        "fulfillment_type":   "SOR",
+        "fulfillment_type":   fulfillment_type,
         "status":             "FULFILLED",
         "platform_order_id":  amazon_order_id,
         "source_file":        source_file,
