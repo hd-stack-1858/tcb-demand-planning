@@ -167,8 +167,9 @@ def _build_row(row: dict, source_file: str) -> dict | None:
         return None
 
     sp = _flt(row.get("item-price", ""))
-    if sp is None or sp <= 0:
+    if sp is None:
         return None
+    # sp=0.0 is valid — promotional / free order; load it
 
     mrp = get_sku_mrp_at_date(sku_id, order_date)
     gross_value = round(sp * qty, 2)
