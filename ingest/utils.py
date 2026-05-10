@@ -3,10 +3,27 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date
 from functools import lru_cache
 
 logger = logging.getLogger(__name__)
+
+
+def _execute_with_retry(query, retries: int = 3, backoff: float = 2.0):
+    """Execute a postgrest query, retrying on transient network errors."""
+    import httpx
+    import httpcore
+    for attempt in range(retries):
+        try:
+            return query.execute()
+        except (httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError):
+            if attempt == retries - 1:
+                raise
+            wait = backoff * (2 ** attempt)
+            logger.warning("Network error on attempt %d — retrying in %.1fs", attempt + 1, wait)
+            time.sleep(wait)
+    raise RuntimeError("unreachable")
 
 # TCB009 (2025 mugs) and TCB009_1 (2026 mugs) share the same Blinkit Item ID.
 # Orders before this cutoff → TCB009; from this date onwards → TCB009_1.
@@ -18,14 +35,12 @@ _AMBIGUOUS_BLK_ITEM_ID = 10274008
 def _load_blinkit_sku_map() -> dict[str, str]:
     """Return {platform_pid_additional: sku_id} for all unambiguous Blinkit SKUs."""
     from tcb.db import get_client
-    rows = (
+    rows = _execute_with_retry(
         get_client()
         .table("sku_channel_ids")
         .select("sku_id, platform_pid_additional")
         .eq("channel_code", "BLK")
-        .execute()
-        .data
-    )
+    ).data
     result: dict[str, str] = {}
     for r in rows:
         val = r.get("platform_pid_additional") or ""
@@ -91,14 +106,12 @@ def normalise_state(raw: str | None) -> str | None:
 def _load_amazon_asin_map() -> dict[str, str]:
     """Return {asin: sku_id} from sku_channel_ids for channel AZ."""
     from tcb.db import get_client
-    rows = (
+    rows = _execute_with_retry(
         get_client()
         .table("sku_channel_ids")
         .select("sku_id, platform_pid")
         .eq("channel_code", "AZ")
-        .execute()
-        .data
-    )
+    ).data
     result: dict[str, str] = {}
     for r in rows:
         pid = (r.get("platform_pid") or "").strip()
@@ -119,7 +132,7 @@ def resolve_amazon_sku(asin: str) -> str | None:
 def get_sku_mrp_at_date(sku_id: str, as_of_date: date) -> float | None:
     """Return the MRP effective on as_of_date from sku_pricing."""
     from tcb.db import get_client
-    rows = (
+    rows = _execute_with_retry(
         get_client()
         .table("sku_pricing")
         .select("mrp")
@@ -127,9 +140,7 @@ def get_sku_mrp_at_date(sku_id: str, as_of_date: date) -> float | None:
         .lte("effective_date", str(as_of_date))
         .order("effective_date", desc=True)
         .limit(1)
-        .execute()
-        .data
-    )
+    ).data
     return float(rows[0]["mrp"]) if rows else None
 
 
@@ -139,14 +150,12 @@ def get_sku_mrp_at_date(sku_id: str, as_of_date: date) -> float | None:
 def _load_fc_product_map() -> dict[str, str]:
     """Return {platform_pid: sku_id} for all FC SKUs with a mapped Product ID."""
     from tcb.db import get_client
-    rows = (
+    rows = _execute_with_retry(
         get_client()
         .table("sku_channel_ids")
         .select("sku_id, platform_pid")
         .eq("channel_code", "FC")
-        .execute()
-        .data
-    )
+    ).data
     result: dict[str, str] = {}
     for r in rows:
         pid = str(r.get("platform_pid") or "").strip()
@@ -167,7 +176,7 @@ def resolve_fc_sku(product_id: str | int) -> str | None:
 def get_sku_sp_at_date(sku_id: str, as_of_date: date) -> float | None:
     """Return the selling price (sp) effective on as_of_date from sku_pricing."""
     from tcb.db import get_client
-    rows = (
+    rows = _execute_with_retry(
         get_client()
         .table("sku_pricing")
         .select("sp")
@@ -175,9 +184,7 @@ def get_sku_sp_at_date(sku_id: str, as_of_date: date) -> float | None:
         .lte("effective_date", str(as_of_date))
         .order("effective_date", desc=True)
         .limit(1)
-        .execute()
-        .data
-    )
+    ).data
     return float(rows[0]["sp"]) if rows else None
 
 
@@ -185,7 +192,7 @@ def get_sku_sp_at_date(sku_id: str, as_of_date: date) -> float | None:
 def get_channel_tp_at_date(sku_id: str, channel_code: str, as_of_date: date) -> float | None:
     """Return the transfer price effective on as_of_date from sku_channel_tp."""
     from tcb.db import get_client
-    rows = (
+    rows = _execute_with_retry(
         get_client()
         .table("sku_channel_tp")
         .select("transfer_price")
@@ -194,9 +201,7 @@ def get_channel_tp_at_date(sku_id: str, channel_code: str, as_of_date: date) -> 
         .lte("effective_date", str(as_of_date))
         .order("effective_date", desc=True)
         .limit(1)
-        .execute()
-        .data
-    )
+    ).data
     return float(rows[0]["transfer_price"]) if rows else None
 
 
@@ -213,28 +218,24 @@ def get_sku_cogs_at_date(sku_id: str, as_of_date: date) -> float | None:
     from tcb.db import get_client
     db = get_client()
 
-    bom = (
+    bom = _execute_with_retry(
         db.table("bom")
         .select("item_id, quantity_per_sku")
         .eq("sku_id", sku_id)
-        .execute()
-        .data
-    )
+    ).data
     if not bom:
         return None
 
     total = 0.0
     for b in bom:
-        batch = (
+        batch = _execute_with_retry(
             db.table("item_batches")
             .select("cost_per_unit")
             .eq("item_id", b["item_id"])
             .lte("received_date", str(as_of_date))
             .order("received_date", desc=True)
             .limit(1)
-            .execute()
-            .data
-        )
+        ).data
         if not batch:
             return None
         total += float(b["quantity_per_sku"]) * float(batch[0]["cost_per_unit"])
