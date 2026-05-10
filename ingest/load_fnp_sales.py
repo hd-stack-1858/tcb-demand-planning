@@ -5,9 +5,11 @@ Two source files (both required for historical load):
   --report    : FnP delivery report  — confirmed-delivered orders only (cda-export *.xls)
 
 Status assignment:
-  Order No in delivery report                → FULFILLED
-  Order No not in report, Order Month May-26 → FULFILLED  (report not yet available)
-  Order No not in report, Dec-25 to Apr-26   → SALE_RETURN
+  Order No in delivery report                          → FULFILLED
+  Order No not in report, Order Month in _NO_REPORT_MONTHS → FULFILLED  (no report yet)
+  Order No not in report, order_date in last 7 days of report coverage → PENDING
+    (may be delivered next month — re-run with next month's report to resolve)
+  Order No not in report, earlier months              → SALE_RETURN
 
 TP validation (logged, not fatal):
   GRAND_TOTAL in delivery report = what FnP pays us (sum of TPs for all SKUs in order).
@@ -32,6 +34,7 @@ import logging
 import os
 import sys
 from collections import defaultdict
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -81,11 +84,30 @@ def _load_delivery_report(path: Path) -> tuple[set[str], dict[str, float]]:
     return delivered, totals
 
 
-def _determine_status(order_no: str, order_month: str, delivered: set[str]) -> str:
+def _pending_cutoff(extracted_df: pd.DataFrame) -> date:
+    """Return the first day of the 'last week' window for PENDING status.
+
+    Any order placed in the 7 days up to and including the latest covered date
+    (months NOT in _NO_REPORT_MONTHS) that is absent from the delivery report
+    is marked PENDING rather than SALE_RETURN.  When next month's report
+    arrives, re-running the loader will resolve these to FULFILLED or SALE_RETURN.
+    """
+    covered = extracted_df[~extracted_df["Order Month"].isin(_NO_REPORT_MONTHS)]
+    if covered.empty:
+        return date.max
+    max_date = covered["Order Date"].apply(_parse_date).max()
+    return max_date - timedelta(days=6)
+
+
+def _determine_status(order_no: str, order_month: str,
+                      order_date: "date", delivered: set[str],
+                      pending_cutoff: "date") -> str:
     if order_no in delivered:
         return "FULFILLED"
     if order_month in _NO_REPORT_MONTHS:
         return "FULFILLED"
+    if order_date >= pending_cutoff:
+        return "PENDING"
     return "SALE_RETURN"
 
 
@@ -126,7 +148,7 @@ def _validate_tp(extracted_df: pd.DataFrame, delivered: set[str],
 
 
 def _build_rows(extracted_df: pd.DataFrame, delivered: set[str],
-                source_file: str) -> tuple[list[dict], int]:
+                pending_cutoff: "date", source_file: str) -> tuple[list[dict], int]:
     """Build order dicts from FnP_Extracted rows. Returns (rows, skipped)."""
     rows: list[dict] = []
     skipped = 0
@@ -150,7 +172,7 @@ def _build_rows(extracted_df: pd.DataFrame, delivered: set[str],
         if city == "Nan":
             city = None
 
-        status = _determine_status(order_no, order_month, delivered)
+        status = _determine_status(order_no, order_month, order_date, delivered, pending_cutoff)
 
         sp    = get_sku_sp_at_date(sku_id, order_date)
         mrp   = get_sku_mrp_at_date(sku_id, order_date)
@@ -225,7 +247,9 @@ def load_files(extracted_path: Path, report_path: Path,
     # TP validation (log only, never fatal)
     _validate_tp(extracted_df, delivered, totals)
 
-    all_rows, skipped = _build_rows(extracted_df, delivered, extracted_path.name)
+    cutoff = _pending_cutoff(extracted_df)
+    logger.info("PENDING cutoff: orders from %s onwards not in report → PENDING", cutoff)
+    all_rows, skipped = _build_rows(extracted_df, delivered, cutoff, extracted_path.name)
 
     # Add the missing order not in Extracted
     all_rows.append(_missing_order_row())
