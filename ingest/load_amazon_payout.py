@@ -1,8 +1,8 @@
-"""Tag Amazon returned orders (RTO / SALE_RETURN) from the payout transactions CSV.
+"""Tag Amazon returned/replacement orders from the payout transactions CSV.
 
 Download from Seller Central → Payments → Transaction View → Download.
 
-How it works:
+How it works — returns (RTO / SALE_RETURN):
   1. Group every row in the CSV by Order ID.
   2. Orders that have at least one 'Refund' transaction are returns.
   3. Net total = sum of 'Total (INR)' across ALL transaction rows for that order.
@@ -14,6 +14,13 @@ How it works:
   4. return_date = Date of the first Refund row for that order.
   5. Updates status + return_date on all FULFILLED DB rows for that platform_order_id
      across AZ FBA (channel 2) and AZ FBM (channel 3).
+
+How it works — replacements (REPLACEMENT):
+  An Order Payment row with Total product charges = 0 is a replacement order.
+  Amazon ships a free unit to the customer; no Refund row exists.
+  The replacement order status → REPLACEMENT (selling_price was already loaded as 0).
+  The original order stays FULFILLED.
+  REPLACEMENT orders participate in FIFO lot COGS consumption same as FULFILLED.
 
 Deferred transactions are processed — the physical return occurred even if
 Amazon has not finalised the financial settlement yet.
@@ -90,6 +97,30 @@ def _build_return_map(rows: list[dict]) -> dict[str, tuple[str, date | None]]:
     return result
 
 
+def _build_replacement_map(rows: list[dict]) -> dict[str, date | None]:
+    """Return {amazon_order_id: order_date} for replacement orders.
+
+    Identified by: a single Order Payment row where Total product charges = 0.
+    Amazon ships a free unit; no Refund row exists for the replacement order.
+    """
+    result: dict[str, date | None] = {}
+    for row in rows:
+        if row.get("Transaction type") != "Order Payment":
+            continue
+        oid = (row.get("Order ID") or "").strip()
+        if not oid:
+            continue
+        tpc = _flt(row.get("Total product charges", ""))
+        if tpc == 0.0:
+            try:
+                order_date = _parse_date(row.get("Date", ""))
+            except ValueError:
+                order_date = None
+            result[oid] = order_date
+            logger.debug("Replacement candidate: %s  date=%s", oid, order_date)
+    return result
+
+
 def _load_reasons(reasons_path: Path) -> dict[str, str]:
     """Load return reason buckets from the tracking sheet CSV.
 
@@ -120,25 +151,30 @@ def load_payout_file(
     db,
     reasons_map: dict[str, str] | None = None,
     dry_run: bool = False,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, int]:
     """Process one payout CSV.
 
-    Returns (rto_marked, sale_return_marked, already_tagged, not_in_db, reasons_enriched).
+    Returns (rto_marked, sale_return_marked, already_tagged, not_in_db,
+             reasons_enriched, replacement_marked).
     """
     with open(filepath, encoding="utf-8-sig", newline="") as f:
         rows = list(csv.DictReader(f))
 
     return_map = _build_return_map(rows)
+    replacement_map = _build_replacement_map(rows)
+    # Safety: an order can't be both a return and a replacement
+    replacement_map = {oid: d for oid, d in replacement_map.items() if oid not in return_map}
 
     rto_total = sum(1 for s, _ in return_map.values() if s == "RTO")
     sr_total  = sum(1 for s, _ in return_map.values() if s == "SALE_RETURN")
     logger.info(
-        "Payout file: %d rows | %d orders with Refund (%d RTO candidates, %d SALE_RETURN candidates)",
-        len(rows), len(return_map), rto_total, sr_total,
+        "Payout file: %d rows | %d orders with Refund (%d RTO, %d SALE_RETURN) | %d replacement candidates",
+        len(rows), len(return_map), rto_total, sr_total, len(replacement_map),
     )
 
-    rto_marked = sr_marked = already_tagged = not_in_db = reasons_enriched = 0
+    rto_marked = sr_marked = already_tagged = not_in_db = reasons_enriched = replacement_marked = 0
 
+    # --- tag returns (RTO / SALE_RETURN) ---
     for oid, (status, return_date) in return_map.items():
         reason = (reasons_map or {}).get(oid)
 
@@ -206,14 +242,59 @@ def load_payout_file(
                 logger.info("Order %s already fully tagged — skipped", oid)
                 already_tagged += 1
 
-    return rto_marked, sr_marked, already_tagged, not_in_db, reasons_enriched
+    # --- tag replacements ---
+    for oid, order_date in replacement_map.items():
+        res = (
+            db.table("orders")
+            .select("order_id,status,selling_price")
+            .eq("platform_order_id", oid)
+            .in_("channel_id", _AZ_CHANNELS)
+            .execute()
+        )
+        db_rows = res.data
+
+        if not db_rows:
+            logger.warning("Replacement order %s not in DB — skipped", oid)
+            not_in_db += 1
+            continue
+
+        fulfilled = [r for r in db_rows if r["status"] == "FULFILLED"]
+        already   = [r for r in db_rows if r["status"] == "REPLACEMENT"]
+
+        if fulfilled:
+            if dry_run:
+                logger.info(
+                    "[DRY RUN] %s → REPLACEMENT  (%d row(s))",
+                    oid, len(fulfilled),
+                )
+            else:
+                db.table("orders").update({"status": "REPLACEMENT"}).eq(
+                    "platform_order_id", oid
+                ).in_("channel_id", _AZ_CHANNELS).eq("status", "FULFILLED").execute()
+                logger.info("Marked %s → REPLACEMENT  (%d DB row(s))", oid, len(fulfilled))
+            replacement_marked += 1
+        elif already:
+            logger.info("Replacement order %s already tagged — skipped", oid)
+            already_tagged += 1
+        else:
+            logger.warning(
+                "Replacement order %s: DB rows not FULFILLED (statuses=%s) — skipped",
+                oid, [r["status"] for r in db_rows],
+            )
+
+    return rto_marked, sr_marked, already_tagged, not_in_db, reasons_enriched, replacement_marked
 
 
-def _verify(db, return_map: dict[str, tuple[str, date | None]]) -> None:
-    """Read back marked orders and confirm status matches expectation."""
-    all_ids = list(return_map.keys())
+def _verify(
+    db,
+    return_map: dict[str, tuple[str, date | None]],
+    replacement_map: dict[str, date | None],
+) -> None:
+    """Read back marked orders and confirm statuses match expectation."""
     mismatches = 0
 
+    # verify returns
+    all_ids = list(return_map.keys())
     for i in range(0, len(all_ids), 200):
         batch = all_ids[i : i + 200]
         rows = (
@@ -234,8 +315,30 @@ def _verify(db, return_map: dict[str, tuple[str, date | None]]) -> None:
                 )
                 mismatches += 1
 
+    # verify replacements
+    rep_ids = list(replacement_map.keys())
+    for i in range(0, len(rep_ids), 200):
+        batch = rep_ids[i : i + 200]
+        rows = (
+            db.table("orders")
+            .select("platform_order_id,status")
+            .in_("platform_order_id", batch)
+            .in_("channel_id", _AZ_CHANNELS)
+            .execute()
+            .data
+        )
+        for row in rows:
+            oid    = row["platform_order_id"]
+            actual = row["status"]
+            if actual not in ("REPLACEMENT", "CANCELLED", "PENDING"):
+                logger.warning(
+                    "VERIFY MISMATCH: replacement order %s — expected REPLACEMENT, got %s",
+                    oid, actual,
+                )
+                mismatches += 1
+
     if mismatches == 0:
-        logger.info("Verification passed — all return statuses correct in DB")
+        logger.info("Verification passed — all statuses correct in DB")
     else:
         logger.error("Verification: %d mismatch(es) — review logs above", mismatches)
 
@@ -262,8 +365,13 @@ def main() -> None:
     with open(args.file, encoding="utf-8-sig", newline="") as f:
         rows = list(csv.DictReader(f))
     return_map = _build_return_map(rows)
+    replacement_map = {
+        oid: d
+        for oid, d in _build_replacement_map(rows).items()
+        if oid not in return_map
+    }
 
-    rto, sr, done, missing, enriched = load_payout_file(
+    rto, sr, done, missing, enriched, replaced = load_payout_file(
         Path(args.file), db, reasons_map=reasons_map, dry_run=args.dry_run
     )
 
@@ -272,13 +380,14 @@ def main() -> None:
         f"\n{args.file}{tag}\n"
         f"  RTO marked         : {rto}\n"
         f"  SALE_RETURN marked : {sr}\n"
+        f"  REPLACEMENT marked : {replaced}\n"
         f"  Reasons enriched   : {enriched}\n"
         f"  Already tagged     : {done}\n"
         f"  Not in DB          : {missing}\n"
     )
 
     if not args.dry_run:
-        _verify(db, return_map)
+        _verify(db, return_map, replacement_map)
 
 
 if __name__ == "__main__":
