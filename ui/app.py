@@ -44,6 +44,7 @@ for _k, _v in [
     ("pending_ship",     None),
     ("wo_key",           0),
     ("wo_success",       None),
+    ("wo_error",         None),
     ("writing_off",      False),
     ("pending_wo",       None),
     ("ret_key",          0),
@@ -384,26 +385,26 @@ with tab_ship:
                     if p["level"] == "sku":
                         writeoff_sku(row["sku"], row["qty"],
                                      reason=p["reason"], notes=p["wo_notes"], created_by="app")
-                        st.write(f"Written off {row['qty']}× {row['sku']}")
+                        st.write(f"Written off {row['qty']}x {row['sku']}")
                     else:
                         writeoff_item(row["item_id"], row["qty"],
                                       reason=p["reason"], notes=p["wo_notes"], created_by="app")
-                        st.write(f"Written off {row['qty']}× {row['item_name']}")
+                        st.write(f"Written off {row['qty']}x {row['item_name']}")
                 except Exception as e:
                     name = row.get("sku", row.get("item_name", "?"))
-                    errors.append(f"❌ {name}: {e}")
+                    errors.append(f"{name}: {e}")
             status.update(
                 label="Done" if not errors else "Completed with errors",
                 state="complete" if not errors else "error",
             )
-        for msg in errors:
-            st.error(msg)
         if not errors:
             if p["level"] == "sku":
-                wo_str = ", ".join(f"{r['qty']}× {r['sku']}" for r in p["to_wo"])
+                wo_str = ", ".join(f"{r['qty']}x {r['sku']}" for r in p["to_wo"])
             else:
-                wo_str = ", ".join(f"{r['qty']}× {r['item_name']}" for r in p["to_wo"])
-            st.session_state.wo_success = f"✅ Written off [{p['reason']}] — {wo_str}"
+                wo_str = ", ".join(f"{r['qty']}x {r['item_name']}" for r in p["to_wo"])
+            st.session_state.wo_success = f"Written off [{p['reason']}] -- {wo_str}"
+        else:
+            st.session_state.wo_error = "Write-off failed:\n" + "\n".join(errors)
         st.session_state.writing_off = False
         st.session_state.pending_wo  = None
         st.session_state.wo_key     += 1
@@ -425,9 +426,15 @@ with tab_ship:
 
     if st.session_state.wo_success:
         st.success(st.session_state.wo_success)
-        if st.button("Dismiss ✕", key="dismiss_wo"):
+        if st.button("Dismiss", key="dismiss_wo"):
             pass
         st.session_state.wo_success = None
+
+    if st.session_state.wo_error:
+        st.error(st.session_state.wo_error)
+        if st.button("Dismiss", key="dismiss_wo_err"):
+            pass
+        st.session_state.wo_error = None
 
     # ── Load data ─────────────────────────────────────────────────────────────
     all_channels = load_channels()
