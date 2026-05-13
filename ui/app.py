@@ -343,6 +343,7 @@ with tab_ship:
                             channel_id=p["channel_id"],
                             selling_price=row["selling_price"],
                             platform_order_id=p["ref_str"] or None,
+                            order_date=p.get("order_date"),
                             city=p.get("city") or None,
                             notes=p["notes"], created_by="app",
                         )
@@ -595,6 +596,17 @@ with tab_ship:
 
     reference = st.text_input(ref_label,          key=f"ship_ref_{st.session_state.ship_key}")
     city      = st.text_input("City (optional)",  key=f"ship_city_{st.session_state.ship_key}") if not is_bulk else None
+
+    if not is_bulk:
+        order_date = st.date_input(
+            "Order Date",
+            value=date.today(),
+            help="Use the actual order date if you're entering this late. Defaults to today.",
+            key=f"ship_order_date_{st.session_state.ship_key}",
+        )
+    else:
+        order_date = None
+
     notes     = st.text_input("Notes (optional)", key=f"ship_notes_{st.session_state.ship_key}")
 
     # ── Step 5: SKU qty table ─────────────────────────────────────────────────
@@ -671,6 +683,7 @@ with tab_ship:
                 "is_dropship": not is_bulk,
                 "is_outright":        is_bulk and ch_data["business_model"] == "OUTRIGHT",
                 "city":               city,
+                "order_date":         order_date,
                 "partner_location_id": partner_location_id,
                 "to_ship":            ship_rows,
             }
