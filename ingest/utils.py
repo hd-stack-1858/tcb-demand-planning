@@ -84,7 +84,36 @@ _STATE_NORM: dict[str, str] = {
     "DL": "Delhi", "CH": "Chandigarh", "PY": "Puducherry",
     "DN": "Dadra & Nagar Haveli", "DD": "Daman & Diu", "LD": "Lakshadweep",
     "AN": "Andaman & Nicobar Islands",
+    # Full-name variants (title-cased key for post-title() lookup)
+    "TAMILNADU": "Tamil Nadu", "ASOM": "Assam", "ASOM (ASSAM)": "Assam",
+    "ORISSA": "Odisha", "PONDICHERRY": "Puducherry",
+    "UTTARANCHAL": "Uttarakhand", "JHARKHAND": "Jharkhand",
 }
+
+# City canonical names — applied after .title() so keys must be title-cased.
+_CITY_NORM: dict[str, str] = {
+    "Delhi":           "New Delhi",
+    "Bangalore":       "Bengaluru",
+    "Gurgaon":         "Gurugram",
+    "Bengalore":       "Bengaluru",
+    "Bangaluru":       "Bengaluru",
+    "Benagluru":       "Bengaluru",
+    "Bangalure":       "Bengaluru",
+    "Bengalure":       "Bengaluru",
+    "Vishakhapatnam":  "Visakhapatnam",
+    "Vishakhapatanam": "Visakhapatnam",
+}
+
+
+def normalise_city(raw: str | None) -> str | None:
+    """Return a canonical city name. Strips, title-cases, then applies known aliases."""
+    if not raw:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    titled = s.title()
+    return _CITY_NORM.get(titled, titled)
 
 
 def normalise_state(raw: str | None) -> str | None:
@@ -95,7 +124,7 @@ def normalise_state(raw: str | None) -> str | None:
     if not s:
         return None
     upper = s.upper()
-    # Try abbreviation map first (2–3 char codes)
+    # Try abbreviation map first, then full-name variant map
     if upper in _STATE_NORM:
         return _STATE_NORM[upper]
     # Already a full name (possibly all-caps) — title-case it

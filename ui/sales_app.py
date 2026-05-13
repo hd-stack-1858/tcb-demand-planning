@@ -1208,6 +1208,302 @@ def tab_returns(raw_df: pd.DataFrame, fdf: pd.DataFrame):
     st.plotly_chart(fig_rt, use_container_width=True)
 
 
+# ── Geography tab ──────────────────────────────────────────────────────────────
+def tab_geography(fdf: pd.DataFrame, net_mode: bool) -> None:
+    """6th tab: city/state breakdown across channels."""
+
+    # All non-cancelled filtered orders (apply_filters already drops CANCELLED)
+    gdf = active_df(fdf, net_mode).copy()
+
+    # In-memory normalisation (mirrors ingest/utils.py — catches any stragglers)
+    _CITY_NORM  = {
+        "Delhi": "New Delhi", "Bangalore": "Bengaluru",
+        "Gurgaon": "Gurugram", "Bengalore": "Bengaluru", "Bangaluru": "Bengaluru",
+        "Benagluru": "Bengaluru", "Bangalure": "Bengaluru", "Bengalure": "Bengaluru",
+        "Vishakhapatnam": "Visakhapatnam", "Vishakhapatanam": "Visakhapatnam",
+    }
+    _STATE_NORM = {
+        "Tamilnadu": "Tamil Nadu", "Asom": "Assam", "Asom (Assam)": "Assam",
+        "Orissa": "Odisha", "Pondicherry": "Puducherry", "Uttaranchal": "Uttarakhand",
+    }
+    gdf["city"]  = gdf["city"].str.strip().str.title().replace(_CITY_NORM)
+    gdf["state"] = gdf["state"].str.strip().str.title().replace(_STATE_NORM)
+
+    geo = gdf[gdf["city"].notna() & gdf["state"].notna()]
+
+    # ── Coverage callout ──────────────────────────────────────────────────────
+    total_rows = len(gdf)
+    geo_rows   = len(geo)
+    coverage   = pct(geo_rows, total_rows)
+    st.info(
+        f"**{coverage:.0f}% of filtered orders ({geo_rows:,} of {total_rows:,}) "
+        f"have city/state data** and are included in the charts below.  "
+        f"Cancelled orders are excluded from this tab."
+    )
+
+    # ── KPI strip ─────────────────────────────────────────────────────────────
+    n_cities  = geo["city"].nunique()
+    n_states  = geo["state"].nunique()
+    top_city  = geo.groupby("city")["quantity"].sum().idxmax()  if n_cities else "—"
+    top_state = geo.groupby("state")["quantity"].sum().idxmax() if n_states else "—"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Cities Reached", n_cities)
+    c2.metric("States Reached", n_states)
+    c3.metric("Top City",       top_city)
+    c4.metric("Top State",      top_state)
+
+    if geo.empty:
+        st.info("No orders with city/state data for the selected filters.")
+        return
+
+    st.markdown("---")
+
+    # ── Metric selector ───────────────────────────────────────────────────────
+    metric = st.radio(
+        "Metric", ["Units", "Orders", "Revenue"], horizontal=True, key="geo_metric"
+    )
+    if metric == "Units":
+        value_col = "quantity"
+        y_label   = "Units"
+    elif metric == "Orders":
+        geo = geo.copy()
+        geo["_orders"] = 1
+        value_col = "_orders"
+        y_label   = "Orders"
+    else:
+        value_col = "gross_value"
+        y_label   = "Revenue (₹)"
+
+    def _bar_totals(fig, grouped_df, x_col):
+        """Add totals as a text-mode scatter trace above each stacked bar."""
+        totals = grouped_df.groupby(x_col)[value_col].sum().reset_index()
+        totals.columns = [x_col, "_tot"]
+        text_vals = [
+            fmt_inr(v) if metric == "Revenue" else f"{int(v):,}"
+            for v in totals["_tot"]
+        ]
+        fig.add_trace(go.Scatter(
+            x=totals[x_col], y=totals["_tot"],
+            mode="text", text=text_vals,
+            textposition="top center", showlegend=False,
+            textfont=dict(size=9, color="#333"),
+        ))
+        max_v = totals["_tot"].max() or 1
+        fig.update_layout(yaxis_range=[0, max_v * 1.18])
+
+    # ── Top Cities chart ──────────────────────────────────────────────────────
+    city_ch = (
+        geo.groupby(["city", "channel_name"])[value_col].sum()
+        .reset_index()
+    )
+    top15_cities = city_ch.groupby("city")[value_col].sum().nlargest(15).index
+    city_ch = city_ch[city_ch["city"].isin(top15_cities)]
+    city_order = (
+        city_ch.groupby("city")[value_col].sum()
+        .sort_values(ascending=False).index.tolist()
+    )
+
+    st.subheader("Top Cities")
+    if not city_ch.empty:
+        fig_city = px.bar(
+            city_ch,
+            x="city", y=value_col, color="channel_name",
+            barmode="stack",
+            labels={value_col: y_label, "channel_name": "Channel", "city": "City"},
+            color_discrete_map=CHANNEL_COLOR_MAP,
+            category_orders={"city": city_order},
+        )
+        fig_city.update_layout(
+            xaxis_title=None, margin=dict(t=30),
+            xaxis=dict(tickangle=-30),
+        )
+        if metric == "Revenue":
+            fig_city.update_layout(yaxis=dict(tickformat=",.0f", tickprefix="₹"))
+        _bar_totals(fig_city, city_ch, "city")
+        st.plotly_chart(fig_city, use_container_width=True)
+
+    # ── City trend table ──────────────────────────────────────────────────────
+    today = date.today()
+    cur_p = pd.Period(today, "M")
+    m1_p  = cur_p - 1
+    m2_p  = cur_p - 2
+    m3_p  = cur_p - 3
+    mult  = _cur_mult()
+
+    city_monthly = (
+        geo.groupby(["city", "month"])["quantity"].sum()
+        .reset_index()
+        .rename(columns={"quantity": "units"})
+    )
+
+    def _period_units(period):
+        sub = city_monthly[city_monthly["month"] == period]
+        return sub.set_index("city")["units"]
+
+    cm_raw = _period_units(cur_p)
+    m1_u   = _period_units(m1_p)
+    m2_u   = _period_units(m2_p)
+    m3_u   = _period_units(m3_p)
+    cm_proj = (cm_raw * mult).round(0)
+
+    def _vs_pct(cur, ref):
+        if ref and ref > 0:
+            return round((cur - ref) / ref * 100, 1)
+        return None
+
+    def _fmt_vs(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "—"
+        return f"+{v:.1f}%" if v >= 0 else f"{v:.1f}%"
+
+    def _color_vs(val):
+        if not isinstance(val, str) or val == "—":
+            return ""
+        try:
+            v = float(val.replace("%", "").replace("+", ""))
+            if v > 5:
+                return "color: green; font-weight: bold"
+            if v < -5:
+                return "color: red; font-weight: bold"
+        except ValueError:
+            pass
+        return ""
+
+    cm_col = f"CM ({today.strftime('%b')})"
+    tbl_rows = []
+    for city in sorted(geo["city"].unique()):
+        cm_v  = float(cm_proj.get(city, 0) or 0)
+        m1_v  = float(m1_u.get(city, 0) or 0)
+        m2_v  = float(m2_u.get(city, 0) or 0)
+        m3_v  = float(m3_u.get(city, 0) or 0)
+        l3m_v = (m1_v + m2_v + m3_v) / 3
+        tbl_rows.append({
+            "City":      city,
+            cm_col:      int(cm_v),
+            "M-1":       int(m1_v),
+            "vs. M-1":   _fmt_vs(_vs_pct(cm_v, m1_v)),
+            "M-2":       int(m2_v),
+            "vs. M-2":   _fmt_vs(_vs_pct(cm_v, m2_v)),
+            "L3M Avg":   round(l3m_v, 1),
+            "vs. L3M":   _fmt_vs(_vs_pct(cm_v, l3m_v)),
+        })
+
+    city_tbl = pd.DataFrame(tbl_rows).sort_values(cm_col, ascending=False)
+    vs_cols  = ["vs. M-1", "vs. M-2", "vs. L3M"]
+    st.caption(f"Units only. {cm_col} projected to full month.")
+    st.dataframe(
+        city_tbl.style.map(_color_vs, subset=vs_cols),
+        use_container_width=True,
+        height=350,
+        hide_index=True,
+    )
+
+    # ── Top States chart ───────────────────────────────────────────────────────
+    state_ch = (
+        geo.groupby(["state", "channel_name"])[value_col].sum()
+        .reset_index()
+    )
+    state_order = (
+        state_ch.groupby("state")[value_col].sum()
+        .sort_values(ascending=False).index.tolist()
+    )
+
+    st.subheader("Top States")
+    if not state_ch.empty:
+        fig_state = px.bar(
+            state_ch,
+            x="state", y=value_col, color="channel_name",
+            barmode="stack",
+            labels={value_col: y_label, "channel_name": "Channel", "state": "State"},
+            color_discrete_map=CHANNEL_COLOR_MAP,
+            category_orders={"state": state_order},
+        )
+        fig_state.update_layout(
+            xaxis_title=None, margin=dict(t=30),
+            xaxis=dict(tickangle=-40),
+            height=450,
+        )
+        if metric == "Revenue":
+            fig_state.update_layout(yaxis=dict(tickformat=",.0f", tickprefix="₹"))
+        _bar_totals(fig_state, state_ch, "state")
+        st.plotly_chart(fig_state, use_container_width=True)
+
+    # ── Blinkit — City Performance ────────────────────────────────────────────
+    blinkit_geo = geo[geo["channel_name"] == "Blinkit"]
+    if not blinkit_geo.empty:
+        st.markdown("---")
+        st.subheader("Blinkit — City Performance")
+
+        col_left, col_right = st.columns([1, 2])
+
+        with col_left:
+            bk_city = (
+                blinkit_geo.groupby("city")
+                .agg(
+                    Orders=("order_id", "count"),
+                    Units=("quantity", "sum"),
+                    Revenue=("gross_value", "sum"),
+                )
+                .reset_index()
+                .sort_values("Units", ascending=False)
+            )
+            bk_city["Revenue"] = bk_city["Revenue"].apply(fmt_inr)
+            total_row = pd.DataFrame([{
+                "city":    "TOTAL",
+                "Orders":  bk_city["Orders"].sum(),
+                "Units":   bk_city["Units"].sum(),
+                "Revenue": fmt_inr(blinkit_geo["gross_value"].sum()),
+            }])
+            bk_display = pd.concat([bk_city, total_row], ignore_index=True).rename(columns={"city": "City"})
+
+            def _bold_blinkit_total(styler):
+                n = len(styler.data)
+                return styler.set_properties(
+                    subset=pd.IndexSlice[n - 1, :],
+                    **{"font-weight": "bold", "border-top": "1px solid #ccc"},
+                )
+
+            st.dataframe(
+                _bold_blinkit_total(bk_display.style),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with col_right:
+            bk_trend = (
+                blinkit_geo.groupby(["month_dt", "city"])["quantity"].sum()
+                .reset_index()
+            )
+            bk_trend["Month"] = bk_trend["month_dt"].dt.strftime("%b %Y")
+            bk_trend = _project_col(bk_trend, "quantity", _cur_mult())
+            month_order = bk_trend.sort_values("month_dt")["Month"].unique().tolist()
+
+            all_bk_cities = sorted(blinkit_geo["city"].unique().tolist())
+            sel_bk_cities = st.multiselect(
+                "Cities to show",
+                options=all_bk_cities,
+                default=all_bk_cities,
+                key="bk_city_sel",
+            )
+            bk_plot = bk_trend[bk_trend["city"].isin(sel_bk_cities)] if sel_bk_cities else bk_trend
+
+            fig_bk = px.line(
+                bk_plot,
+                x="Month", y="quantity", color="city",
+                markers=True,
+                labels={"quantity": "Units", "city": "City"},
+                category_orders={"Month": month_order},
+            )
+            fig_bk.update_layout(
+                xaxis_title=None, yaxis_title="Units",
+                margin=dict(t=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.caption("Monthly units — current month projected to full month")
+            st.plotly_chart(fig_bk, use_container_width=True)
+
+
 # ── Auth gate ──────────────────────────────────────────────────────────────────
 def _require_auth() -> None:
     """Password gate for public deployment. No-op if APP_PASSWORD secret is not set."""
@@ -1264,8 +1560,8 @@ def main():
         st.info("No data for the selected filters.")
         return
 
-    t1, t2, t3, t4, t5 = st.tabs([
-        "📊 Overview", "📈 Trends", "🏪 By Channel", "📦 By SKU", "🔄 Returns",
+    t1, t2, t3, t4, t5, t6 = st.tabs([
+        "📊 Overview", "📈 Trends", "🏪 By Channel", "📦 By SKU", "🔄 Returns", "🗺️ Geography",
     ])
     with t1:
         tab_overview(raw_df, fdf, filters["net_mode"])
@@ -1277,6 +1573,8 @@ def main():
         tab_sku(fdf, filters["net_mode"])
     with t5:
         tab_returns(raw_df, fdf)
+    with t6:
+        tab_geography(fdf, filters["net_mode"])
 
 
 if __name__ == "__main__":

@@ -42,6 +42,7 @@ from ingest.utils import (
     resolve_amazon_sku,
     get_sku_cogs_at_date,
     get_sku_mrp_at_date,
+    normalise_city,
     normalise_state,
 )
 
@@ -182,7 +183,7 @@ def _build_row(row: dict, source_file: str) -> dict | None:
     if mrp and mrp > 0 and sp < mrp:
         discount_pct = round((mrp - sp) / mrp * 100, 2)
 
-    city  = (row.get("ship-city",  "") or "").strip().title() or None
+    city  = normalise_city(row.get("ship-city", "") or "")
     state = normalise_state(row.get("ship-state", ""))
 
     pre_pivot = order_date < AZ_LOT_PIVOT
