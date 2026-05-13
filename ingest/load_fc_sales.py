@@ -162,11 +162,13 @@ def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int, int]
         if db_order_id is None:
             to_insert.append(row)
         else:
-            # Update everything except order_id, channel_id, lot_cogs_finalized
-            # lot_cogs_finalized is preserved from DB (App may have already dispatched)
+            # Update everything except order_id, channel_id, lot_cogs_finalized.
+            # Also exclude city/state if None — FC report has no address columns,
+            # so None here would overwrite values the App already captured.
             payload = {
                 k: v for k, v in row.items()
                 if k not in ("order_id", "channel_id", "lot_cogs_finalized")
+                and not (k in ("city", "state") and v is None)
             }
             # Canonicalise platform_order_id to the FC OrderID (not Shipping Ref)
             payload["platform_order_id"] = order_id_raw
