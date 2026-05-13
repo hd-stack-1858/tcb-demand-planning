@@ -1208,8 +1208,35 @@ def tab_returns(raw_df: pd.DataFrame, fdf: pd.DataFrame):
     st.plotly_chart(fig_rt, use_container_width=True)
 
 
+# ── Auth gate ──────────────────────────────────────────────────────────────────
+def _require_auth() -> None:
+    """Password gate for public deployment. No-op if APP_PASSWORD secret is not set."""
+    try:
+        pwd_secret = st.secrets.get("APP_PASSWORD", "")
+    except Exception:
+        return  # secrets not configured — local dev, skip gate
+
+    if not pwd_secret:
+        return  # secret present but empty — treat as disabled
+
+    if st.session_state.get("_auth_ok"):
+        return
+
+    st.markdown("## Growth Spurt Dashboard")
+    pwd = st.text_input("Password", type="password", key="_pwd")
+    if st.button("Enter"):
+        if pwd == pwd_secret:
+            st.session_state["_auth_ok"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password")
+    st.stop()
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
+    _require_auth()
+
     import base64
     logo_path = os.path.join(os.path.dirname(__file__), "..", "assets", "logo.png")
     if os.path.exists(logo_path):
