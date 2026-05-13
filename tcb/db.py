@@ -114,6 +114,45 @@ def get_monthly_mis(months: int = 3):
     )
 
 
+def get_orders_raw(start_date: str | None = None, end_date: str | None = None) -> list[dict]:
+    """Fetch all orders for MIS dashboard, with channel and sku names merged in Python."""
+    db = get_client()
+
+    cols = (
+        "order_id, channel_id, order_date, sku_id, quantity, mrp, "
+        "selling_price, gross_value, discount_pct, fulfillment_type, "
+        "city, state, status, return_date, return_reason, source_file"
+    )
+    orders: list[dict] = []
+    page_size = 1000
+    offset = 0
+    while True:
+        q = db.table("orders").select(cols)
+        if start_date:
+            q = q.gte("order_date", start_date)
+        if end_date:
+            q = q.lte("order_date", end_date)
+        batch = q.order("order_date").range(offset, offset + page_size - 1).execute().data
+        orders.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+
+    if not orders:
+        return []
+
+    channels = {r["channel_id"]: r for r in db.table("channels").select("channel_id, name, code").execute().data}
+    skus     = {r["sku_id"]:     r for r in db.table("skus").select("sku_id, name").execute().data}
+
+    for row in orders:
+        ch = channels.get(row["channel_id"], {})
+        sk = skus.get(row["sku_id"], {})
+        row["channel_name"] = ch.get("name", row["channel_id"])
+        row["channel_code"] = ch.get("code", "")
+        row["sku_name"]     = sk.get("name", row["sku_id"])
+    return orders
+
+
 def record_transaction(txn: dict):
     """
     Insert a single inventory transaction and update inventory position atomically.

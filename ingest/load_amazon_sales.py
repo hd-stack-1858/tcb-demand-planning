@@ -166,13 +166,17 @@ def _build_row(row: dict, source_file: str) -> dict | None:
     if qty <= 0:
         return None
 
-    sp = _flt(row.get("item-price", ""))
-    if sp is None:
+    # item-price is the line-item total (all units combined), NOT per-unit.
+    # gross_value = item-price as-is; selling_price = per-unit = item-price / qty.
+    item_price = _flt(row.get("item-price", ""))
+    if item_price is None:
         return None
-    # sp=0.0 is valid — promotional / free order; load it
+    # item_price=0.0 is valid — promotional / replacement order; load it
+
+    gross_value  = round(item_price, 2)
+    sp           = round(item_price / qty, 2)  # per-unit selling price
 
     mrp = get_sku_mrp_at_date(sku_id, order_date)
-    gross_value = round(sp * qty, 2)
 
     discount_pct = None
     if mrp and mrp > 0 and sp < mrp:

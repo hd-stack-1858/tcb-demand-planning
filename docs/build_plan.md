@@ -101,7 +101,7 @@ Each script accepts a `--file` argument and `--env dev/prod` flag.
    - Shows preview of rows to be loaded + confirmation
    - Shows load summary: N rows inserted, M duplicates skipped
 
-**Status: 🔲 PENDING**
+**Status: ✅ Done** — `ui/sales_app.py` built. 5 tabs: Overview, Trends, By Channel, By SKU, Returns & Status. Auth via Streamlit Cloud viewer allowlist.
 
 ---
 

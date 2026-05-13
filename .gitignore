@@ -10,8 +10,14 @@ master files/
 
 # Keep assets/ (logo etc.) — do NOT ignore images
 
-# Raw data downloads
+# Raw data downloads — stay local, data already in DB
 blinkit_inventory/
+blinkit_reports/
+amazon_reports/
+
+# Temp files
+*.tmp
+C\*.txt
 
 # Python
 __pycache__/
