@@ -121,7 +121,9 @@ def get_orders_raw(start_date: str | None = None, end_date: str | None = None) -
     cols = (
         "order_id, channel_id, order_date, sku_id, quantity, mrp, "
         "selling_price, gross_value, discount_pct, fulfillment_type, "
-        "city, state, status, return_date, return_reason, source_file"
+        "city, state, status, return_date, return_reason, "
+        "return_responsible, return_customer_verbatim, "
+        "platform_order_id, source_file"
     )
     orders: list[dict] = []
     page_size = 1000

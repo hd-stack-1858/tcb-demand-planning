@@ -1063,41 +1063,91 @@ def tab_returns(raw_df: pd.DataFrame, fdf: pd.DataFrame):
         use_container_width=True, hide_index=True,
     )
 
-    # ── Return rate by channel ────────────────────────────────────────────────
+    # ── Shared return base + filters ─────────────────────────────────────────
+    ret_base = all_fdf[all_fdf["status"].isin(RETURN_STATUSES)].copy()
+    for _col in ("return_reason", "return_responsible", "return_customer_verbatim"):
+        if _col not in ret_base.columns:
+            ret_base[_col] = "Unknown"
+        ret_base[_col] = ret_base[_col].fillna("Unknown")
+
     st.subheader("Return Rate by Channel")
+    f1, f2 = st.columns(2)
+    with f1:
+        sel_reason = st.multiselect(
+            "Filter by Reason",
+            sorted(ret_base["return_reason"].unique()),
+            default=[],
+            key="ret_reason_filter",
+        )
+    with f2:
+        sel_resp = st.multiselect(
+            "Filter by Responsible",
+            sorted(ret_base["return_responsible"].unique()),
+            default=[],
+            key="ret_resp_filter",
+        )
+
+    ret_filtered = ret_base.copy()
+    if sel_reason:
+        ret_filtered = ret_filtered[ret_filtered["return_reason"].isin(sel_reason)]
+    if sel_resp:
+        ret_filtered = ret_filtered[ret_filtered["return_responsible"].isin(sel_resp)]
+
+    ret_tcb = ret_base[ret_base["return_responsible"] == "TCB"]
+
+    if sel_reason or sel_resp:
+        st.caption(
+            f"Filters active — showing {len(ret_filtered):,} of {len(ret_base):,} return orders. "
+            "Return Rate % uses all dispatched orders as denominator."
+        )
+
+    def _filt_rate(ch_filt, ch_ret_base, grp):
+        denom = int((grp["status"] == "FULFILLED").sum()) + len(ch_ret_base)
+        return pct(len(ch_filt), denom)
+
+    def _tcb_rate(ch_tcb, ch_ret_base, grp):
+        denom = int((grp["status"] == "FULFILLED").sum()) + len(ch_ret_base)
+        return pct(len(ch_tcb), denom)
+
+    # ── Return rate by channel ────────────────────────────────────────────────
     ret_rows = []
     for ch, grp in all_fdf.groupby("channel_name"):
+        ch_ret  = ret_base[ret_base["channel_name"] == ch]
+        ch_filt = ret_filtered[ret_filtered["channel_name"] == ch]
+        ch_tcb  = ret_tcb[ret_tcb["channel_name"] == ch]
         ret_rows.append({
-            "Channel":       ch,
-            "Fulfilled":     int((grp["status"] == "FULFILLED").sum()),
-            "RTO":           int((grp["status"] == "RTO").sum()),
-            "Sale Return":   int((grp["status"] == "SALE_RETURN").sum()),
-            "Replacement":   int((grp["status"] == "REPLACEMENT").sum()),
-            "Return Rate %": return_rate_pct(grp),  # numeric for heatmap
+            "Channel":           ch,
+            "Fulfilled":         int((grp["status"] == "FULFILLED").sum()),
+            "RTO":               int((ch_filt["status"] == "RTO").sum()),
+            "Sale Return":       int((ch_filt["status"] == "SALE_RETURN").sum()),
+            "Replacement":       int((ch_filt["status"] == "REPLACEMENT").sum()),
+            "Return Rate %":     _filt_rate(ch_filt, ch_ret, grp),
+            "TCB Responsible Return Rate %": _tcb_rate(ch_tcb, ch_ret, grp),
         })
     ret_df = pd.DataFrame(ret_rows)
     ret_df = pd.concat([ret_df, pd.DataFrame([{
-        "Channel":       "TOTAL",
-        "Fulfilled":     int(ret_df["Fulfilled"].sum()),
-        "RTO":           int(ret_df["RTO"].sum()),
-        "Sale Return":   int(ret_df["Sale Return"].sum()),
-        "Replacement":   int(ret_df["Replacement"].sum()),
-        "Return Rate %": return_rate_pct(all_fdf),
+        "Channel":           "TOTAL",
+        "Fulfilled":         int(ret_df["Fulfilled"].sum()),
+        "RTO":               int(ret_df["RTO"].sum()),
+        "Sale Return":       int(ret_df["Sale Return"].sum()),
+        "Replacement":       int(ret_df["Replacement"].sum()),
+        "Return Rate %":     _filt_rate(ret_filtered, ret_base, all_fdf),
+        "TCB Responsible Return Rate %": _tcb_rate(ret_tcb, ret_base, all_fdf),
     }])], ignore_index=True)
     _is_total_ret = [False] * (len(ret_df) - 1) + [True]
 
-    def _return_rate_ch_bg(col):
-        max_val = max((v for flag, v in zip(_is_total_ret, col) if not flag), default=1) or 1
+    def _rr_bg(col, is_total_flags):
+        max_val = max((v for flag, v in zip(is_total_flags, col) if not flag), default=1) or 1
         return pd.Series(
             ["" if flag else f"background-color: rgba(165, 55, 55, {min(v / max_val, 1) * 0.55:.2f})"
-             for flag, v in zip(_is_total_ret, col)],
+             for flag, v in zip(is_total_flags, col)],
             index=col.index,
         )
 
     st.dataframe(
         _bold_total_row(ret_df)
-        .apply(_return_rate_ch_bg, subset=["Return Rate %"])
-        .format({"Return Rate %": "{:.1f}%"}),
+        .apply(_rr_bg, is_total_flags=_is_total_ret, subset=["Return Rate %", "TCB Responsible Return Rate %"])
+        .format({"Return Rate %": "{:.1f}%", "TCB Responsible Return Rate %": "{:.1f}%"}),
         use_container_width=True, hide_index=True,
     )
 
@@ -1105,72 +1155,88 @@ def tab_returns(raw_df: pd.DataFrame, fdf: pd.DataFrame):
     st.subheader("Return Rate by SKU")
     ret_sku_rows = []
     for sku, grp in all_fdf.groupby("sku_id"):
+        sku_ret  = ret_base[ret_base["sku_id"] == sku]
+        sku_filt = ret_filtered[ret_filtered["sku_id"] == sku]
+        sku_tcb  = ret_tcb[ret_tcb["sku_id"] == sku]
         ret_sku_rows.append({
-            "SKU":           sku,
-            "SKU Name":      grp["sku_name"].iloc[0],
-            "Fulfilled":     int((grp["status"] == "FULFILLED").sum()),
-            "RTO":           int((grp["status"] == "RTO").sum()),
-            "Sale Return":   int((grp["status"] == "SALE_RETURN").sum()),
-            "Replacement":   int((grp["status"] == "REPLACEMENT").sum()),
-            "Return Rate %": return_rate_pct(grp),  # numeric for heatmap
+            "SKU":               sku,
+            "SKU Name":          grp["sku_name"].iloc[0],
+            "Fulfilled":         int((grp["status"] == "FULFILLED").sum()),
+            "RTO":               int((sku_filt["status"] == "RTO").sum()),
+            "Sale Return":       int((sku_filt["status"] == "SALE_RETURN").sum()),
+            "Replacement":       int((sku_filt["status"] == "REPLACEMENT").sum()),
+            "Return Rate %":     _filt_rate(sku_filt, sku_ret, grp),
+            "TCB Responsible Return Rate %": _tcb_rate(sku_tcb, sku_ret, grp),
         })
     ret_sku_df = pd.DataFrame(ret_sku_rows)
     ret_sku_df = pd.concat([ret_sku_df, pd.DataFrame([{
-        "SKU":           "TOTAL",
-        "SKU Name":      "",
-        "Fulfilled":     int(ret_sku_df["Fulfilled"].sum()),
-        "RTO":           int(ret_sku_df["RTO"].sum()),
-        "Sale Return":   int(ret_sku_df["Sale Return"].sum()),
-        "Replacement":   int(ret_sku_df["Replacement"].sum()),
-        "Return Rate %": return_rate_pct(all_fdf),
+        "SKU":               "TOTAL",
+        "SKU Name":          "",
+        "Fulfilled":         int(ret_sku_df["Fulfilled"].sum()),
+        "RTO":               int(ret_sku_df["RTO"].sum()),
+        "Sale Return":       int(ret_sku_df["Sale Return"].sum()),
+        "Replacement":       int(ret_sku_df["Replacement"].sum()),
+        "Return Rate %":     _filt_rate(ret_filtered, ret_base, all_fdf),
+        "TCB Responsible Return Rate %": _tcb_rate(ret_tcb, ret_base, all_fdf),
     }])], ignore_index=True)
     _is_total_ret_sku = [False] * (len(ret_sku_df) - 1) + [True]
 
-    def _return_rate_sku_bg(col):
-        max_val = max((v for flag, v in zip(_is_total_ret_sku, col) if not flag), default=1) or 1
-        return pd.Series(
-            ["" if flag else f"background-color: rgba(165, 55, 55, {min(v / max_val, 1) * 0.55:.2f})"
-             for flag, v in zip(_is_total_ret_sku, col)],
-            index=col.index,
-        )
-
     st.dataframe(
         _bold_total_row(ret_sku_df)
-        .apply(_return_rate_sku_bg, subset=["Return Rate %"])
-        .format({"Return Rate %": "{:.1f}%"}),
+        .apply(_rr_bg, is_total_flags=_is_total_ret_sku, subset=["Return Rate %", "TCB Responsible Return Rate %"])
+        .format({"Return Rate %": "{:.1f}%", "TCB Responsible Return Rate %": "{:.1f}%"}),
         use_container_width=True, hide_index=True,
     )
 
     # ── Return reasons ────────────────────────────────────────────────────────
     st.subheader("Return Reasons")
-    st.caption("Return reason data available for Amazon and First Cry only. Other channels show 'Reason not known'.")
-    reason_df = all_fdf[all_fdf["status"].isin(RETURN_STATUSES)].copy()
-    known_channels = {"Amazon", "First Cry"}
-    reason_df["reason_display"] = reason_df.apply(
-        lambda r: (r["return_reason"] or "Not specified")
-        if r["channel_name"] in known_channels else "Reason not known",
-        axis=1,
-    )
-    reasons = (
-        reason_df.groupby("reason_display")
+    rdf = ret_base.copy()
+    reasons_grp = (
+        rdf.groupby(["return_reason", "return_responsible"])
         .agg(Orders=("order_id", "count"), Units=("quantity", "sum"))
+        .reset_index()
         .sort_values("Orders", ascending=False)
     )
-    if not reasons.empty:
-        reasons["% of Returns"] = (reasons["Orders"] / reasons["Orders"].sum() * 100).round(1)
-        reasons_reset = reasons.reset_index()
-        reasons_reset.columns = ["Reason", "Orders", "Units", "% of Returns"]
+    if not reasons_grp.empty:
+        reasons_grp["% of Returns"] = (reasons_grp["Orders"] / reasons_grp["Orders"].sum() * 100).round(1)
+        reasons_grp.columns = ["Reason", "Responsible", "Orders", "Units", "% of Returns"]
         total_reason = pd.DataFrame([{
-            "Reason": "TOTAL",
-            "Orders": int(reasons_reset["Orders"].sum()),
-            "Units":  int(reasons_reset["Units"].sum()),
-            "% of Returns": 100.0,
+            "Reason":         "TOTAL",
+            "Responsible":    "",
+            "Orders":         int(reasons_grp["Orders"].sum()),
+            "Units":          int(reasons_grp["Units"].sum()),
+            "% of Returns":   100.0,
         }])
-        reasons_reset = pd.concat([reasons_reset, total_reason], ignore_index=True)
+        reasons_display = pd.concat([reasons_grp, total_reason], ignore_index=True)
         st.dataframe(
-            _bold_total_row(reasons_reset)
+            _bold_total_row(reasons_display)
             .format({"% of Returns": "{:.1f}%"}),
             use_container_width=True, hide_index=True,
+        )
+
+        # Raw data download
+        pid_col = "platform_order_id" if "platform_order_id" in rdf.columns else None
+        raw_dl = rdf[[
+            "channel_name",
+            *(["platform_order_id"] if pid_col else []),
+            "order_date",
+            "return_reason",
+            "return_responsible",
+            "return_customer_verbatim",
+        ]].copy()
+        raw_dl.columns = [
+            "Channel Name",
+            *(["Order Number"] if pid_col else []),
+            "Order Date",
+            "Return Reason",
+            "Responsible",
+            "Customer Verbatim",
+        ]
+        st.download_button(
+            "⬇ Download raw return data",
+            raw_dl.to_csv(index=False),
+            file_name="returns_raw.csv",
+            mime="text/csv",
         )
     else:
         st.info("No return data in selected filters.")

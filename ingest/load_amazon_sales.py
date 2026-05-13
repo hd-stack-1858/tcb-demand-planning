@@ -160,7 +160,7 @@ def _build_row(row: dict, source_file: str) -> dict | None:
     # Fulfilled path — both FBA (Shipped) and FBM (Shipped - Delivered to Buyer)
     is_fbm = order_status == _STATUS_FBM
     channel_id = AZ_FBM_CHANNEL_ID if is_fbm else AZ_FBA_CHANNEL_ID
-    fulfillment_type = "OUTRIGHT" if is_fbm else "SOR"
+    fulfillment_type = "DROP_SHIP" if is_fbm else "SOR"
 
     qty_raw = row.get("quantity", "").strip()
     qty = int(qty_raw) if qty_raw else 1
