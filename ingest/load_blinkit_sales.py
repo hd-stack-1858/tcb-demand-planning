@@ -99,8 +99,13 @@ def _build_row(raw: tuple, source_file: str) -> dict | None:
     }
 
 
-def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int, int]:
-    """Load one sales Excel file. Returns (new, duplicate, skipped)."""
+def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int]:
+    """Load one sales Excel file. Returns (upserted, skipped).
+
+    Uses ignore_duplicates=False so any field changes on re-load propagate.
+    lot_cogs_finalized is not in the Blinkit row dict and is therefore not
+    touched by the upsert.
+    """
     wb = openpyxl.load_workbook(str(filepath), read_only=True, data_only=True)
     ws = wb.active
 
@@ -117,20 +122,20 @@ def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int, int]
     wb.close()
 
     if dry_run or not to_upsert:
-        return len(to_upsert), 0, skipped
+        return len(to_upsert), skipped
 
-    new_count = 0
+    upserted = 0
     for i in range(0, len(to_upsert), _UPSERT_BATCH):
         result = (
             db.table("orders")
             .upsert(to_upsert[i : i + _UPSERT_BATCH],
                     on_conflict="order_id,channel_id",
-                    ignore_duplicates=True)
+                    ignore_duplicates=False)
             .execute()
         )
-        new_count += len(result.data) if result.data else 0
+        upserted += len(result.data) if result.data else 0
 
-    return new_count, len(to_upsert) - new_count, skipped
+    return upserted, skipped
 
 
 def main() -> None:
@@ -152,17 +157,16 @@ def main() -> None:
         logger.error("No .xlsx files found")
         sys.exit(1)
 
-    total_new = total_dup = total_skip = 0
+    total_upserted = total_skip = 0
     for f in files:
-        new, dup, skip = load_file(f, db, dry_run=args.dry_run)
+        upserted, skip = load_file(f, db, dry_run=args.dry_run)
         tag = " [DRY RUN]" if args.dry_run else ""
-        print(f"{f.name}{tag}: {new} new | {dup} duplicate | {skip} skipped")
-        total_new += new
-        total_dup += dup
+        print(f"{f.name}{tag}: {upserted} upserted | {skip} skipped")
+        total_upserted += upserted
         total_skip += skip
 
     if len(files) > 1:
-        print(f"\nTotal: {total_new} new | {total_dup} duplicate | {total_skip} skipped")
+        print(f"\nTotal: {total_upserted} upserted | {total_skip} skipped")
 
 
 if __name__ == "__main__":

@@ -60,9 +60,10 @@ AZ_LOT_PIVOT = date(2026, 5, 2)
 
 _STATUS_SHIPPED    = "Shipped"
 _STATUS_FBM        = "Shipped - Delivered to Buyer"
+_STATUS_FBM_PICKUP = "Shipped - Picked Up"   # FBM via pickup point; treat as FBM
 _STATUS_CANCELLED  = "Cancelled"
 _STATUS_PENDING    = "Pending"
-_LOAD_ORDER_STATUSES = {_STATUS_SHIPPED, _STATUS_FBM, _STATUS_CANCELLED, _STATUS_PENDING}
+_LOAD_ORDER_STATUSES = {_STATUS_SHIPPED, _STATUS_FBM, _STATUS_FBM_PICKUP, _STATUS_CANCELLED, _STATUS_PENDING}
 _INCLUDE_SALES_CHANNEL = "Amazon.in"
 _UPSERT_BATCH = 100
 
@@ -158,7 +159,7 @@ def _build_row(row: dict, source_file: str) -> dict | None:
         }
 
     # Fulfilled path — both FBA (Shipped) and FBM (Shipped - Delivered to Buyer)
-    is_fbm = order_status == _STATUS_FBM
+    is_fbm = order_status in {_STATUS_FBM, _STATUS_FBM_PICKUP}
     channel_id = AZ_FBM_CHANNEL_ID if is_fbm else AZ_FBA_CHANNEL_ID
     fulfillment_type = "DROP_SHIP" if is_fbm else "SOR"
 
@@ -211,8 +212,16 @@ def _build_row(row: dict, source_file: str) -> dict | None:
     }
 
 
-def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int, int]:
-    """Load one Amazon sales TSV. Returns (new, duplicate, skipped)."""
+def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int]:
+    """Load one Amazon sales TSV. Returns (upserted, skipped).
+
+    Uses ignore_duplicates=False so status changes (e.g. PENDING→FULFILLED)
+    are applied on re-load. NOTE: this overwrites lot_cogs_finalized — safe as
+    long as the payout loader has not yet finalized COGS for the period being
+    loaded. If a payout has already run, re-running this file would reset
+    lot_cogs_finalized to False for those orders; add a DB trigger to guard if
+    needed.
+    """
     to_upsert: list[dict] = []
     skipped = 0
 
@@ -226,22 +235,22 @@ def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int, int]
                 to_upsert.append(row)
 
     if dry_run or not to_upsert:
-        return len(to_upsert), 0, skipped
+        return len(to_upsert), skipped
 
-    new_count = 0
+    upserted = 0
     for i in range(0, len(to_upsert), _UPSERT_BATCH):
         result = (
             db.table("orders")
             .upsert(
                 to_upsert[i : i + _UPSERT_BATCH],
                 on_conflict="order_id,channel_id",
-                ignore_duplicates=True,
+                ignore_duplicates=False,
             )
             .execute()
         )
-        new_count += len(result.data) if result.data else 0
+        upserted += len(result.data) if result.data else 0
 
-    return new_count, len(to_upsert) - new_count, skipped
+    return upserted, skipped
 
 
 def main() -> None:
@@ -266,17 +275,16 @@ def main() -> None:
         logger.error("No .txt files found")
         sys.exit(1)
 
-    total_new = total_dup = total_skip = 0
+    total_upserted = total_skip = 0
     for f in files:
-        new, dup, skip = load_file(f, db, dry_run=args.dry_run)
+        upserted, skip = load_file(f, db, dry_run=args.dry_run)
         tag = " [DRY RUN]" if args.dry_run else ""
-        print(f"{f.name}{tag}: {new} new | {dup} duplicate | {skip} skipped")
-        total_new += new
-        total_dup += dup
+        print(f"{f.name}{tag}: {upserted} upserted | {skip} skipped")
+        total_upserted += upserted
         total_skip += skip
 
     if len(files) > 1:
-        print(f"\nTotal: {total_new} new | {total_dup} duplicate | {total_skip} skipped")
+        print(f"\nTotal: {total_upserted} upserted | {total_skip} skipped")
 
 
 if __name__ == "__main__":
