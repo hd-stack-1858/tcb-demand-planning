@@ -39,6 +39,14 @@ RETURN_STATUSES = {"RTO", "SALE_RETURN", "REPLACEMENT"}
 ALL_STATUSES    = {"FULFILLED", "PENDING", "CANCELLED", "RTO", "SALE_RETURN", "REPLACEMENT"}
 STATUS_ORDER    = ["FULFILLED", "REPLACEMENT", "PENDING", "RTO", "SALE_RETURN", "CANCELLED"]
 
+# Canonical display names; DB has alternate spellings mapped below
+BLINKIT_CITIES      = ["Bengaluru", "Chennai", "Ghaziabad", "Gurgaon", "Hyderabad", "New Delhi"]
+BLINKIT_CITY_DB_MAP = {c: [c] for c in BLINKIT_CITIES}
+BLINKIT_CITY_DB_MAP["Gurgaon"]   = ["Gurgaon", "Gurugram"]   # same city, two spellings
+BLINKIT_CITY_DB_MAP["New Delhi"]  = ["New Delhi", "Delhi"]    # same city, two spellings
+# All DB city values that belong to a Blinkit city (used for "Others" exclusion)
+_ALL_BLINKIT_DB_CITIES = {v for vals in BLINKIT_CITY_DB_MAP.values() for v in vals}
+
 CHANNEL_COLOR_MAP = {
     "Amazon":         "#FF9900",
     "Blinkit":        "#FFED29",
@@ -180,6 +188,11 @@ def sidebar(df: pd.DataFrame) -> dict:
     else:
         sel_range = (None, None)
 
+    city_options = BLINKIT_CITIES + ["Others"]
+    sel_city = st.sidebar.multiselect("City", ["All Cities"] + city_options, default=["All Cities"])
+    if "All Cities" in sel_city or not sel_city:
+        sel_city = ["__all__"]
+
     mode = st.sidebar.radio(
         "Revenue mode",
         ["Gross (excl. Cancelled)", "Net (Fulfilled only)"],
@@ -188,7 +201,17 @@ def sidebar(df: pd.DataFrame) -> dict:
     st.sidebar.markdown("---")
     st.sidebar.caption("Gross = all statuses except Cancelled  \nNet = Fulfilled + Pending only")
 
-    return {"channels": sel_ch, "skus": sel_sku, "range": sel_range, "net_mode": "Net" in mode}
+    return {"channels": sel_ch, "skus": sel_sku, "range": sel_range, "net_mode": "Net" in mode, "cities": sel_city}
+
+
+def _apply_city_filter(df: pd.DataFrame, cities: list) -> pd.DataFrame:
+    if "__all__" in cities:
+        return df
+    specific  = [c for c in cities if c != "Others"]
+    db_values = {v for c in specific for v in BLINKIT_CITY_DB_MAP.get(c, [c])}
+    if "Others" in cities:
+        return df[df["city"].isin(db_values) | ~df["city"].isin(_ALL_BLINKIT_DB_CITIES)]
+    return df[df["city"].isin(db_values)]
 
 
 def apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
@@ -197,6 +220,7 @@ def apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
         out = out[out["month_dt"].dt.to_period("M").astype(str) >= f["range"][0]]
     if f["range"][1]:
         out = out[out["month_dt"].dt.to_period("M").astype(str) <= f["range"][1]]
+    out = _apply_city_filter(out, f.get("cities", ["__all__"]))
     return out[out["status"] != "CANCELLED"]
 
 
@@ -284,9 +308,19 @@ def velocity_snapshot(raw_df: pd.DataFrame) -> None:
 
 
 # ── Tab 1 — Overview ───────────────────────────────────────────────────────────
-def tab_overview(raw_df: pd.DataFrame, fdf: pd.DataFrame, net_mode: bool):
+def tab_overview(raw_df: pd.DataFrame, fdf: pd.DataFrame, net_mode: bool, filters: dict = None):
     st.caption("Cancelled orders are excluded from all metrics on this tab.")
     adf = active_df(fdf, net_mode)
+
+    # Velocity snapshot + MTD projection use raw_df (no date filter) but should respect
+    # channel / SKU / city filters from the sidebar
+    filtered_raw = raw_df.copy()
+    if filters:
+        filtered_raw = filtered_raw[
+            filtered_raw["channel_name"].isin(filters["channels"]) &
+            filtered_raw["sku_id"].isin(filters["skus"])
+        ]
+        filtered_raw = _apply_city_filter(filtered_raw, filters.get("cities", ["__all__"]))
 
     total_orders = adf[["order_id", "channel_id"]].drop_duplicates().shape[0]
     total_units  = int(adf["quantity"].sum())
@@ -302,10 +336,10 @@ def tab_overview(raw_df: pd.DataFrame, fdf: pd.DataFrame, net_mode: bool):
 
     today = date.today()
     days_in_month = calendar.monthrange(today.year, today.month)[1]
-    cur = raw_df[
-        (raw_df["order_date"].dt.year  == today.year) &
-        (raw_df["order_date"].dt.month == today.month) &
-        (raw_df["status"].isin(NET_STATUSES))
+    cur = filtered_raw[
+        (filtered_raw["order_date"].dt.year  == today.year) &
+        (filtered_raw["order_date"].dt.month == today.month) &
+        (filtered_raw["status"].isin(NET_STATUSES))
     ]
     mtd_units = int(cur["quantity"].sum())
     mtd_rev   = cur["gross_value"].sum()
@@ -317,7 +351,7 @@ def tab_overview(raw_df: pd.DataFrame, fdf: pd.DataFrame, net_mode: bool):
         f"{fmt_inr(mtd_rev)} revenue so far → **~{fmt_inr(mtd_rev * mult)}** projected"
     )
 
-    velocity_snapshot(raw_df)
+    velocity_snapshot(filtered_raw)
 
     st.markdown("---")
 
@@ -957,7 +991,7 @@ def tab_sku(fdf: pd.DataFrame, net_mode: bool):
 
 
 # ── Tab 5 — Returns ────────────────────────────────────────────────────────────
-def tab_returns(raw_df: pd.DataFrame, fdf: pd.DataFrame):
+def tab_returns(raw_df: pd.DataFrame, fdf: pd.DataFrame, filters: dict = None):
     st.warning("**This tab shows ALL order statuses including Cancelled. All other tabs exclude Cancelled orders.**")
 
     if not raw_df.empty and not fdf.empty:
@@ -969,6 +1003,7 @@ def tab_returns(raw_df: pd.DataFrame, fdf: pd.DataFrame):
             (raw_df["month_dt"] >= _min_month) &
             (raw_df["month_dt"] <= _max_month)
         ]
+        all_fdf = _apply_city_filter(all_fdf, (filters or {}).get("cities", ["__all__"]))
     else:
         all_fdf = fdf
 
@@ -1291,7 +1326,7 @@ def tab_geography(fdf: pd.DataFrame, net_mode: bool) -> None:
     # In-memory normalisation (mirrors ingest/utils.py — catches any stragglers)
     _CITY_NORM  = {
         "Delhi": "New Delhi", "Bangalore": "Bengaluru",
-        "Gurgaon": "Gurugram", "Bengalore": "Bengaluru", "Bangaluru": "Bengaluru",
+        "Gurugram": "Gurgaon", "Bengalore": "Bengaluru", "Bangaluru": "Bengaluru",
         "Benagluru": "Bengaluru", "Bangalure": "Bengaluru", "Bengalure": "Bengaluru",
         "Vishakhapatnam": "Visakhapatnam", "Vishakhapatanam": "Visakhapatnam",
     }
@@ -1637,7 +1672,7 @@ def main():
         "📊 Overview", "📈 Trends", "🏪 By Channel", "📦 By SKU", "🔄 Returns", "🗺️ Geography",
     ])
     with t1:
-        tab_overview(raw_df, fdf, filters["net_mode"])
+        tab_overview(raw_df, fdf, filters["net_mode"], filters)
     with t2:
         tab_trends(fdf, filters["net_mode"])
     with t3:
@@ -1645,7 +1680,7 @@ def main():
     with t4:
         tab_sku(fdf, filters["net_mode"])
     with t5:
-        tab_returns(raw_df, fdf)
+        tab_returns(raw_df, fdf, filters)
     with t6:
         tab_geography(fdf, filters["net_mode"])
 
