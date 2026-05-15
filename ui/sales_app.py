@@ -960,10 +960,17 @@ def tab_sku(fdf: pd.DataFrame, net_mode: bool):
 def tab_returns(raw_df: pd.DataFrame, fdf: pd.DataFrame):
     st.warning("**This tab shows ALL order statuses including Cancelled. All other tabs exclude Cancelled orders.**")
 
-    all_fdf = raw_df[
-        raw_df["channel_name"].isin(fdf["channel_name"].unique()) &
-        raw_df["sku_id"].isin(fdf["sku_id"].unique())
-    ] if not raw_df.empty else fdf
+    if not raw_df.empty and not fdf.empty:
+        _min_month = fdf["month_dt"].min()
+        _max_month = fdf["month_dt"].max()
+        all_fdf = raw_df[
+            raw_df["channel_name"].isin(fdf["channel_name"].unique()) &
+            raw_df["sku_id"].isin(fdf["sku_id"].unique()) &
+            (raw_df["month_dt"] >= _min_month) &
+            (raw_df["month_dt"] <= _max_month)
+        ]
+    else:
+        all_fdf = fdf
 
     # ── Status breakdown — pie + table ────────────────────────────────────────
     st.subheader("Order Status Breakdown")
