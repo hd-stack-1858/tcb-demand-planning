@@ -19,6 +19,9 @@ amazon_reports/
 *.tmp
 C\*.txt
 
+# Runtime logs — generated at run time, not source code
+automation/logs/
+
 # Python
 __pycache__/
 *.pyc
@@ -33,3 +36,6 @@ build/
 
 # Claude Code local directory — memory, settings, lock files — all local, not committed
 .claude/
+
+# Blinkit browser session — contains auth cookies, never commit
+.blinkit_session/
