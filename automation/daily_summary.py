@@ -45,7 +45,7 @@ CHANNEL_LABELS: dict[int, str] = {
 }
 
 # Statuses that count as a sale (exclude returns, cancellations, RTO)
-SALE_STATUSES = {"FULFILLED", "DELIVERED", "SHIPPED"}
+SALE_STATUSES = {"FULFILLED", "DELIVERED", "SHIPPED", "PENDING"}
 
 
 def _format_day(d: date) -> str:
