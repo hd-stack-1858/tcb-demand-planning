@@ -7,11 +7,15 @@ Run daily at 12:00 noon IST (after blinkit_auth.py has been run once):
 Navigation flow (from seller portal):
   1. seller.blinkit.com → load saved session
   2. Left sidebar → click "Performance" icon (bar chart, 2nd icon)
-  3. Dropdown (default "Last 7 days") → select "Current Month"
-     Exception: on the 1st of the month, select "Previous Month" (current month has no data yet)
+  3. Period dropdown — leave at default "Last 7 days" (no click needed)
   4. Click "Reports" button (top-right, has download icon)
-  5. File downloads as: sales-report-mtd-DD-MM-YYYY.xlsx
-  6. Move to blinkit_reports/sales/ → run ingest/load_blinkit_sales.py
+  5. File downloads to blinkit_reports/sales/
+  6. Ingest via ingest/load_blinkit_sales.py
+
+Why "Last 7 days" not "Current Month":
+  - One fewer click (default, no interaction needed)
+  - Status changes after 7 days are extremely rare in quick commerce
+  - Handles month-end correctly: on Jun 1, "Last 7 days" still includes May 31
 
 If session expires, daily_runner.py catches BlinkitSessionExpired and sends
 a WhatsApp alert to Himanshu asking him to run blinkit_auth.py.
@@ -67,43 +71,6 @@ def _is_login_page(page) -> bool:
         return False
 
 
-def _select_period(page, headed: bool) -> str:
-    """
-    Click the Ant Design period dropdown and choose Current Month (or Previous Month on 1st).
-    Dropdown trigger is a <div class="...ant-dropdown-trigger"> containing "Last 7 days".
-    """
-    today = date.today()
-    target_option = "Previous Month" if today.day == 1 else "Current Month"
-    logger.info("Selecting %s", target_option)
-
-    # The dropdown trigger is an Ant Design div, not a <button>
-    try:
-        dropdown = page.locator("div.ant-dropdown-trigger").first
-        dropdown.wait_for(timeout=10_000)
-        dropdown.click()
-        time.sleep(1)
-    except (PWTimeout, Exception) as exc:
-        logger.warning("Could not click period dropdown: %s", exc)
-        if not headed:
-            raise
-
-    # Ant Design renders menu items as <li class="ant-dropdown-menu-item"> inside a portal
-    try:
-        option = page.locator(f"li.ant-dropdown-menu-item:has-text('{target_option}')").first
-        if not option.count():
-            option = page.get_by_text(target_option, exact=True).first
-        option.wait_for(timeout=5_000)
-        option.click()
-        time.sleep(1)
-        logger.info("Period set to: %s", target_option)
-    except (PWTimeout, Exception) as exc:
-        logger.warning("Could not select '%s': %s", target_option, exc)
-        if not headed:
-            raise
-
-    return target_option
-
-
 def scrape(dry_run: bool = False, headed: bool = False) -> Path:
     """
     Download today's MTD sales report from Blinkit seller portal.
@@ -128,9 +95,11 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
         page = ctx.new_page()
 
         # ── Step 1: Load portal, check session ───────────────────────────────
+        # Use "domcontentloaded" — Blinkit's SPA keeps background requests alive
+        # indefinitely, so "networkidle" never fires reliably.
         logger.info("Loading Blinkit seller portal...")
-        page.goto(PORTAL_URL, wait_until="networkidle", timeout=30_000)
-        time.sleep(2)
+        page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=30_000)
+        time.sleep(4)   # let SPA finish rendering sidebar
 
         if _is_login_page(page):
             browser.close()
@@ -142,33 +111,36 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
 
         # ── Step 2: Navigate to Performance via sidebar ───────────────────────
         # The portal is an SPA — /performance 404s. Must click the sidebar icon.
+        # Wait explicitly for at least one selector rather than checking count() immediately.
         logger.info("Clicking Performance icon in sidebar...")
         perf_clicked = False
         perf_selectors = [
             "[aria-label='Performance']",
             "[title='Performance']",
             "a[href*='performance']",
-            "nav a:nth-child(2)",          # 2nd nav item = Performance
+            "nav a:nth-child(2)",
             "[class*='nav'] a:nth-child(2)",
         ]
         for sel in perf_selectors:
             try:
                 el = page.locator(sel).first
-                if el.count() and el.is_visible():
-                    el.click()
-                    page.wait_for_load_state("networkidle", timeout=15_000)
-                    time.sleep(2)
-                    logger.info("Clicked Performance via: %s — URL: %s", sel, page.url)
-                    perf_clicked = True
-                    break
+                el.wait_for(state="visible", timeout=5_000)
+                el.click()
+                page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                time.sleep(2)
+                logger.info("Clicked Performance via: %s — URL: %s", sel, page.url)
+                perf_clicked = True
+                break
             except Exception:
                 continue
 
         if not perf_clicked:
-            # Last resort: find any element whose text contains "Performance"
+            # Last resort: any visible element whose text is "Performance"
             try:
-                page.get_by_text("Performance").first.click()
-                page.wait_for_load_state("networkidle", timeout=15_000)
+                el = page.get_by_text("Performance").first
+                el.wait_for(state="visible", timeout=20_000)
+                el.click()
+                page.wait_for_load_state("domcontentloaded", timeout=15_000)
                 time.sleep(2)
                 perf_clicked = True
                 logger.info("Clicked Performance via text. URL: %s", page.url)
@@ -179,8 +151,7 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
                     "Run with --headed to debug visually."
                 ) from exc
 
-        # ── Step 3: Set period to Current Month (or Previous Month on 1st) ───
-        _select_period(page, headed=headed)
+        # ── Step 3: Period is already "Last 7 days" (portal default — no click needed) ───
 
         # ── Step 4: Click "Reports" button ────────────────────────────────────
         # Confirmed: <button class="relative flex items-center...">Reports</button>
@@ -198,7 +169,7 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
         # ── Step 5: Capture the download ─────────────────────────────────────
         logger.info("Waiting for download...")
         today_str = date.today().strftime("%d-%m-%Y")
-        expected_name = f"sales-report-mtd-{today_str}.xlsx"
+        expected_name = f"sales-report-7d-{today_str}.xlsx"
 
         with page.expect_download(timeout=60_000) as dl_info:
             reports_btn.first.click()

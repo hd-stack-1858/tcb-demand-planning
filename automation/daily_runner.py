@@ -60,22 +60,19 @@ PROJECT = Path(__file__).parent.parent
 
 
 def _run_amazon() -> dict:
-    """Run Amazon SP-API orders + finances pulls. Returns result dict."""
-    results = {}
-    for report_type in ("orders", "finances"):
-        logger.info("Amazon SP-API: pulling %s...", report_type)
-        proc = subprocess.run(
-            [PYTHON, str(PROJECT / "automation" / "amazon_sp_api.py"), report_type,
-             "--env", "prod"],
-            capture_output=True, text=True, cwd=str(PROJECT),
-        )
-        if proc.returncode == 0:
-            logger.info("Amazon %s: OK", report_type)
-            results[report_type] = "ok"
-        else:
-            logger.error("Amazon %s failed (exit %d):\n%s", report_type, proc.returncode, proc.stderr)
-            results[report_type] = f"error (exit {proc.returncode})"
-    return results
+    """Run Amazon SP-API orders pull (MTD status refresh). Returns result dict."""
+    logger.info("Amazon SP-API: pulling orders...")
+    proc = subprocess.run(
+        [PYTHON, str(PROJECT / "automation" / "amazon_sp_api.py"), "orders",
+         "--env", "prod"],
+        capture_output=True, text=True, cwd=str(PROJECT),
+    )
+    if proc.returncode == 0:
+        logger.info("Amazon orders: OK")
+        return {"orders": "ok"}
+    else:
+        logger.error("Amazon orders failed (exit %d):\n%s", proc.returncode, proc.stderr)
+        return {"orders": f"error (exit {proc.returncode})"}
 
 
 def _run_blinkit() -> dict:
@@ -165,9 +162,47 @@ def run(dry_run: bool = False) -> int:
     # Send WhatsApp briefing
     _send_whatsapp(amazon_result, blinkit_result, dry_run=dry_run)
 
-    # Determine exit code
+    # Determine exit code + send targeted email alerts for any failures
     amazon_ok  = all(v == "ok" for v in amazon_result.values())
     blinkit_ok = blinkit_result.get("status") == "ok"
+
+    try:
+        from automation.email_sender import send_alert
+        today = date.today().strftime("%d-%b")
+        log   = f"automation/logs/daily_runner_{date.today().strftime('%Y%m%d')}.log"
+
+        if not amazon_ok:
+            send_alert(
+                subject=f"⚠️ Amazon SP-API — Failed ({today})",
+                body=(
+                    f"Amazon SP-API pull failed.\n\n"
+                    f"Detail: {amazon_result}\n\n"
+                    f"Log: {log}"
+                ),
+            )
+
+        blinkit_status = blinkit_result.get("status")
+        if blinkit_status == "session_expired":
+            send_alert(
+                subject=f"⚠️ Blinkit Scraper — Session Expired ({today})",
+                body=(
+                    f"The Blinkit portal session has expired.\n\n"
+                    f"Action required:\n"
+                    f"  python automation/blinkit_auth.py\n\n"
+                    f"Log: {log}"
+                ),
+            )
+        elif blinkit_status != "ok":
+            send_alert(
+                subject=f"⚠️ Blinkit Scraper — Failed ({today})",
+                body=(
+                    f"Blinkit scraper failed (exit {blinkit_result.get('exit_code', '?')}).\n\n"
+                    f"{blinkit_result.get('stderr', '')[:500]}\n\n"
+                    f"Log: {log}"
+                ),
+            )
+    except Exception as exc:
+        logger.warning("Could not send failure alert email: %s", exc)
 
     if amazon_ok and blinkit_ok:
         logger.info("All done — success.")

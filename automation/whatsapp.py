@@ -122,6 +122,33 @@ def send_daily_brief(message_text: str, dry_run: bool = False) -> list[dict]:
     return results
 
 
+def _send_hello_world(dry_run: bool = False) -> list[dict]:
+    """Send Meta's built-in hello_world template (no params) — for API connectivity testing only."""
+    token, phone_id, recipients = _get_config()
+
+    if dry_run:
+        logger.info("[dry-run] Would send hello_world to %s", recipients)
+        return [{"dry_run": True, "to": r} for r in recipients]
+
+    url     = f"{_API_BASE}/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    results = []
+    for recipient in recipients:
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": recipient,
+            "type": "template",
+            "template": {"name": "hello_world", "language": {"code": "en_US"}},
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        result = resp.json()
+        logger.info("hello_world sent to %s: %s", recipient, result)
+        results.append(result)
+    return results
+
+
 if __name__ == "__main__":
     # Quick test — sends a test message to all configured recipients
     import argparse
@@ -129,11 +156,20 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Test WhatsApp sender")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--hello-world", action="store_true",
+                        help="Send built-in hello_world template (for API connectivity test)")
     args = parser.parse_args()
 
-    test_msg = "15-May Thurs  TEST message from Vignesh automation setup."
-    try:
-        results = send_daily_brief(test_msg, dry_run=args.dry_run)
-        print(f"Sent to {len(results)} recipient(s). OK.")
-    except EnvironmentError as e:
-        print(f"SETUP REQUIRED:\n{e}")
+    if args.hello_world:
+        try:
+            results = _send_hello_world(dry_run=args.dry_run)
+            print(f"hello_world sent to {len(results)} recipient(s). API connectivity OK.")
+        except Exception as e:
+            print(f"ERROR: {e}")
+    else:
+        test_msg = "15-May Thu  TEST message from Vignesh automation setup."
+        try:
+            results = send_daily_brief(test_msg, dry_run=args.dry_run)
+            print(f"Sent to {len(results)} recipient(s). OK.")
+        except EnvironmentError as e:
+            print(f"SETUP REQUIRED:\n{e}")

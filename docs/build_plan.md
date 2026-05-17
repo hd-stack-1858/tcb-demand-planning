@@ -1,6 +1,6 @@
 # Sales MIS + Demand Planning System — Build Plan
 
-*Last updated: May 2026*
+*Last updated: 17-May 2026*
 
 ---
 
@@ -23,6 +23,14 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | Return reason fields | `return_reason`, `return_responsible`, `return_customer_verbatim` — all channels |
 | COGS / lot system | FIFO lot consumption for Amazon FBA and Blinkit |
 | `mcp/server.py` | Vignesh — FastMCP server, 9 tools, connected to Claude.ai + Claude Desktop |
+| `automation/blinkit_scraper.py` + `blinkit_auth.py` | Playwright scraper — logs into Blinkit portal, downloads MTD CSV, ingests to DB |
+| `automation/whatsapp.py` | Meta Cloud API sender — daily briefing to Himanshu + Shubhra |
+| `automation/daily_summary.py` | Queries yesterday's orders, formats WhatsApp message |
+| `automation/daily_runner.py` | Orchestrator — G1 (Amazon) + G2 (Blinkit) + G3 (WhatsApp), logs to automation/logs/ |
+| Windows Task Scheduler | "Blinkit Sales_Daily Run" — triggers daily_runner.py at 12:01 IST. First run: 16-May-2026 |
+| `automation/fnp_scraper.py` | Playwright scraper — accepts FnP orders, downloads Branding Challan PDF, emails. Live tested 17-May-2026. Runs 11:00/14:00/16:00 IST. |
+| `automation/fc_scraper.py` + `fc_auth.py` | Playwright scraper — accepts FC orders, fills shipment dims, downloads Invoice+PackingSlip PDFs, emails. Dry-run passed 17-May-2026. |
+| `automation/email_sender.py` | SMTP email helper — `send_with_attachments()` + `send_alert()` for failure notifications |
 
 ---
 
@@ -36,8 +44,8 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | D | Demand Forecasting Engine | 🔲 Pending |
 | E | Reorder Integration | 🔲 Pending |
 | F | Vignesh — MCP tool server (9 tools) | ✅ Done |
-| G | Daily Automation — data pipeline + WhatsApp briefing | 🚧 Next |
-| H | Vignesh as Proactive Agent — memory + scheduling + decision logic | 🔲 Pending |
+| G | Daily Automation — data pipeline + WhatsApp briefing | ✅ Done |
+| H | Vignesh as Proactive Agent — memory + scheduling + decision logic | 🚧 Next |
 | I | Full Autonomy — approval gates, self-monitoring, agent loop | 🔲 Pending |
 
 ---
@@ -48,8 +56,8 @@ Vignesh is not just an MCP server. The long-term vision is a true ops agent who 
 
 ```
 Phase F (Done)    → Passive tool server. Answers when asked. No initiative.
-Phase G (Next)    → Gets eyes and a voice. Data flows in automatically. Sends daily WhatsApp.
-Phase H           → Gets a brain. Monitors proactively. Recommends. Flags anomalies.
+Phase G (Done)    → Got eyes and a voice. Data flows in automatically. Sends daily WhatsApp.
+Phase H (Next)    → Gets a brain. Monitors proactively. Recommends. Flags anomalies.
 Phase I           → Gets autonomy. Drafts POs, approves within guardrails, runs the ops loop.
 ```
 
@@ -132,11 +140,11 @@ Phase I           → Gets autonomy. Drafts POs, approves within guardrails, run
 
 ---
 
-## Phase G — Daily Automation + WhatsApp Briefing 🚧 Next
+## Phase G — Daily Automation + WhatsApp Briefing ✅ Done
 
 **Goal:** Data pipeline runs at 12:00 noon IST with zero manual intervention. Vignesh sends a WhatsApp sales briefing to Himanshu + Shubhra immediately after.
 
-### G1 — Amazon SP-API daily pull ✅ Already working
+### G1 — Amazon SP-API daily pull ✅ Done
 
 `automation/amazon_sp_api.py` is built and used for production loads. Needs to be wired to a daily scheduler.
 
@@ -146,25 +154,16 @@ Phase I           → Gets autonomy. Drafts POs, approves within guardrails, run
   → python automation/amazon_sp_api.py finances  # settlement data
 ```
 
-### G2 — Blinkit daily scraper 🔲 To build
+### G2 — Blinkit daily scraper ✅ Done
 
-**File:** `automation/blinkit_scraper.py`
+**File:** `automation/blinkit_scraper.py` + `automation/blinkit_auth.py`
 
-Blinkit has no public API. Use Playwright to:
-1. Log into Blinkit seller portal (credentials in `.env`)
-2. Navigate to MTD sales report
-3. Download CSV
-4. Run `ingest/load_blinkit_sales.py` on the file
+Playwright-based. Loads saved session → navigates to Performance → selects Current Month → clicks Reports → downloads MTD XLSX → ingests via `load_blinkit_sales.py`. Tested and confirmed working (downloaded data up to 14-May-2026). Session-expiry handled: exit code 2 → `daily_runner.py` sends WhatsApp alert asking Himanshu to re-run `blinkit_auth.py`.
 
-```
-12:00 noon IST
-  → python automation/blinkit_scraper.py  # downloads + ingests
-```
+### G3 — WhatsApp daily briefing ✅ Done
 
-### G3 — WhatsApp daily briefing 🔲 To build
-
-**Platform:** Meta Cloud API (free tier, up to 1000 conversations/month)
-**Sender number:** Dedicated number registered as WhatsApp Business (not on personal WhatsApp)
+**Platform:** Meta Cloud API (free tier, up to 1000 conversations/month) — setup complete.
+**Sender number:** Dedicated WhatsApp Business number registered on Meta Business Suite.
 **Recipients:** Himanshu + Shubhra
 
 **Message format (sent every day ~12:15 IST after both ingestions complete):**
@@ -178,25 +177,56 @@ Blinkit has no public API. Use Playwright to:
 
 One row per channel. Each entry = `{qty}{SKU_ID}`. Only channels with orders that day appear.
 
-**Files to build:**
+**Files built:**
 - `automation/whatsapp.py` — Meta Cloud API sender (template message)
 - `automation/daily_summary.py` — queries yesterday's orders from DB, formats message, calls whatsapp.py
+- `automation/daily_runner.py` — orchestrates G1+G2+G3, handles partial failures, logs to `automation/logs/`
 
-### G4 — Scheduler 🔲 To build
+### G4 — Scheduler ✅ Done
 
-**Windows:** Task Scheduler jobs (local machine, runs at noon IST)
-**Cloud option (later):** GitHub Actions cron for resilience
+**Windows Task Scheduler:** Task "Blinkit Sales_Daily Run" created and active.
+- Trigger: Daily at 12:01 IST
+- Action: runs `automation/daily_runner.py`
+- First live run: 16-May-2026
 
-```
-12:00 → G1 Amazon orders + finances
-12:00 → G2 Blinkit scraper
-12:15 → G3 WhatsApp briefing (after both G1 + G2 complete)
-```
+**Meta one-time setup:** Complete — sender number registered, `daily_sales_brief` template approved, tokens stored in `.env`.
 
-**One-time setup required before G3:**
-1. Register sender number on Meta Business Suite → WhatsApp Business API
-2. Create message template (get Meta approval — ~24 hrs)
-3. Store `META_WA_TOKEN`, `META_PHONE_NUMBER_ID`, recipient numbers in `.env`
+### G5 — FnP scraper ✅ Done
+
+**Files:** `automation/fnp_scraper.py` + `automation/email_sender.py`
+
+Playwright-based. Logs in → checks ALL date columns (TODAY/TOMORROW/FUTURE) in Allocated section → accepts orders → checks all date columns in "Orders to be shipped" → downloads Branding Challan PDF(s) → emails to Himanshu + Dilwar. Failure alerts email Himanshu.
+- Schedules: 11:00, 14:00, 16:00 IST via Windows Task Scheduler ✅ Active
+- Live tested 17-May-2026: 3 orders accepted, PDFs downloaded correctly
+- Email send test: pending (next real order)
+
+### G6 — First Cry scraper ✅ Built | 🔲 Email + Scheduler pending
+
+**Files:** `automation/fc_scraper.py` + `automation/fc_auth.py` + `automation/fc_dimensions.json`
+
+Playwright-based. Loads saved session → processes each pending B2C order (accept, fill shipment dims, save) → downloads Invoice + Packing Slip PDFs → emails to Himanshu + Dilwar. Failure alerts email Himanshu.
+- Dry-run passed 17-May-2026 (PDFs downloaded correctly)
+- Pending: email test with next real FC order
+- Schedule: 11:00, 20:00 IST via Windows Task Scheduler 🔲 Set up after email test passes
+
+### G7 — FnP + FC Layer 1 order recording 🔲 Pending (after G5/G6 stabilise)
+
+**Goal:** Complete the automation loop — currently scrapers accept orders and email PDFs but do NOT record the sale in the DB. Without this, the Sales MIS has no FnP/FC data until manual Ship Out is done in the Warehouse App.
+
+**Why this matters:** All channels follow a two-layer architecture:
+- Layer 1 (daily): `record_dropship_sale()` → orders table + inventory decrement → feeds Sales MIS
+- Layer 2 (month-end): portal reports → reconcile returns and discrepancies
+
+FnP and FC currently have Layer 2 ingest scripts but Layer 1 is still manual.
+
+**What to build:**
+- After each order is processed by the scraper, call `record_dropship_sale()` directly in Python
+- Data already available during the scraper run (no PDF parsing needed):
+  - FC: Order ID, SKU, Qty, City — all visible in the configure tab
+  - FnP: Order ID, SKU, Qty — readable from the Allocated section
+- No browser automation needed — direct Python call to `tcb/inventory.py`
+
+**Blocked by:** G5 and G6 live and stable.
 
 ---
 
@@ -286,17 +316,12 @@ Vignesh: → creates PO in DB, marks SENT, logs decision, sets 3-day follow-up r
 ## Build Order Going Forward
 
 ```
-Track 1 — Vignesh daily automation (immediate):
-  G2. Blinkit Playwright scraper
-  G3. WhatsApp sender (Meta API setup first)
-  G4. Scheduler (Task Scheduler, noon IST)
+Track 1 — Forecasting + Reorder (no blockers):
+  D. Demand Forecasting Engine (tcb/forecasting.py + Forecast tab in sales_app)
+  E. Reorder Integration + Vignesh tool (tcb/reorder.py + Reorder Plan tab)
 
-Track 2 — Forecasting + Reorder (parallel):
-  D. Demand Forecasting Engine
-  E. Reorder Integration + Vignesh tool
-
-Track 3 — Vignesh agent layer (after G):
-  H. Memory + playbooks + enhanced briefing
+Track 2 — Vignesh agent layer (can start now that G is live):
+  H. Memory + decision playbooks + enhanced WhatsApp alerts
   I. Approval gates + invoice/PO automation
 ```
 
@@ -316,9 +341,18 @@ Track 3 — Vignesh agent layer (after G):
 | `ingest/load_fc_sales.py` | ✅ Built |
 | `automation/amazon_sp_api.py` | ✅ Built — orders + finances, poll/download |
 | `mcp/server.py` | ✅ Built — 9 tools, live on Claude.ai |
-| `automation/blinkit_scraper.py` | 🔲 Phase G2 |
-| `automation/whatsapp.py` | 🔲 Phase G3 |
-| `automation/daily_summary.py` | 🔲 Phase G3 |
+| `automation/blinkit_scraper.py` | ✅ Built + tested (downloaded up to 14-May) |
+| `automation/blinkit_auth.py` | ✅ Built — saves Playwright session state |
+| `automation/whatsapp.py` | ✅ Built — Meta Cloud API sender |
+| `automation/daily_summary.py` | ✅ Built — queries DB, formats WA message |
+| `automation/daily_runner.py` | ✅ Built — orchestrates G1+G2+G3, logs to automation/logs/ |
+| Windows Task Scheduler | ✅ Set up — "Blinkit Sales_Daily Run" at 12:01 IST daily |
+| `automation/fnp_scraper.py` | 🔲 Built, pending first live test (needs a real FnP order) |
+| `automation/email_sender.py` | ✅ Built — SMTP PDF attachment sender (shared by FnP + FC) |
+| FnP Task Scheduler jobs | 🔲 To set up — 11:00, 14:00, 16:00 IST (see below) |
+| `automation/fc_scraper.py` + `fc_auth.py` | 🟡 Dry-run passed (17-May-2026) — PDFs downloaded. Pending email test + Task Scheduler (needs next real FC order) |
+| `automation/fc_dimensions.json` | ✅ All 12 SKUs filled |
+| FC Task Scheduler jobs | 🔲 To set up after first live test passes — 11:00, 20:00 IST |
 | `automation/vignesh_monitor.py` | 🔲 Phase H2 |
 | `tcb/forecasting.py` | 🔲 Phase D |
 | `tcb/reorder.py` | 🔲 Phase E |

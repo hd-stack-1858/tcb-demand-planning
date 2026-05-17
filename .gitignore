@@ -37,5 +37,10 @@ build/
 # Claude Code local directory — memory, settings, lock files — all local, not committed
 .claude/
 
-# Blinkit browser session — contains auth cookies, never commit
+# Browser sessions — contain auth cookies, never commit
 .blinkit_session/
+.fc_session/
+
+# Downloaded reports — data stays local, not in source control
+fnp_reports/
+fc_reports/

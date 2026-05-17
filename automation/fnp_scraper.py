@@ -1,0 +1,526 @@
+"""
+FnP order processor.
+Runs at 11:00, 14:00, 16:00 IST via Windows Task Scheduler.
+
+Flow each run:
+  1. Login to partner.fnp.com
+  2. Navigate to Allocated orders:
+       - If any: select all → ACCEPT → orders move to "Orders to be shipped"
+  3. Navigate to Orders to be Shipped:
+       - If any: select all → BRANDING CHALLAN → PDF downloads
+  4. Email PDF to Himanshu + Dilwar
+
+Clean no-op if no orders found. Self-healing: orders stuck in "Orders to be
+shipped" from a failed run are picked up on the next run automatically.
+
+Required .env vars:
+  FNP_USERNAME      vendor portal email (shubhra@thecradlebox.com)
+  FNP_PASSWORD      vendor portal password
+  SMTP_SENDER       sending email address (hd@thecradlebox.com)
+  SMTP_PASSWORD     Gmail App Password for SMTP_SENDER
+  EMAIL_HIMANSHU    Himanshu's email
+  EMAIL_DILWAR      Dilwar's email
+
+Usage:
+  python automation/fnp_scraper.py              # normal run
+  python automation/fnp_scraper.py --dry-run    # download PDF, skip email
+  python automation/fnp_scraper.py --headed     # show browser window (debug)
+
+Logs: automation/logs/fnp_YYYYMMDD.log
+
+DEBUGGING FIRST RUN:
+  Run with --headed to watch the browser. If it fails mid-flow, check the log
+  for the URL it's stuck on and adjust selectors in _click_section() below.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import sys
+import time
+from datetime import date
+from pathlib import Path
+
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+load_dotenv(Path(__file__).parent.parent / ".env")
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+LOG_DIR  = Path(__file__).parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+log_file = LOG_DIR / f"fnp_{date.today().strftime('%Y%m%d')}.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler(str(log_file), encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+PORTAL_URL   = "https://partner.fnp.com/vendorapp/templates/index.html#/login/"
+DOWNLOAD_DIR = Path(__file__).parent.parent / "fnp_reports" / "challans"
+
+
+# ── Login ──────────────────────────────────────────────────────────────────────
+
+def _login(page) -> None:
+    username = os.environ.get("FNP_USERNAME", "").strip()
+    password = os.environ.get("FNP_PASSWORD", "").strip()
+    if not username or not password:
+        raise EnvironmentError("FNP_USERNAME and FNP_PASSWORD must be set in .env")
+
+    logger.info("Opening FnP portal...")
+    page.goto(PORTAL_URL, wait_until="networkidle", timeout=30_000)
+    time.sleep(2)
+
+    # If portal redirected away from the login URL, session is still active — skip login
+    logger.info("Post-navigation URL: %s", page.url)
+    if "#/login" not in page.url:
+        logger.info("Session active — already on dashboard. Skipping login.")
+        return
+
+    # Still on login page — fill credentials
+    # Use visible inputs only to avoid matching hidden dashboard elements
+    email_input = page.locator("input[type='email']").first
+    if not email_input.count() or not email_input.is_visible():
+        email_input = page.locator("input[type='text']:visible").first
+    email_input.fill(username)
+    page.locator("input[type='password']").first.fill(password)
+    page.get_by_role("button", name="Login").click()
+
+    # Wait for Angular SPA to navigate away from login
+    # "text=Allocated" is NOT safe: the login page has "An order has been allocated to you."
+    page.wait_for_url(lambda url: "#/login" not in url, timeout=30_000)
+    page.wait_for_load_state("networkidle", timeout=30_000)
+    time.sleep(3)
+    logger.info("Logged in. Dashboard loaded. URL: %s", page.url)
+
+
+# ── Dashboard navigation ───────────────────────────────────────────────────────
+
+def _scan_section(page, label: str) -> list[tuple[int, int]]:
+    """
+    Scan the dashboard section for label.
+    Returns list of (child_index, count) for every non-zero date column.
+
+    DOM structure (div-based Angular app, not a table):
+      DIV (parent)
+        H2  "Allocated"  (or H2.ordershipped for "Orders to be shipped")
+        DIV.ng-scope     <- direct children of this are the date cells (TODAY/TOMORROW/FUTURE)
+    """
+    cells = page.evaluate(f"""
+        () => {{
+            // Find the H2 label with exact text
+            let labelEl = null;
+            for (const el of document.querySelectorAll('h2, h3')) {{
+                if ((el.innerText || '').trim() === '{label}') {{
+                    labelEl = el;
+                    break;
+                }}
+            }}
+            if (!labelEl) return [];
+
+            // The sibling div (DIV.ng-scope) holds the date cells
+            const p1 = labelEl.parentElement;
+            const dateContainer = Array.from(p1.children).find(c => c !== labelEl);
+            if (!dateContainer) return [];
+
+            // Scan direct children of dateContainer for (N) count pattern
+            const result = [];
+            Array.from(dateContainer.children).forEach((child, idx) => {{
+                const text = (child.innerText || '').trim();
+                const m = text.match(/\\((\\d+)\\)/);
+                if (m) {{
+                    result.push({{idx: idx, count: parseInt(m[1]), text: text.replace(/\\n/g, ' ')}});
+                }}
+            }});
+            return result;
+        }}
+    """)
+
+    logger.info("'%s' section cells: %s", label, cells)
+
+    nonzero = [(c["idx"], c["count"]) for c in cells if c["count"] > 0]
+    if not nonzero:
+        logger.info("'%s': all columns are zero — nothing to process.", label)
+    return nonzero
+
+
+def _click_column(page, label: str, child_idx: int) -> None:
+    """
+    Click the date cell at child_idx inside the section's DIV.ng-scope container.
+    """
+    page.evaluate(f"""
+        () => {{
+            let labelEl = null;
+            for (const el of document.querySelectorAll('h2, h3')) {{
+                if ((el.innerText || '').trim() === '{label}') {{
+                    labelEl = el;
+                    break;
+                }}
+            }}
+            if (!labelEl) return;
+            const p1 = labelEl.parentElement;
+            const dateContainer = Array.from(p1.children).find(c => c !== labelEl);
+            if (!dateContainer) return;
+            const child = dateContainer.children[{child_idx}];
+            if (child) child.click();
+        }}
+    """)
+    page.wait_for_load_state("networkidle", timeout=20_000)
+    time.sleep(2)
+    logger.info("Clicked '%s' child[%d]. URL: %s", label, child_idx, page.url)
+
+
+def _return_to_dashboard(page) -> None:
+    """
+    Navigate back to the main dashboard after processing a section.
+    Tries go_back() first; falls back to reloading the portal base URL.
+    """
+    page.go_back()
+    page.wait_for_load_state("networkidle", timeout=15_000)
+    time.sleep(2)
+
+    if page.locator("text=Orders to be shipped").count():
+        logger.info("Back on dashboard.")
+        return
+
+    # Fallback: reload portal base (session still active, redirects to dashboard)
+    base = PORTAL_URL.replace("#/login/", "")
+    logger.info("go_back() didn't land on dashboard — trying %s", base)
+    page.goto(base, wait_until="networkidle", timeout=30_000)
+    page.wait_for_selector("text=Allocated", timeout=30_000)
+    time.sleep(2)
+    logger.info("Dashboard loaded via base URL.")
+
+
+# ── Order list page helpers ────────────────────────────────────────────────────
+
+def _read_order_count(page) -> int:
+    """
+    Extract order count from the page heading.
+    Headings like 'Allocated LastTenDays Orders (5)' → 5.
+    Returns -1 if count cannot be determined (treat as "proceed anyway").
+    """
+    for sel in ["h1", "h2", "h3", "[class*='heading']", "[class*='title']", "[class*='page-title']"]:
+        el = page.locator(sel).first
+        if el.count() and el.is_visible():
+            text = el.inner_text().strip()
+            nums = re.findall(r'\((\d+)\)', text)
+            if nums:
+                count = int(nums[0])
+                logger.info("Order count from heading '%s': %d", text, count)
+                return count
+    logger.warning("Could not read order count from page heading — proceeding with unknown count.")
+    return -1
+
+
+def _select_all(page) -> None:
+    """Select all orders on the current list page."""
+    # Prefer the header checkbox (checks everything at once)
+    # The checkbox has id="selectall" and ng-model="selectall".
+    # Use JS click — Playwright's .check() fails because the SPA scroll container
+    # is an inner div, not window, so scrollIntoView leaves it "outside viewport".
+    result = page.evaluate("""
+        () => {
+            const cb = document.getElementById('selectall')
+                    || document.querySelector('input[ng-model="selectall"]')
+                    || document.querySelector('input[type="checkbox"]');
+            if (!cb) return {found: false};
+            cb.scrollIntoView({behavior: 'instant', block: 'center'});
+            cb.click();
+            return {found: true, id: cb.id, checked: cb.checked};
+        }
+    """)
+    logger.info("Select All result: %s", result)
+    if result and result.get("found"):
+        time.sleep(1)
+        return
+    logger.warning("No 'Select All' checkbox found.")
+
+
+def _click_accept(page) -> None:
+    """Click the Accept button on the Allocated orders page."""
+    # ng-disabled until Select All is checked. Wait up to 5s for Angular to enable it,
+    # then JS-click (scrollIntoView + click) to handle the SPA scroll container.
+    # There are TWO bulkAccept buttons: ng-show="!selectall" and ng-show="selectall".
+    # After Select All, the !selectall button gets ng-hide; the selectall button becomes visible.
+    # Use getComputedStyle (not offsetParent — that's null for position:fixed bottom ribbons).
+    find_js = """
+        () => {
+            const all = [...document.querySelectorAll('button')].map(b => ({
+                text: (b.innerText || '').trim().substring(0, 40),
+                cls: b.className,
+                disabled: b.disabled,
+                display: window.getComputedStyle(b).display,
+                visibility: window.getComputedStyle(b).visibility,
+            }));
+            const btn = [...document.querySelectorAll('button')].find(b =>
+                (b.innerText || '').trim().toLowerCase().startsWith('accept') &&
+                !b.classList.contains('ng-hide') &&
+                window.getComputedStyle(b).display !== 'none' &&
+                window.getComputedStyle(b).visibility !== 'hidden'
+            );
+            if (!btn) return {found: false, all_buttons: all};
+            return {found: true, disabled: btn.disabled, cls: btn.className};
+        }
+    """
+    for attempt in range(10):
+        state = page.evaluate(find_js)
+        if state and state.get("found") and not state.get("disabled"):
+            break
+        if attempt == 0:
+            logger.info("Accept button scan: %s", state)
+        else:
+            logger.info("Accept button not ready (attempt %d/10): found=%s", attempt + 1, state.get("found"))
+        time.sleep(0.5)
+
+    clicked = page.evaluate("""
+        () => {
+            const btn = [...document.querySelectorAll('button')].find(b =>
+                (b.innerText || '').trim().toLowerCase().startsWith('accept') &&
+                !b.classList.contains('ng-hide') &&
+                window.getComputedStyle(b).display !== 'none' &&
+                window.getComputedStyle(b).visibility !== 'hidden'
+            );
+            if (!btn) return {found: false};
+            btn.scrollIntoView({behavior: 'instant', block: 'center'});
+            btn.click();
+            return {found: true, disabled: btn.disabled, cls: btn.className};
+        }
+    """)
+    logger.info("Accept click result: %s", clicked)
+    if not clicked or not clicked.get("found"):
+        raise RuntimeError("Accept button not found on allocated orders page.")
+    time.sleep(3)
+    page.wait_for_load_state("networkidle", timeout=20_000)
+    logger.info("ACCEPT clicked.")
+
+
+def _click_branding_challan(page) -> Path:
+    """
+    Click the BRANDING CHALLAN button, capture the download, save to DOWNLOAD_DIR.
+    Returns the saved PDF path.
+    """
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    challan_btn = None
+    for sel in [
+        "button:has-text('BRANDING CHALLAN')",
+        "a:has-text('BRANDING CHALLAN')",
+        "[class*='branding']",
+    ]:
+        el = page.locator(sel).first
+        if el.count() and el.is_visible():
+            challan_btn = el
+            break
+
+    if challan_btn is None:
+        raise RuntimeError(
+            "BRANDING CHALLAN button not found. "
+            "Run with --headed to debug. Check if orders are selected."
+        )
+
+    today_str = date.today().strftime("%Y%m%d")
+    run_time  = time.strftime("%H%M")
+
+    logger.info("Clicking BRANDING CHALLAN and waiting for download...")
+    with page.expect_download(timeout=60_000) as dl:
+        challan_btn.click()
+
+    download = dl.value
+    if download.failure():
+        raise RuntimeError(f"Branding Challan download failed: {download.failure()}")
+
+    filename = download.suggested_filename or f"fnp_challan_{today_str}_{run_time}.pdf"
+    dest = DOWNLOAD_DIR / filename
+    download.save_as(str(dest))
+    logger.info("Challan saved: %s (%d bytes)", dest, dest.stat().st_size)
+    return dest
+
+
+# ── Main pipeline ──────────────────────────────────────────────────────────────
+
+def run(dry_run: bool = False, headed: bool = False) -> dict:
+    """
+    Full FnP processing pipeline. Returns result dict:
+      allocated_accepted  int   — total orders accepted across all date columns
+      ship_count          int   — total orders processed from "Orders to be shipped"
+      challan_downloaded  bool
+      emailed             bool
+      skipped             bool  — True if no orders found at all
+    """
+    result: dict = {
+        "allocated_accepted": 0,
+        "ship_count": 0,
+        "challan_downloaded": False,
+        "emailed": False,
+        "skipped": False,
+    }
+
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    pdf_paths: list[Path] = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=not headed,
+            slow_mo=300 if headed else 50,
+        )
+        ctx  = browser.new_context(
+            accept_downloads=True,
+            viewport={"width": 1280, "height": 900},
+        )
+        page = ctx.new_page()
+
+        try:
+            # ── Step 1: Login ──────────────────────────────────────────────────
+            _login(page)
+
+            # ── Step 2: Allocated orders — ALL non-zero columns ────────────────
+            # TODAY, TOMORROW, FUTURE can each have orders simultaneously
+            alloc_cols = _scan_section(page, "Allocated")
+            logger.info("Allocated: %d non-zero column(s) found.", len(alloc_cols))
+
+            for col_idx, col_count in alloc_cols:
+                logger.info("Allocated col[%d]: %d order(s). Selecting + accepting...",
+                            col_idx, col_count)
+                _click_column(page, "Allocated", col_idx)
+                count = _read_order_count(page)
+                _select_all(page)
+                _click_accept(page)
+                result["allocated_accepted"] += count if count > 0 else col_count
+                _return_to_dashboard(page)
+
+            # ── Step 3: Orders to be shipped — ALL non-zero columns ────────────
+            ship_cols = _scan_section(page, "Orders to be shipped")
+            logger.info("Orders to be shipped: %d non-zero column(s) found.", len(ship_cols))
+
+            if not ship_cols and result["allocated_accepted"] == 0:
+                logger.info("No orders anywhere — nothing to process.")
+                result["skipped"] = True
+                browser.close()
+                return result
+
+            if not ship_cols and result["allocated_accepted"] > 0:
+                # Accepted orders haven't appeared in to-be-shipped yet — timing issue
+                logger.warning(
+                    "Accepted %d order(s) but 'Orders to be shipped' shows 0. "
+                    "Retrying in 5s...",
+                    result["allocated_accepted"],
+                )
+                time.sleep(5)
+                page.reload(wait_until="networkidle", timeout=30_000)
+                ship_cols = _scan_section(page, "Orders to be shipped")
+                if not ship_cols:
+                    logger.error("Still 0 orders to ship after retry. Check portal manually.")
+                    browser.close()
+                    return result
+
+            total_ship = 0
+            for col_idx, col_count in ship_cols:
+                logger.info("Orders to be shipped col[%d]: %d order(s). Downloading challan...",
+                            col_idx, col_count)
+                _click_column(page, "Orders to be shipped", col_idx)
+                count = _read_order_count(page)
+                total_ship += count if count > 0 else col_count
+                _select_all(page)
+                pdf = _click_branding_challan(page)
+                pdf_paths.append(pdf)
+                result["challan_downloaded"] = True
+                _return_to_dashboard(page)
+
+            result["ship_count"] = total_ship
+
+        except Exception:
+            logger.exception("FnP scraper encountered an error.")
+            try:
+                browser.close()
+            except Exception:
+                pass
+            raise
+
+        browser.close()
+
+    # ── Step 4: Email all PDFs in one message ──────────────────────────────────
+    if not pdf_paths:
+        return result
+
+    from automation.email_sender import send_with_attachments
+
+    recipients = [
+        r for r in [
+            os.environ.get("EMAIL_HIMANSHU", "").strip(),
+            os.environ.get("EMAIL_DILWAR", "").strip(),
+        ]
+        if r
+    ]
+
+    if not recipients:
+        logger.warning("No email recipients set. Add EMAIL_HIMANSHU / EMAIL_DILWAR to .env")
+    else:
+        n     = result["ship_count"] if result["ship_count"] > 0 else result["allocated_accepted"]
+        today = date.today().strftime("%d-%b-%Y")
+        subject = f"FnP Branding Challan — {today} ({n} order(s))"
+        body = (
+            f"Hi,\n\n"
+            f"Attached is the FnP Branding Challan for {n} order(s) on {today}.\n"
+            f"Please print and pack as per the challan.\n\n"
+            f"— Vignesh (automated)\n"
+        )
+        send_with_attachments(subject, body, recipients, pdf_paths, dry_run=dry_run)
+        result["emailed"] = not dry_run
+
+    return result
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="FnP order processor")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Download challan but do NOT send email")
+    parser.add_argument("--headed", action="store_true",
+                        help="Show browser window — use this for first-run debugging")
+    args = parser.parse_args()
+
+    os.environ.setdefault("TCB_ENV", "prod")
+
+    logger.info("=" * 55)
+    logger.info("FnP scraper started — %s", date.today().isoformat())
+    logger.info("=" * 55)
+
+    try:
+        result = run(dry_run=args.dry_run, headed=args.headed)
+        if result["skipped"]:
+            print("No FnP orders found — nothing to do.")
+        else:
+            print(
+                f"FnP: allocated_accepted={result['allocated_accepted']} | "
+                f"ship_count={result['ship_count']} | "
+                f"challan={'downloaded' if result['challan_downloaded'] else 'N/A'} | "
+                f"email={'sent' if result['emailed'] else ('dry-run' if args.dry_run else 'not sent')}"
+            )
+    except Exception as e:
+        logger.error("FAILED: %s", e)
+        try:
+            from automation.email_sender import send_alert
+            send_alert(
+                subject=f"⚠️ FnP Scraper — Failed ({date.today().strftime('%d-%b')})",
+                body=(
+                    f"Error: {e}\n\n"
+                    f"Log: automation/logs/fnp_{date.today().strftime('%Y%m%d')}.log"
+                ),
+            )
+        except Exception:
+            pass
+        print(f"ERROR: {e}")
+        sys.exit(1)

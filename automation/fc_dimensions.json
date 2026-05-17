@@ -1,0 +1,16 @@
+{
+  "_instructions": "Fill in weight_kg, length_cm, breadth_cm, height_cm for each SKU. Used by fc_scraper.py when filling the shipment form. Style code must match exactly what appears in the First Cry portal.",
+
+  "TCB001": {"weight_kg": 0.6, "length_cm": 30, "breadth_cm": 27, "height_cm": 11.5},
+  "TCB002": {"weight_kg": 0.6, "length_cm": 30, "breadth_cm": 27, "height_cm": 11.5},
+  "TCB003": {"weight_kg": 0.6, "length_cm": 30, "breadth_cm": 27, "height_cm": 11.5},
+  "TCB004": {"weight_kg": 0.6, "length_cm": 30, "breadth_cm": 27, "height_cm": 11.5},
+  "TCB005": {"weight_kg": 0.6, "length_cm": 30, "breadth_cm": 27, "height_cm": 11.5},
+  "TCB006": {"weight_kg": 0.6, "length_cm": 30, "breadth_cm": 27, "height_cm": 11.5},
+  "TCB007": {"weight_kg": 0.6, "length_cm": 30, "breadth_cm": 27, "height_cm": 11.5},
+  "TCB008": {"weight_kg": 0.6, "length_cm": 19, "breadth_cm": 19, "height_cm": 5.5},
+  "TCB009": {"weight_kg": 0.8, "length_cm": 28, "breadth_cm": 14, "height_cm": 14},
+  "TCB010": {"weight_kg": 1.1, "length_cm": 30, "breadth_cm": 27, "height_cm": 11.5},
+  "TCB011": {"weight_kg": 0.6, "length_cm": 19, "breadth_cm": 19, "height_cm": 7},
+  "TCB012": {"weight_kg": 0.6, "length_cm": 19, "breadth_cm": 19, "height_cm": 5.5}
+}
