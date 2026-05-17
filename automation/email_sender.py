@@ -80,9 +80,15 @@ def send_with_attachments(
 
 
 def send_alert(subject: str, body: str) -> None:
-    """Send a plain-text failure alert to Himanshu (no attachments)."""
+    """Send a plain-text failure alert to Himanshu (no attachments).
+
+    Sends to EMAIL_HIMANSHU; also CC EMAIL_HIMANSHU_ALT if set (use personal Gmail
+    as backup so alerts don't silently land in work-inbox spam).
+    """
     himanshu = os.environ.get("EMAIL_HIMANSHU", "").strip()
     if not himanshu:
         logger.warning("EMAIL_HIMANSHU not set — cannot send alert email.")
         return
-    send_with_attachments(subject, body, [himanshu], attachments=[])
+    alt = os.environ.get("EMAIL_HIMANSHU_ALT", "").strip()
+    to_addrs = [himanshu] + ([alt] if alt and alt != himanshu else [])
+    send_with_attachments(subject, body, to_addrs, attachments=[])

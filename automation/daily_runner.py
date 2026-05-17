@@ -139,7 +139,13 @@ def _send_whatsapp(amazon_result: dict, blinkit_result: dict, dry_run: bool) -> 
         send_daily_brief(message, dry_run=dry_run)
         logger.info("WhatsApp sent%s.", " (dry-run)" if dry_run else "")
     except EnvironmentError as exc:
-        logger.warning("WhatsApp not configured — skipping send.\n%s", exc)
+        # requests.HTTPError inherits IOError→OSError→EnvironmentError in Python 3;
+        # check isinstance so API errors aren't silently logged as "not configured".
+        import requests as _req
+        if isinstance(exc, _req.exceptions.HTTPError):
+            logger.error("WhatsApp API error (already logged above): %s", exc)
+        else:
+            logger.warning("WhatsApp not configured — skipping send.\n%s", exc)
     except Exception as exc:
         logger.error("WhatsApp send failed: %s", exc)
 

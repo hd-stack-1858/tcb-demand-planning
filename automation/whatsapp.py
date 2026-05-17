@@ -80,8 +80,11 @@ def send_daily_brief(message_text: str, dry_run: bool = False) -> list[dict]:
     """
     token, phone_id, recipients = _get_config()
 
+    # Meta template params cannot contain newlines or more than 4 consecutive spaces
+    flat_text = " | ".join(line.strip() for line in message_text.splitlines() if line.strip())
+
     if dry_run:
-        logger.info("[dry-run] Would send WhatsApp to %s:\n%s", recipients, message_text)
+        logger.info("[dry-run] Would send WhatsApp to %s:\n%s", recipients, flat_text)
         return [{"dry_run": True, "to": r} for r in recipients]
 
     url     = f"{_API_BASE}/{phone_id}/messages"
@@ -103,7 +106,7 @@ def send_daily_brief(message_text: str, dry_run: bool = False) -> list[dict]:
                     {
                         "type": "body",
                         "parameters": [
-                            {"type": "text", "text": message_text}
+                            {"type": "text", "text": flat_text}
                         ],
                     }
                 ],
@@ -116,7 +119,8 @@ def send_daily_brief(message_text: str, dry_run: bool = False) -> list[dict]:
             logger.error("WhatsApp send failed for %s: %s — %s", recipient, exc, resp.text)
             raise
         result = resp.json()
-        logger.info("WhatsApp sent to %s: message_id=%s", recipient, result.get("messages", [{}])[0].get("id"))
+        logger.info("WhatsApp sent to %s: message_id=%s | text=%r",
+                    recipient, result.get("messages", [{}])[0].get("id"), flat_text[:80])
         results.append(result)
 
     return results
