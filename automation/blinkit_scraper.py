@@ -99,7 +99,9 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
         # indefinitely, so "networkidle" never fires reliably.
         logger.info("Loading Blinkit seller portal...")
         page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=30_000)
-        time.sleep(4)   # let SPA finish rendering sidebar
+        # Headless mode renders the SPA sidebar noticeably slower than headed.
+        # 8s gives the sidebar time to mount before we start probing selectors.
+        time.sleep(8)
 
         if _is_login_page(page):
             browser.close()
@@ -124,7 +126,7 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
         for sel in perf_selectors:
             try:
                 el = page.locator(sel).first
-                el.wait_for(state="visible", timeout=5_000)
+                el.wait_for(state="visible", timeout=10_000)
                 el.click()
                 page.wait_for_load_state("domcontentloaded", timeout=15_000)
                 time.sleep(2)
