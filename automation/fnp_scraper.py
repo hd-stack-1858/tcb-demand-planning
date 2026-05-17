@@ -409,17 +409,26 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
                 return result
 
             if not ship_cols and result["allocated_accepted"] > 0:
-                # Accepted orders haven't appeared in to-be-shipped yet — timing issue
-                logger.warning(
-                    "Accepted %d order(s) but 'Orders to be shipped' shows 0. "
-                    "Retrying in 5s...",
-                    result["allocated_accepted"],
-                )
-                time.sleep(5)
-                page.reload(wait_until="networkidle", timeout=30_000)
-                ship_cols = _scan_section(page, "Orders to be shipped")
+                # Portal takes time to move accepted orders into "Orders to be shipped".
+                # Retry up to 4 times with 15s gaps (total up to ~60s).
+                for attempt in range(1, 5):
+                    logger.warning(
+                        "Accepted %d order(s) but 'Orders to be shipped' shows 0. "
+                        "Waiting 15s before retry %d/4...",
+                        result["allocated_accepted"], attempt,
+                    )
+                    time.sleep(15)
+                    page.reload(wait_until="networkidle", timeout=30_000)
+                    time.sleep(3)
+                    ship_cols = _scan_section(page, "Orders to be shipped")
+                    if ship_cols:
+                        break
+
                 if not ship_cols:
-                    logger.error("Still 0 orders to ship after retry. Check portal manually.")
+                    logger.warning(
+                        "Orders were accepted but challan not yet available after ~60s. "
+                        "Likely past FnP's evening cutoff — challan will appear in tomorrow's run."
+                    )
                     browser.close()
                     return result
 
