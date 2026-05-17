@@ -207,7 +207,7 @@ Playwright-based. Logs in → checks ALL date columns (TODAY/TOMORROW/FUTURE) in
 Playwright-based. Loads saved session → processes each pending B2C order (accept, fill shipment dims, save) → downloads Invoice + Packing Slip PDFs → emails to Himanshu + Dilwar. Failure alerts email Himanshu.
 - Dry-run passed 17-May-2026 (PDFs downloaded correctly)
 - Pending: email test with next real FC order
-- Schedule: 11:00, 20:00 IST via Windows Task Scheduler 🔲 Set up after email test passes
+- Schedule: 10:30 IST + 20:00 IST via Windows Task Scheduler ✅ Active (from 17-May-2026 evening)
 
 ### G7 — FnP + FC Layer 1 order recording 🔲 Pending (after G5/G6 stabilise)
 
