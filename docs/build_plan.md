@@ -1,6 +1,6 @@
 # Sales MIS + Demand Planning System — Build Plan
 
-*Last updated: 17-May 2026*
+*Last updated: 17-May 2026 (evening)*
 
 ---
 
@@ -23,14 +23,14 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | Return reason fields | `return_reason`, `return_responsible`, `return_customer_verbatim` — all channels |
 | COGS / lot system | FIFO lot consumption for Amazon FBA and Blinkit |
 | `mcp/server.py` | Vignesh — FastMCP server, 9 tools, connected to Claude.ai + Claude Desktop |
-| `automation/blinkit_scraper.py` + `blinkit_auth.py` | Playwright scraper — logs into Blinkit portal, downloads MTD CSV, ingests to DB |
-| `automation/whatsapp.py` | Meta Cloud API sender — daily briefing to Himanshu + Shubhra |
-| `automation/daily_summary.py` | Queries yesterday's orders, formats WhatsApp message |
-| `automation/daily_runner.py` | Orchestrator — G1 (Amazon) + G2 (Blinkit) + G3 (WhatsApp), logs to automation/logs/ |
-| Windows Task Scheduler | "Blinkit Sales_Daily Run" — triggers daily_runner.py at 12:01 IST. First run: 16-May-2026 |
-| `automation/fnp_scraper.py` | Playwright scraper — accepts FnP orders, downloads Branding Challan PDF, emails. Live tested 17-May-2026. Runs 11:00/14:00/16:00 IST. |
-| `automation/fc_scraper.py` + `fc_auth.py` | Playwright scraper — accepts FC orders, fills shipment dims, downloads Invoice+PackingSlip PDFs, emails. Dry-run passed 17-May-2026. |
-| `automation/email_sender.py` | SMTP email helper — `send_with_attachments()` + `send_alert()` for failure notifications |
+| `automation/blinkit_scraper.py` + `blinkit_auth.py` | Playwright scraper — logs into Blinkit portal, downloads last-7d XLSX, ingests to DB. Headless timing fixed 17-May (sleep 8s, selector timeout 10s). |
+| `automation/whatsapp.py` | Meta Cloud API sender — daily briefing to Himanshu + Shubhra. Newline sanitization added (flattens `\n` → ` | ` before API call). Live tested 17-May-2026. |
+| `automation/daily_summary.py` | Queries yesterday's orders, formats WhatsApp message. PENDING orders included in unit count (matches MIS). |
+| `automation/daily_runner.py` | Orchestrator — G1 (Amazon) + G2 (Blinkit) + G3 (WhatsApp), logs to automation/logs/. HTTPError exception handler fixed. |
+| Windows Task Scheduler — daily_runner | "Blinkit Sales_Daily Run" — triggers daily_runner.py at 12:01 IST. First run: 16-May-2026. |
+| `automation/fnp_scraper.py` | Playwright scraper — accepts FnP orders, downloads Branding Challan PDF, emails. Live tested 17-May-2026 (3 orders). Runs 11:00/14:00/16:00 IST ✅ Active. |
+| `automation/fc_scraper.py` + `fc_auth.py` | Playwright scraper — accepts FC orders, fills shipment dims, downloads Invoice+PackingSlip PDFs, emails. Dry-run passed 17-May-2026. Runs 10:30/20:00 IST ✅ Active. |
+| `automation/email_sender.py` | SMTP email helper — `send_with_attachments()` + `send_alert()`. `send_alert()` supports `EMAIL_HIMANSHU_ALT` for backup delivery to personal Gmail. |
 
 ---
 
@@ -158,7 +158,11 @@ Phase I           → Gets autonomy. Drafts POs, approves within guardrails, run
 
 **File:** `automation/blinkit_scraper.py` + `automation/blinkit_auth.py`
 
-Playwright-based. Loads saved session → navigates to Performance → selects Current Month → clicks Reports → downloads MTD XLSX → ingests via `load_blinkit_sales.py`. Tested and confirmed working (downloaded data up to 14-May-2026). Session-expiry handled: exit code 2 → `daily_runner.py` sends WhatsApp alert asking Himanshu to re-run `blinkit_auth.py`.
+Playwright-based. Loads saved session → navigates to Performance → clicks Reports → downloads last-7d XLSX → ingests via `load_blinkit_sales.py`. Session-expiry handled: exit code 2 → `daily_runner.py` sends failure email + WhatsApp alert.
+
+**Note:** Report is always named `sales-report-last-7d-{yesterday}.xlsx` — latest Blinkit date in DB is always yesterday, not today. This is expected.
+
+**Headless timing fix (17-May-2026):** In headless mode the SPA sidebar renders slower. Bumped post-load sleep 4s→8s and per-selector timeout 5s→10s. First clean headless run expected 18-May noon.
 
 ### G3 — WhatsApp daily briefing ✅ Done
 
@@ -169,18 +173,19 @@ Playwright-based. Loads saved session → navigates to Performance → selects C
 **Message format (sent every day ~12:15 IST after both ingestions complete):**
 
 ```
-14-May Thurs  25 units overall:
-• Amazon: 1TCB005, 1TCB006, 1TCB008, 9TCB009
-• Blinkit: 1TCB001, 1TCB002, 2TCB004, 1TCB005, 2TCB009
-• First Cry: 1TCB006
+Sales update: 16-May Sat  27 units overall: | • Blinkit: 4TCB006, 3TCB004 | • Amazon: 5TCB009_1 | • FnP: 1TCB004 - Vignesh
 ```
 
-One row per channel. Each entry = `{qty}{SKU_ID}`. Only channels with orders that day appear.
+Single flat line (` | ` separator) — Meta template params cannot contain newlines. One entry per channel, sorted by volume. Each entry = `{qty}{SKU_ID}`. Only channels with orders appear.
+
+**Recipients:** Himanshu + Shubhra — both live and confirmed 17-May-2026. Shubhra added to Meta allowed list manually.
+
+**Sale statuses counted:** FULFILLED, DELIVERED, SHIPPED, PENDING (PENDING included to match MIS count — confirmed 17-May).
 
 **Files built:**
-- `automation/whatsapp.py` — Meta Cloud API sender (template message)
+- `automation/whatsapp.py` — Meta Cloud API sender (template `daily_sales_brief`, approved)
 - `automation/daily_summary.py` — queries yesterday's orders from DB, formats message, calls whatsapp.py
-- `automation/daily_runner.py` — orchestrates G1+G2+G3, handles partial failures, logs to `automation/logs/`
+- `automation/daily_runner.py` — orchestrates G1+G2+G3, handles partial failures, sends failure alert emails, logs to `automation/logs/`
 
 ### G4 — Scheduler ✅ Done
 
@@ -188,8 +193,9 @@ One row per channel. Each entry = `{qty}{SKU_ID}`. Only channels with orders tha
 - Trigger: Daily at 12:01 IST
 - Action: runs `automation/daily_runner.py`
 - First live run: 16-May-2026
+- First fully clean run expected: 18-May-2026 (after Blinkit headless fix)
 
-**Meta one-time setup:** Complete — sender number registered, `daily_sales_brief` template approved, tokens stored in `.env`.
+**Meta one-time setup:** Complete — sender number registered, `daily_sales_brief` template approved, tokens stored in `.env`. Shubhra added to allowed recipients 17-May-2026.
 
 ### G5 — FnP scraper ✅ Done
 
@@ -198,16 +204,17 @@ One row per channel. Each entry = `{qty}{SKU_ID}`. Only channels with orders tha
 Playwright-based. Logs in → checks ALL date columns (TODAY/TOMORROW/FUTURE) in Allocated section → accepts orders → checks all date columns in "Orders to be shipped" → downloads Branding Challan PDF(s) → emails to Himanshu + Dilwar. Failure alerts email Himanshu.
 - Schedules: 11:00, 14:00, 16:00 IST via Windows Task Scheduler ✅ Active
 - Live tested 17-May-2026: 3 orders accepted, PDFs downloaded correctly
-- Email send test: pending (next real order)
+- 16:00 run on 17-May: clean ("No orders") confirming scheduler is working
+- Email send test: pending (next real order with the current code)
 
-### G6 — First Cry scraper ✅ Built | 🔲 Email + Scheduler pending
+### G6 — First Cry scraper ✅ Built + Scheduled | 🔲 Email test pending
 
 **Files:** `automation/fc_scraper.py` + `automation/fc_auth.py` + `automation/fc_dimensions.json`
 
 Playwright-based. Loads saved session → processes each pending B2C order (accept, fill shipment dims, save) → downloads Invoice + Packing Slip PDFs → emails to Himanshu + Dilwar. Failure alerts email Himanshu.
 - Dry-run passed 17-May-2026 (PDFs downloaded correctly)
-- Pending: email test with next real FC order
 - Schedule: 10:30 IST + 20:00 IST via Windows Task Scheduler ✅ Active (from 17-May-2026 evening)
+- Email send test: pending (next real FC order)
 
 ### G7 — FnP + FC Layer 1 order recording 🔲 Pending (after G5/G6 stabilise)
 
@@ -341,18 +348,18 @@ Track 2 — Vignesh agent layer (can start now that G is live):
 | `ingest/load_fc_sales.py` | ✅ Built |
 | `automation/amazon_sp_api.py` | ✅ Built — orders + finances, poll/download |
 | `mcp/server.py` | ✅ Built — 9 tools, live on Claude.ai |
-| `automation/blinkit_scraper.py` | ✅ Built + tested (downloaded up to 14-May) |
+| `automation/blinkit_scraper.py` | ✅ Built + tested. Headless timing fix applied 17-May (sleep 8s, timeout 10s) |
 | `automation/blinkit_auth.py` | ✅ Built — saves Playwright session state |
-| `automation/whatsapp.py` | ✅ Built — Meta Cloud API sender |
-| `automation/daily_summary.py` | ✅ Built — queries DB, formats WA message |
-| `automation/daily_runner.py` | ✅ Built — orchestrates G1+G2+G3, logs to automation/logs/ |
-| Windows Task Scheduler | ✅ Set up — "Blinkit Sales_Daily Run" at 12:01 IST daily |
-| `automation/fnp_scraper.py` | 🔲 Built, pending first live test (needs a real FnP order) |
-| `automation/email_sender.py` | ✅ Built — SMTP PDF attachment sender (shared by FnP + FC) |
-| FnP Task Scheduler jobs | 🔲 To set up — 11:00, 14:00, 16:00 IST (see below) |
-| `automation/fc_scraper.py` + `fc_auth.py` | 🟡 Dry-run passed (17-May-2026) — PDFs downloaded. Pending email test + Task Scheduler (needs next real FC order) |
+| `automation/whatsapp.py` | ✅ Built + live — Meta Cloud API, newline fix applied, both recipients confirmed |
+| `automation/daily_summary.py` | ✅ Built + live — PENDING orders included, matches MIS |
+| `automation/daily_runner.py` | ✅ Built + live — G1+G2+G3, failure email alerts, HTTPError handler fixed |
+| Windows Task Scheduler — daily_runner | ✅ Active — "Blinkit Sales_Daily Run" at 12:01 IST daily |
+| `automation/fnp_scraper.py` | ✅ Live tested 17-May (3 orders, PDFs). Email test pending next real order |
+| `automation/email_sender.py` | ✅ Built — SMTP sender, EMAIL_HIMANSHU_ALT backup support added |
+| FnP Task Scheduler jobs | ✅ Active — 11:00, 14:00, 16:00 IST |
+| `automation/fc_scraper.py` + `fc_auth.py` | 🟡 Dry-run passed 17-May. Email test pending next real FC order |
 | `automation/fc_dimensions.json` | ✅ All 12 SKUs filled |
-| FC Task Scheduler jobs | 🔲 To set up after first live test passes — 11:00, 20:00 IST |
+| FC Task Scheduler jobs | ✅ Active — 10:30, 20:00 IST (from 17-May-2026 evening) |
 | `automation/vignesh_monitor.py` | 🔲 Phase H2 |
 | `tcb/forecasting.py` | 🔲 Phase D |
 | `tcb/reorder.py` | 🔲 Phase E |
