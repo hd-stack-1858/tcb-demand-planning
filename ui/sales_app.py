@@ -150,9 +150,11 @@ def colour_rr(val) -> str:
 
 
 def _cur_mult() -> float:
-    """Multiplier to project current month-to-date to full month-end."""
+    """Multiplier to project current month-to-date to full month-end.
+    Data is available through yesterday, so use today.day - 1 as elapsed days."""
     today = date.today()
-    return calendar.monthrange(today.year, today.month)[1] / today.day
+    data_days = max(today.day - 1, 1)
+    return calendar.monthrange(today.year, today.month)[1] / data_days
 
 
 def _project_col(df: pd.DataFrame, value_col: str, mult: float) -> pd.DataFrame:
@@ -278,7 +280,7 @@ def velocity_snapshot(raw_df: pd.DataFrame) -> None:
         row = {"SKU Code": sku_id, "SKU Name": sku_name_map.get(sku_id, sku_id)}
         for d, col in zip(days, day_cols):
             row[col] = int(daily_u.get((sku_id, d), 0))
-        row[avg_col_cm] = round(cm_u.get(sku_id, 0) / today.day, 1)
+        row[avg_col_cm] = round(cm_u.get(sku_id, 0) / max(today.day - 1, 1), 1)
         row[avg_col_lm] = round(lm_u.get(sku_id, 0) / last_month_days, 1)
         row[vs_lm_col]  = _vs_lm_pct(row[avg_col_cm], row[avg_col_lm])
         rows.append(row)
@@ -343,10 +345,11 @@ def tab_overview(raw_df: pd.DataFrame, fdf: pd.DataFrame, net_mode: bool, filter
     ]
     mtd_units = int(cur["quantity"].sum())
     mtd_rev   = cur["gross_value"].sum()
-    mult = days_in_month / today.day
+    data_days = max(today.day - 1, 1)
+    mult = days_in_month / data_days
     st.info(
         f"**{today.strftime('%b %Y')} projection:** "
-        f"{mtd_units:,} units so far ({today.day} of {days_in_month} days) "
+        f"{mtd_units:,} units so far ({data_days} of {days_in_month} days) "
         f"→ **~{round(mtd_units * mult):,} units** projected | "
         f"{fmt_inr(mtd_rev)} revenue so far → **~{fmt_inr(mtd_rev * mult)}** projected"
     )
@@ -489,7 +492,7 @@ def tab_trends(fdf: pd.DataFrame, net_mode: bool):
         st.plotly_chart(fig, use_container_width=True)
     st.caption(
         f"⚠️ {today.strftime('%b %Y')} shows projected month-end "
-        f"({today.day} days elapsed, {mult:.1f}× multiplier)."
+        f"({max(today.day - 1, 1)} days elapsed, {mult:.1f}× multiplier)."
     )
 
     # ── MoM comparison — 3 tables, channels as rows ───────────────────────────
@@ -616,7 +619,7 @@ def tab_trends(fdf: pd.DataFrame, net_mode: bool):
 
     st.caption(
         f"⚠️ {today.strftime('%b %Y')} (proj) = month-to-date × {mult:.1f} "
-        f"({today.day} of {calendar.monthrange(today.year, today.month)[1]} days elapsed)."
+        f"({max(today.day - 1, 1)} of {calendar.monthrange(today.year, today.month)[1]} days elapsed)."
     )
 
 
@@ -779,7 +782,7 @@ def tab_channel(fdf: pd.DataFrame, net_mode: bool):
         st.plotly_chart(fig, use_container_width=True)
     st.caption(
         f"⚠️ {today.strftime('%b %Y')} shows projected month-end "
-        f"({today.day} days elapsed, {mult:.1f}× multiplier)."
+        f"({max(today.day - 1, 1)} days elapsed, {mult:.1f}× multiplier)."
     )
 
     # ── Fulfillment type split ────────────────────────────────────────────────
@@ -908,7 +911,7 @@ def tab_sku(fdf: pd.DataFrame, net_mode: bool):
             st.info("Select at least one SKU above to plot the comparison.")
     st.caption(
         f"⚠️ {today.strftime('%b %Y')} shows projected month-end "
-        f"({today.day} days elapsed, {mult:.1f}× multiplier)."
+        f"({max(today.day - 1, 1)} days elapsed, {mult:.1f}× multiplier)."
     )
 
     # ── Theme Comparison ──────────────────────────────────────────────────────
@@ -951,7 +954,7 @@ def tab_sku(fdf: pd.DataFrame, net_mode: bool):
         st.plotly_chart(fig_th, use_container_width=True)
     st.caption(
         f"⚠️ {today.strftime('%b %Y')} shows projected month-end "
-        f"({today.day} days elapsed, {mult:.1f}× multiplier)."
+        f"({max(today.day - 1, 1)} days elapsed, {mult:.1f}× multiplier)."
     )
 
     st.subheader("SKU × Channel Heatmap (Units)")
