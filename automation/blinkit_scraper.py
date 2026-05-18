@@ -87,10 +87,38 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not headed, slow_mo=100 if headed else 0)
+        # Blinkit uses Cloudflare bot detection that blocks Playwright's bundled
+        # Chromium in headless mode (hangs the TCP connection indefinitely).
+        # Using the user's installed Chrome + stealth args bypasses this because:
+        #   1. Real Chrome has a legit TLS/JA3 fingerprint
+        #   2. --disable-blink-features=AutomationControlled removes the automation flag
+        #   3. navigator.webdriver is patched to undefined via init_script
+        # Falls back to bundled Chromium if Chrome isn't installed.
+        try:
+            browser = p.chromium.launch(
+                channel="chrome",
+                headless=not headed,
+                slow_mo=100 if headed else 0,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+        except Exception:
+            browser = p.chromium.launch(
+                headless=not headed,
+                slow_mo=100 if headed else 0,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
         ctx = browser.new_context(
             storage_state=str(SESSION_FILE),
             accept_downloads=True,
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/136.0.0.0 Safari/537.36"
+            ),
+        )
+        # Hide the webdriver flag that bot detectors probe for
+        ctx.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
         page = ctx.new_page()
 
@@ -98,10 +126,16 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
         # Use "domcontentloaded" — Blinkit's SPA keeps background requests alive
         # indefinitely, so "networkidle" never fires reliably.
         logger.info("Loading Blinkit seller portal...")
-        page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=30_000)
-        # Headless mode renders the SPA sidebar noticeably slower than headed.
-        # 8s gives the sidebar time to mount before we start probing selectors.
-        time.sleep(8)
+        page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=60_000)
+        # Wait for either the sidebar nav or the "Sell on Blinkit" login CTA to
+        # appear — whichever comes first — instead of a fixed sleep.
+        try:
+            page.wait_for_selector(
+                "nav, [class*='sidebar'], [class*='nav'], button:has-text('Sell on Blinkit')",
+                timeout=30_000,
+            )
+        except PWTimeout:
+            pass  # proceed anyway and let _is_login_page sort it out
 
         if _is_login_page(page):
             browser.close()
@@ -113,9 +147,11 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
 
         # ── Step 2: Navigate to Performance via sidebar ───────────────────────
         # The portal is an SPA — /performance 404s. Must click the sidebar icon.
-        # Wait explicitly for at least one selector rather than checking count() immediately.
-        logger.info("Clicking Performance icon in sidebar...")
+        # Give the sidebar 30s to fully mount (it lazy-loads after the SPA boots).
+        logger.info("Waiting for sidebar to mount, then clicking Performance...")
         perf_clicked = False
+
+        # Strategy A: explicit attribute-based selectors (fast path)
         perf_selectors = [
             "[aria-label='Performance']",
             "[title='Performance']",
@@ -126,7 +162,7 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
         for sel in perf_selectors:
             try:
                 el = page.locator(sel).first
-                el.wait_for(state="visible", timeout=10_000)
+                el.wait_for(state="visible", timeout=5_000)
                 el.click()
                 page.wait_for_load_state("domcontentloaded", timeout=15_000)
                 time.sleep(2)
@@ -136,31 +172,63 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
             except Exception:
                 continue
 
+        # Strategy B: wait up to 30s for any element with text "Performance"
         if not perf_clicked:
-            # Last resort: any visible element whose text is "Performance"
             try:
                 el = page.get_by_text("Performance").first
-                el.wait_for(state="visible", timeout=20_000)
+                el.wait_for(state="visible", timeout=30_000)
                 el.click()
                 page.wait_for_load_state("domcontentloaded", timeout=15_000)
                 time.sleep(2)
                 perf_clicked = True
                 logger.info("Clicked Performance via text. URL: %s", page.url)
-            except Exception as exc:
-                browser.close()
-                raise RuntimeError(
-                    "Could not find Performance icon in sidebar. "
-                    "Run with --headed to debug visually."
-                ) from exc
+            except Exception:
+                pass
+
+        # Strategy C: JS click on any element whose text includes "Performance"
+        if not perf_clicked:
+            try:
+                clicked = page.evaluate("""
+                    () => {
+                        const el = [...document.querySelectorAll('a, button, li, div, span')]
+                            .find(e => (e.innerText || '').trim() === 'Performance'
+                                    && e.offsetParent !== null);
+                        if (!el) return false;
+                        el.click();
+                        return true;
+                    }
+                """)
+                if clicked:
+                    page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                    time.sleep(2)
+                    perf_clicked = True
+                    logger.info("Clicked Performance via JS. URL: %s", page.url)
+            except Exception:
+                pass
+
+        if not perf_clicked:
+            # Log visible links to help debug what the sidebar actually contains
+            links = page.evaluate("""
+                () => [...document.querySelectorAll('a, button')]
+                    .filter(e => e.offsetParent !== null)
+                    .map(e => ({tag: e.tagName, text: (e.innerText||'').trim().slice(0,40),
+                                href: e.href||'', aria: e.getAttribute('aria-label')||''}))
+                    .slice(0, 20)
+            """)
+            logger.error("Visible links/buttons on page: %s", links)
+            browser.close()
+            raise RuntimeError(
+                "Could not find Performance icon in sidebar. "
+                "Check log for visible links. Run with --headed to debug visually."
+            )
 
         # ── Step 3: Period is already "Last 7 days" (portal default — no click needed) ───
 
         # ── Step 4: Click "Reports" button ────────────────────────────────────
-        # Confirmed: <button class="relative flex items-center...">Reports</button>
         logger.info("Clicking Reports button...")
         try:
             reports_btn = page.get_by_role("button", name="Reports")
-            reports_btn.wait_for(timeout=15_000)
+            reports_btn.wait_for(timeout=30_000)
         except PWTimeout:
             browser.close()
             raise RuntimeError(
@@ -169,12 +237,31 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
             )
 
         # ── Step 5: Capture the download ─────────────────────────────────────
-        logger.info("Waiting for download...")
+        # The Reports button may directly download OR open a panel with a
+        # separate Download/Export button — handle both cases.
+        logger.info("Clicking Reports and waiting for download...")
         today_str = date.today().strftime("%d-%m-%Y")
         expected_name = f"sales-report-7d-{today_str}.xlsx"
 
-        with page.expect_download(timeout=60_000) as dl_info:
+        with page.expect_download(timeout=90_000) as dl_info:
             reports_btn.first.click()
+            # Wait briefly — if a download panel opened, find the trigger within it
+            time.sleep(3)
+            for dl_sel in [
+                "button:has-text('Download')",
+                "button:has-text('Export')",
+                "a:has-text('Download')",
+                "[aria-label*='download' i]",
+                "[class*='download' i]",
+            ]:
+                try:
+                    el = page.locator(dl_sel).first
+                    if el.count() and el.is_visible():
+                        logger.info("Reports opened a panel — clicking trigger: %s", dl_sel)
+                        el.click()
+                        break
+                except Exception:
+                    continue
 
         download = dl_info.value
         if download.failure():
@@ -204,8 +291,22 @@ def ingest(xlsx_path: Path, dry_run: bool = False) -> tuple[int, int]:
 
 
 def run(dry_run: bool = False, headed: bool = False) -> dict:
-    """Full pipeline: scrape → ingest → return summary dict."""
-    xlsx = scrape(dry_run=dry_run, headed=headed)
+    """Full pipeline: scrape → ingest → return summary dict.
+
+    Retries once on PWTimeout — Blinkit's server can be slow at noon when
+    the machine is busy, causing a transient navigation timeout that resolves
+    on a second attempt.
+    """
+    for attempt in range(1, 3):
+        try:
+            xlsx = scrape(dry_run=dry_run, headed=headed)
+            break
+        except PWTimeout as exc:
+            if attempt == 2:
+                raise
+            logger.warning("Scrape attempt %d/2 timed out — retrying in 20s...", attempt)
+            time.sleep(20)
+
     upserted, skipped = ingest(xlsx, dry_run=dry_run)
     return {"upserted": upserted, "skipped": skipped, "file": xlsx.name}
 

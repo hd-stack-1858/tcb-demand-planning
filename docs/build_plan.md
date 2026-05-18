@@ -1,6 +1,6 @@
 # Sales MIS + Demand Planning System — Build Plan
 
-*Last updated: 17-May 2026 (evening)*
+*Last updated: 18-May 2026*
 
 ---
 
@@ -207,14 +207,14 @@ Playwright-based. Logs in → checks ALL date columns (TODAY/TOMORROW/FUTURE) in
 - 16:00 run on 17-May: clean ("No orders") confirming scheduler is working
 - Email send test: pending (next real order with the current code)
 
-### G6 — First Cry scraper ✅ Built + Scheduled | 🔲 Email test pending
+### G6 — First Cry scraper ✅ Live + Tested
 
 **Files:** `automation/fc_scraper.py` + `automation/fc_auth.py` + `automation/fc_dimensions.json`
 
 Playwright-based. Loads saved session → processes each pending B2C order (accept, fill shipment dims, save) → downloads Invoice + Packing Slip PDFs → emails to Himanshu + Dilwar. Failure alerts email Himanshu.
 - Dry-run passed 17-May-2026 (PDFs downloaded correctly)
 - Schedule: 10:30 IST + 20:00 IST via Windows Task Scheduler ✅ Active (from 17-May-2026 evening)
-- Email send test: pending (next real FC order)
+- Email test passed 18-May-2026: 10:30 run picked up 1 real order, PDF downloaded and emailed ✅
 
 ### G7 — FnP + FC Layer 1 order recording 🔲 Pending (after G5/G6 stabilise)
 
@@ -348,16 +348,16 @@ Track 2 — Vignesh agent layer (can start now that G is live):
 | `ingest/load_fc_sales.py` | ✅ Built |
 | `automation/amazon_sp_api.py` | ✅ Built — orders + finances, poll/download |
 | `mcp/server.py` | ✅ Built — 9 tools, live on Claude.ai |
-| `automation/blinkit_scraper.py` | ✅ Built + tested. Headless timing fix applied 17-May (sleep 8s, timeout 10s) |
+| `automation/blinkit_scraper.py` | ✅ Live. Stealth Chrome fix 18-May (bot detection bypass, panel download, sidebar retry) |
 | `automation/blinkit_auth.py` | ✅ Built — saves Playwright session state |
 | `automation/whatsapp.py` | ✅ Built + live — Meta Cloud API, newline fix applied, both recipients confirmed |
 | `automation/daily_summary.py` | ✅ Built + live — PENDING orders included, matches MIS |
 | `automation/daily_runner.py` | ✅ Built + live — G1+G2+G3, failure email alerts, HTTPError handler fixed |
 | Windows Task Scheduler — daily_runner | ✅ Active — "Blinkit Sales_Daily Run" at 12:01 IST daily |
-| `automation/fnp_scraper.py` | ✅ Live tested 17-May (3 orders, PDFs). Email test pending next real order |
+| `automation/fnp_scraper.py` | ✅ Live. Angular timing + load wait fix 18-May (retry loop, startsWith match) |
 | `automation/email_sender.py` | ✅ Built — SMTP sender, EMAIL_HIMANSHU_ALT backup support added |
 | FnP Task Scheduler jobs | ✅ Active — 11:00, 14:00, 16:00 IST |
-| `automation/fc_scraper.py` + `fc_auth.py` | 🟡 Dry-run passed 17-May. Email test pending next real FC order |
+| `automation/fc_scraper.py` + `fc_auth.py` | ✅ Live + tested — email confirmed 18-May (1 real order, PDF sent) |
 | `automation/fc_dimensions.json` | ✅ All 12 SKUs filled |
 | FC Task Scheduler jobs | ✅ Active — 10:30, 20:00 IST (from 17-May-2026 evening) |
 | `automation/vignesh_monitor.py` | 🔲 Phase H2 |

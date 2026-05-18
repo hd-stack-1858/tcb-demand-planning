@@ -77,7 +77,10 @@ def _login(page) -> None:
         raise EnvironmentError("FNP_USERNAME and FNP_PASSWORD must be set in .env")
 
     logger.info("Opening FnP portal...")
-    page.goto(PORTAL_URL, wait_until="networkidle", timeout=30_000)
+    # "commit" fires as soon as HTTP response headers arrive — much earlier than
+    # "domcontentloaded" on slow connections where Angular bundles take a long time.
+    # We wait for the actual page content with wait_for_selector below instead.
+    page.goto(PORTAL_URL, wait_until="commit", timeout=60_000)
     time.sleep(2)
 
     # If portal redirected away from the login URL, session is still active — skip login
@@ -98,59 +101,89 @@ def _login(page) -> None:
     # Wait for Angular SPA to navigate away from login
     # "text=Allocated" is NOT safe: the login page has "An order has been allocated to you."
     page.wait_for_url(lambda url: "#/login" not in url, timeout=30_000)
-    page.wait_for_load_state("networkidle", timeout=30_000)
-    time.sleep(3)
+    page.wait_for_load_state("load", timeout=30_000)
+    # Wait for the dashboard grid to actually render — Angular fires backend API calls
+    # after the load event, so we need to wait for the date-cell content to appear.
+    page.wait_for_selector("text=TODAY", timeout=30_000)
+    time.sleep(1)
     logger.info("Logged in. Dashboard loaded. URL: %s", page.url)
 
 
 # ── Dashboard navigation ───────────────────────────────────────────────────────
 
-def _scan_section(page, label: str) -> list[tuple[int, int]]:
+def _scan_section(page, label: str, retries: int = 6) -> list[tuple[int, int]]:
     """
     Scan the dashboard section for label.
     Returns list of (child_index, count) for every non-zero date column.
 
     DOM structure (div-based Angular app, not a table):
       DIV (parent)
-        H2  "Allocated"  (or H2.ordershipped for "Orders to be shipped")
-        DIV.ng-scope     <- direct children of this are the date cells (TODAY/TOMORROW/FUTURE)
+        H2  "Allocated"  (or similar for "Orders to be shipped")
+        DIV.ng-scope     <- direct children are date cells (TODAY/TOMORROW/FUTURE)
+
+    Retries up to `retries` times with 3s gaps because Angular fetches order counts
+    via XHR after the load event — the DOM may be present but cells unpopulated.
     """
-    cells = page.evaluate(f"""
-        () => {{
-            // Find the H2 label with exact text
-            let labelEl = null;
-            for (const el of document.querySelectorAll('h2, h3')) {{
-                if ((el.innerText || '').trim() === '{label}') {{
-                    labelEl = el;
-                    break;
+    for attempt in range(retries):
+        result = page.evaluate(f"""
+            () => {{
+                // Match label element across common tags.
+                // Use startsWith (not ===) because the element may contain icon
+                // child nodes that add extra text to innerText (e.g. export button).
+                let labelEl = null;
+                for (const tag of ['h2', 'h3', 'div', 'span', 'p']) {{
+                    for (const el of document.querySelectorAll(tag)) {{
+                        const t = (el.innerText || el.textContent || '').trim();
+                        if (t === '{label}' || t.startsWith('{label}\\n') || t.startsWith('{label} ')) {{
+                            labelEl = el;
+                            break;
+                        }}
+                    }}
+                    if (labelEl) break;
                 }}
+                if (!labelEl) return {{found_label: false, found_container: false, cells: []}};
+
+                const p1 = labelEl.parentElement;
+                const dateContainer = Array.from(p1.children).find(c => c !== labelEl);
+                if (!dateContainer) return {{found_label: true, found_container: false, cells: []}};
+
+                // Scan direct children for (N) count pattern
+                const cells = [];
+                Array.from(dateContainer.children).forEach((child, idx) => {{
+                    const text = (child.innerText || '').trim();
+                    const m = text.match(/\\((\\d+)\\)/);
+                    if (m) {{
+                        cells.push({{idx: idx, count: parseInt(m[1]), text: text.replace(/\\n/g, ' ')}});
+                    }}
+                }});
+                return {{found_label: true, found_container: true, cells: cells}};
             }}
-            if (!labelEl) return [];
+        """)
 
-            // The sibling div (DIV.ng-scope) holds the date cells
-            const p1 = labelEl.parentElement;
-            const dateContainer = Array.from(p1.children).find(c => c !== labelEl);
-            if (!dateContainer) return [];
+        found_label     = result.get("found_label", False)
+        found_container = result.get("found_container", False)
+        cells           = result.get("cells", [])
 
-            // Scan direct children of dateContainer for (N) count pattern
-            const result = [];
-            Array.from(dateContainer.children).forEach((child, idx) => {{
-                const text = (child.innerText || '').trim();
-                const m = text.match(/\\((\\d+)\\)/);
-                if (m) {{
-                    result.push({{idx: idx, count: parseInt(m[1]), text: text.replace(/\\n/g, ' ')}});
-                }}
-            }});
-            return result;
-        }}
-    """)
+        logger.info("'%s' scan (attempt %d/%d): label=%s container=%s cells=%s",
+                    label, attempt + 1, retries, found_label, found_container, cells)
 
-    logger.info("'%s' section cells: %s", label, cells)
+        if found_label and found_container and len(cells) > 0:
+            # Angular has rendered the date cells — trust the counts
+            nonzero = [(c["idx"], c["count"]) for c in cells if c["count"] > 0]
+            if not nonzero:
+                logger.info("'%s': all columns are zero — nothing to process.", label)
+            return nonzero
 
-    nonzero = [(c["idx"], c["count"]) for c in cells if c["count"] > 0]
-    if not nonzero:
-        logger.info("'%s': all columns are zero — nothing to process.", label)
-    return nonzero
+        # Not fully rendered yet — wait and retry
+        if attempt < retries - 1:
+            logger.info(
+                "'%s': not ready (label=%s, container=%s, cells=%d) — waiting 3s...",
+                label, found_label, found_container, len(cells),
+            )
+            time.sleep(3)
+
+    logger.warning("'%s': section never fully rendered after %d attempts.", label, retries)
+    return []
 
 
 def _click_column(page, label: str, child_idx: int) -> None:
@@ -174,7 +207,7 @@ def _click_column(page, label: str, child_idx: int) -> None:
             if (child) child.click();
         }}
     """)
-    page.wait_for_load_state("networkidle", timeout=20_000)
+    page.wait_for_load_state("load", timeout=20_000)
     time.sleep(2)
     logger.info("Clicked '%s' child[%d]. URL: %s", label, child_idx, page.url)
 
@@ -185,7 +218,7 @@ def _return_to_dashboard(page) -> None:
     Tries go_back() first; falls back to reloading the portal base URL.
     """
     page.go_back()
-    page.wait_for_load_state("networkidle", timeout=15_000)
+    page.wait_for_load_state("load", timeout=15_000)
     time.sleep(2)
 
     if page.locator("text=Orders to be shipped").count():
@@ -195,7 +228,7 @@ def _return_to_dashboard(page) -> None:
     # Fallback: reload portal base (session still active, redirects to dashboard)
     base = PORTAL_URL.replace("#/login/", "")
     logger.info("go_back() didn't land on dashboard — trying %s", base)
-    page.goto(base, wait_until="networkidle", timeout=30_000)
+    page.goto(base, wait_until="domcontentloaded", timeout=60_000)
     page.wait_for_selector("text=Allocated", timeout=30_000)
     time.sleep(2)
     logger.info("Dashboard loaded via base URL.")
@@ -300,7 +333,7 @@ def _click_accept(page) -> None:
     if not clicked or not clicked.get("found"):
         raise RuntimeError("Accept button not found on allocated orders page.")
     time.sleep(3)
-    page.wait_for_load_state("networkidle", timeout=20_000)
+    time.sleep(5)  # Accept triggers a server-side status update, not a new page load
     logger.info("ACCEPT clicked.")
 
 
@@ -356,7 +389,23 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
       challan_downloaded  bool
       emailed             bool
       skipped             bool  — True if no orders found at all
+
+    Retries once on PWTimeout — the FnP portal is intermittently slow (30–60+ s
+    load times), causing transient navigation timeouts that resolve on a retry.
     """
+    for attempt in range(1, 3):
+        try:
+            return _run_once(dry_run=dry_run, headed=headed)
+        except PWTimeout as exc:
+            if attempt == 2:
+                raise
+            logger.warning("Attempt %d/2 timed out — retrying in 20s...", attempt)
+            time.sleep(20)
+    raise RuntimeError("unreachable")  # satisfies type checkers
+
+
+def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
+    """Single attempt of the FnP pipeline (called by run() with retry wrapper)."""
     result: dict = {
         "allocated_accepted": 0,
         "ship_count": 0,
@@ -418,7 +467,7 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
                         result["allocated_accepted"], attempt,
                     )
                     time.sleep(15)
-                    page.reload(wait_until="networkidle", timeout=30_000)
+                    page.reload(wait_until="load", timeout=60_000)
                     time.sleep(3)
                     ship_cols = _scan_section(page, "Orders to be shipped")
                     if ship_cols:
