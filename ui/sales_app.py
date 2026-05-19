@@ -637,28 +637,28 @@ def tab_channel(fdf: pd.DataFrame, net_mode: bool):
     cur_period = pd.Period(today, "M")
 
     def _period_metrics(df_sub: pd.DataFrame, p: pd.Period) -> dict:
-        sub = df_sub[df_sub["month"] == p]
-        g   = sub[sub["status"].isin(GROSS_STATUSES)]
-        n   = sub[sub["status"].isin(NET_STATUSES)]
+        sub    = df_sub[df_sub["month"] == p]
+        g      = sub[sub["status"].isin(GROSS_STATUSES)]
+        orders = g[["order_id", "channel_id"]].drop_duplicates().shape[0]
+        units  = int(g["quantity"].sum())
+        rev    = g["gross_value"].sum()
         return {
-            "orders":    g[["order_id", "channel_id"]].drop_duplicates().shape[0],
-            "units":     int(g["quantity"].sum()),
-            "gross_rev": g["gross_value"].sum(),
-            "net_rev":   n["gross_value"].sum(),
-            "rr":        return_rate_pct(sub),
+            "orders":    orders,
+            "units":     units,
+            "gross_rev": rev,
+            "asp":       rev / units  if units  else 0.0,
+            "aov":       rev / orders if orders else 0.0,
         }
 
     mult = _cur_mult()
     pm   = [_period_metrics(cdf, cur_period - i) for i in range(4)]
     M_raw, M1, M2, M3 = pm
-    # Project current month to full-month; return rate is a ratio — don't scale it
-    M   = {k: (v * mult if k != "rr" else v) for k, v in M_raw.items()}
+    # Project current month: scale counts/revenue; asp and aov are ratios — don't scale
+    M   = {k: (v * mult if k not in ("asp", "aov") else v) for k, v in M_raw.items()}
     avg = {k: (M1[k] + M2[k] + M3[k]) / 3 for k in M}
 
     def _fmt(key, val) -> str:
-        if key == "rr":
-            return f"{val:.1f}%"
-        if key in ("gross_rev", "net_rev"):
+        if key in ("gross_rev", "asp", "aov"):
             return f"₹{round(val):,}"
         return f"{round(val):,}"
 
@@ -668,46 +668,28 @@ def tab_channel(fdf: pd.DataFrame, net_mode: bool):
     def _fmt_vs_ch(v):
         return "—" if (v != v) else f"{'+'if v > 0 else ''}{v:.1f}%"
 
-    def _fmt_bps(v):
-        return "—" if (v != v) else f"{'+'if v > 0 else ''}{v:.0f} bps"
-
     def _color_vs_ch(v):
         if v != v:
             return ""
         return "color: green" if v > 5 else ("color: red" if v < -5 else "")
 
-    def _color_vs_rr(v):
-        # Return rate: down = good (green), up = bad (red)
-        if v != v:
-            return ""
-        return "color: green" if v < -5 else ("color: red" if v > 5 else "")
-
-    vs_cols_ch  = ["vs. M-1", "vs. M-2", "vs. L3M"]
-    rr_label    = "Return Rate %"
-    non_rr_labels = ["Orders", "Units", "Gross Revenue", "Net Revenue"]
-
+    vs_cols_ch    = ["vs. M-1", "vs. M-2", "vs. L3M"]
     metric_labels = [
         ("orders",    "Orders"),
         ("units",     "Units"),
         ("gross_rev", "Gross Revenue"),
-        ("net_rev",   "Net Revenue"),
-        ("rr",        rr_label),
+        ("asp",       "ASP"),
+        ("aov",       "AOV"),
     ]
+    all_labels    = [label for _, label in metric_labels]
+
     summary_rows = []
     for key, label in metric_labels:
-        if key == "rr":
-            # bps = absolute difference in percentage points × 100
-            vs_vals = {
-                "vs. M-1": (M[key] - M1[key]) * 100,
-                "vs. M-2": (M[key] - M2[key]) * 100,
-                "vs. L3M": (M[key] - avg[key]) * 100,
-            }
-        else:
-            vs_vals = {
-                "vs. M-1": _vs_pct_ch(M[key], M1[key]),
-                "vs. M-2": _vs_pct_ch(M[key], M2[key]),
-                "vs. L3M": _vs_pct_ch(M[key], avg[key]),
-            }
+        vs_vals = {
+            "vs. M-1": _vs_pct_ch(M[key], M1[key]),
+            "vs. M-2": _vs_pct_ch(M[key], M2[key]),
+            "vs. L3M": _vs_pct_ch(M[key], avg[key]),
+        }
         summary_rows.append({
             "Metric":                label,
             f"{cur_period} (Proj)":  _fmt(key, M[key]),
@@ -722,10 +704,8 @@ def tab_channel(fdf: pd.DataFrame, net_mode: bool):
     summary_df = pd.DataFrame(summary_rows).set_index("Metric")
     st.dataframe(
         summary_df.style
-        .format({c: _fmt_vs_ch for c in vs_cols_ch}, subset=pd.IndexSlice[non_rr_labels, vs_cols_ch])
-        .format({c: _fmt_bps   for c in vs_cols_ch}, subset=pd.IndexSlice[[rr_label],     vs_cols_ch])
-        .map(_color_vs_ch, subset=pd.IndexSlice[non_rr_labels, vs_cols_ch])
-        .map(_color_vs_rr, subset=pd.IndexSlice[[rr_label],     vs_cols_ch]),
+        .format({c: _fmt_vs_ch for c in vs_cols_ch}, subset=pd.IndexSlice[all_labels, vs_cols_ch])
+        .map(_color_vs_ch, subset=pd.IndexSlice[all_labels, vs_cols_ch]),
         use_container_width=True,
     )
 
