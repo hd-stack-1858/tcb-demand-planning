@@ -1320,10 +1320,28 @@ def tab_geography(fdf: pd.DataFrame, net_mode: bool) -> None:
         "Tamilnadu": "Tamil Nadu", "Asom": "Assam", "Asom (Assam)": "Assam",
         "Orissa": "Odisha", "Pondicherry": "Puducherry", "Uttaranchal": "Uttarakhand",
     }
+    # Groupings for Top Cities chart + table only — raw city data is never changed
+    _CITY_GROUPS = {
+        "Bengaluru":         "Bengaluru",
+        # NCR
+        "New Delhi":         "NCR",  "Gurgaon":           "NCR",
+        "Ghaziabad":         "NCR",  "Faridabad":         "NCR",
+        "Noida":             "NCR",  "Greater Noida":     "NCR",
+        # Greater Mumbai
+        "Mumbai":            "Greater Mumbai",  "Navi Mumbai":       "Greater Mumbai",
+        "Thane":             "Greater Mumbai",  "Kalyan":            "Greater Mumbai",
+        "Mira-Bhayandar":    "Greater Mumbai",  "Mira Bhayandar":    "Greater Mumbai",
+        "Vasai-Virar":       "Greater Mumbai",  "Vasai Virar":       "Greater Mumbai",
+        "Vasai":             "Greater Mumbai",  "Virar":             "Greater Mumbai",
+        "Panvel":            "Greater Mumbai",  "Bhiwandi-Nizampur": "Greater Mumbai",
+        # Greater Pune
+        "Pune":              "Greater Pune",    "Pimpri Chinchwad":  "Greater Pune",
+    }
     gdf["city"]  = gdf["city"].str.strip().str.title().replace(_CITY_NORM)
     gdf["state"] = gdf["state"].str.strip().str.title().replace(_STATE_NORM)
 
-    geo = gdf[gdf["city"].notna() & gdf["state"].notna()]
+    geo = gdf[gdf["city"].notna() & gdf["state"].notna()].copy()
+    geo["display_city"] = geo["city"].map(_CITY_GROUPS).fillna(geo["city"])
 
     # ── Coverage callout ──────────────────────────────────────────────────────
     total_rows = len(gdf)
@@ -1388,13 +1406,13 @@ def tab_geography(fdf: pd.DataFrame, net_mode: bool) -> None:
 
     # ── Top Cities chart ──────────────────────────────────────────────────────
     city_ch = (
-        geo.groupby(["city", "channel_name"])[value_col].sum()
+        geo.groupby(["display_city", "channel_name"])[value_col].sum()
         .reset_index()
     )
-    top15_cities = city_ch.groupby("city")[value_col].sum().nlargest(15).index
-    city_ch = city_ch[city_ch["city"].isin(top15_cities)]
+    top15_cities = city_ch.groupby("display_city")[value_col].sum().nlargest(15).index
+    city_ch = city_ch[city_ch["display_city"].isin(top15_cities)]
     city_order = (
-        city_ch.groupby("city")[value_col].sum()
+        city_ch.groupby("display_city")[value_col].sum()
         .sort_values(ascending=False).index.tolist()
     )
 
@@ -1402,11 +1420,11 @@ def tab_geography(fdf: pd.DataFrame, net_mode: bool) -> None:
     if not city_ch.empty:
         fig_city = px.bar(
             city_ch,
-            x="city", y=value_col, color="channel_name",
+            x="display_city", y=value_col, color="channel_name",
             barmode="stack",
-            labels={value_col: y_label, "channel_name": "Channel", "city": "City"},
+            labels={value_col: y_label, "channel_name": "Channel", "display_city": "City"},
             color_discrete_map=CHANNEL_COLOR_MAP,
-            category_orders={"city": city_order},
+            category_orders={"display_city": city_order},
         )
         fig_city.update_layout(
             xaxis_title=None, margin=dict(t=30),
@@ -1414,7 +1432,7 @@ def tab_geography(fdf: pd.DataFrame, net_mode: bool) -> None:
         )
         if metric == "Revenue":
             fig_city.update_layout(yaxis=dict(tickformat=",.0f", tickprefix="₹"))
-        _bar_totals(fig_city, city_ch, "city")
+        _bar_totals(fig_city, city_ch, "display_city")
         st.plotly_chart(fig_city, use_container_width=True)
 
     # ── City trend table ──────────────────────────────────────────────────────
@@ -1426,9 +1444,9 @@ def tab_geography(fdf: pd.DataFrame, net_mode: bool) -> None:
     mult  = _cur_mult()
 
     city_monthly = (
-        geo.groupby(["city", "month"])["quantity"].sum()
+        geo.groupby(["display_city", "month"])["quantity"].sum()
         .reset_index()
-        .rename(columns={"quantity": "units"})
+        .rename(columns={"quantity": "units", "display_city": "city"})
     )
 
     def _period_units(period):
@@ -1466,7 +1484,7 @@ def tab_geography(fdf: pd.DataFrame, net_mode: bool) -> None:
 
     cm_col = f"CM ({today.strftime('%b')})"
     tbl_rows = []
-    for city in sorted(geo["city"].unique()):
+    for city in sorted(geo["display_city"].unique()):
         cm_v  = float(cm_proj.get(city, 0) or 0)
         m1_v  = float(m1_u.get(city, 0) or 0)
         m2_v  = float(m2_u.get(city, 0) or 0)
