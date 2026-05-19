@@ -15,18 +15,23 @@ from tcb.inventory import (
     record_dropship_sale, record_outright_transfer,
 )
 
-st.set_page_config(page_title="TCB Warehouse", page_icon="📦", layout="centered")
+st.set_page_config(page_title="Tiny Steps WMS", page_icon="📦", layout="centered")
 
 # ── Header ─────────────────────────────────────────────────────────────────────
+import base64
 logo_path = os.path.join(os.path.dirname(__file__), '..', 'assets', 'logo.png')
 if os.path.exists(logo_path):
-    col_logo, col_title = st.columns([1, 4])
-    with col_logo:
-        st.image(logo_path, width=80)
-    with col_title:
-        st.markdown("## Warehouse Management")
+    with open(logo_path, "rb") as _f:
+        _logo_b64 = base64.b64encode(_f.read()).decode()
+    st.markdown(
+        f"""<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+            <img src="data:image/png;base64,{_logo_b64}" width="70"/>
+            <h2 style="margin:0;padding:0;">Tiny Steps WMS</h2>
+        </div>""",
+        unsafe_allow_html=True,
+    )
 else:
-    st.markdown("## Warehouse Management")
+    st.markdown("## Tiny Steps WMS")
 
 db = get_client()
 
