@@ -229,10 +229,11 @@ Playwright-based. Loads saved session → processes each pending B2C order (acce
 - `_process_one_order()` updated to also extract qty (small-integer cell scan) and city (known-cities list scan of page text); returns `(pdfs, order_info)` tuple
 - Both email bodies updated with order details table + DB status column
 
-**⚠️ Needs verification with real orders:**
-- **FnP:** Check next real order log — look for `Order row extraction: N row(s)` and confirm `sku_raw` is populated. If `sku_raw=None`, the portal uses a product name format not yet in `_FNP_PRODUCT_TO_SKU` — add it. Check email body shows correct DB status.
-- **FC:** Check next real order log — confirm qty was read correctly (look for `qty=N (cell[N])`). Check city detection worked or is None. Check email body shows correct DB status.
-- After first real orders processed: verify records appear in Sales MIS dashboard.
+**Verification status:**
+- **FC: ✅ Live-tested 19-May-2026** — order 13812306MQDC22099B (TCB010, qty=1, New Delhi, 2026-05-19). Order Date and City read from table row. Box No 4 fallback triggered (NonFCPackaging Material removed by FC). Weight-only fill worked. PDFs downloaded. DB recorded. Email sent.
+  - Note: `NonFCPackaging Material` option appears to be permanently removed from FC portal. If it returns, scraper will use it automatically. If absent for many more days, clean up the dead primary path.
+- **FnP: ⚠️ Pending** — Check next real order log for `Order row extraction: N row(s)`. If `sku_raw=None`, the portal shows a product name format not in `_FNP_PRODUCT_TO_SKU` — add it from the `cells=` log line. Check email body shows correct DB status.
+- After first FnP order: verify record appears in Sales MIS dashboard.
 
 **Safety properties:**
 - Duplicate-check before every DB write — safe on retry runs
