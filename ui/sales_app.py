@@ -648,8 +648,11 @@ def tab_channel(fdf: pd.DataFrame, net_mode: bool):
             "rr":        return_rate_pct(sub),
         }
 
-    pm  = [_period_metrics(cdf, cur_period - i) for i in range(4)]
-    M, M1, M2, M3 = pm
+    mult = _cur_mult()
+    pm   = [_period_metrics(cdf, cur_period - i) for i in range(4)]
+    M_raw, M1, M2, M3 = pm
+    # Project current month to full-month; return rate is a ratio — don't scale it
+    M   = {k: (v * mult if k != "rr" else v) for k, v in M_raw.items()}
     avg = {k: (M1[k] + M2[k] + M3[k]) / 3 for k in M}
 
     def _fmt(key, val) -> str:
@@ -707,7 +710,7 @@ def tab_channel(fdf: pd.DataFrame, net_mode: bool):
             }
         summary_rows.append({
             "Metric":                label,
-            f"{cur_period} (M)":     _fmt(key, M[key]),
+            f"{cur_period} (Proj)":  _fmt(key, M[key]),
             f"{cur_period-1} (M-1)": _fmt(key, M1[key]),
             "vs. M-1":               vs_vals["vs. M-1"],
             f"{cur_period-2} (M-2)": _fmt(key, M2[key]),
