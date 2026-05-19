@@ -44,7 +44,7 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | D | Demand Forecasting Engine | 🔲 Pending |
 | E | Reorder Integration | 🔲 Pending |
 | F | Vignesh — MCP tool server (9 tools) | ✅ Done |
-| G | Daily Automation — data pipeline + WhatsApp briefing | ✅ Done |
+| G | Daily Automation — data pipeline + WhatsApp briefing | 🚧 G7 built, needs real-order verification |
 | H | Vignesh as Proactive Agent — memory + scheduling + decision logic | 🚧 Next |
 | I | Full Autonomy — approval gates, self-monitoring, agent loop | 🔲 Pending |
 
@@ -216,24 +216,28 @@ Playwright-based. Loads saved session → processes each pending B2C order (acce
 - Schedule: 10:30 IST + 20:00 IST via Windows Task Scheduler ✅ Active (from 17-May-2026 evening)
 - Email test passed 18-May-2026: 10:30 run picked up 1 real order, PDF downloaded and emailed ✅
 
-### G7 — FnP + FC Layer 1 order recording 🔲 Pending (after G5/G6 stabilise)
+### G7 — FnP + FC Layer 1 order recording 🚧 Built — Needs verification with real orders
 
-**Goal:** Complete the automation loop — currently scrapers accept orders and email PDFs but do NOT record the sale in the DB. Without this, the Sales MIS has no FnP/FC data until manual Ship Out is done in the Warehouse App.
+**Goal:** Complete the automation loop — scrapers accept orders, email PDFs, AND now auto-record each sale to DB (orders table + inventory decrement) so Sales MIS has same-day data without manual Ship Out.
 
-**Why this matters:** All channels follow a two-layer architecture:
-- Layer 1 (daily): `record_dropship_sale()` → orders table + inventory decrement → feeds Sales MIS
-- Layer 2 (month-end): portal reports → reconcile returns and discrepancies
+**Design:** Auto-write to DB immediately. The email body includes a per-order table (Order No, SKU, Qty, City, DB status) so Himanshu can catch errors same-day and fix in Warehouse App → Ship Out, instead of waiting for month-end reconciliation.
 
-FnP and FC currently have Layer 2 ingest scripts but Layer 1 is still manual.
+**What was built (19-May-2026, commit 22afc9b):**
+- `_read_order_rows()` in `fnp_scraper.py` — JS extraction of order table on the portal list page; resolves SKU via TCB code match or product-name → SKU lookup dict (`_FNP_PRODUCT_TO_SKU`)
+- `_record_fnp_order()` — duplicate-checks then calls `record_dropship_sale()` for each FnP order; never raises (DB failure logs warning only, does not block email)
+- `_record_fc_order()` in `fc_scraper.py` — same pattern, channel_id=6
+- `_process_one_order()` updated to also extract qty (small-integer cell scan) and city (known-cities list scan of page text); returns `(pdfs, order_info)` tuple
+- Both email bodies updated with order details table + DB status column
 
-**What to build:**
-- After each order is processed by the scraper, call `record_dropship_sale()` directly in Python
-- Data already available during the scraper run (no PDF parsing needed):
-  - FC: Order ID, SKU, Qty, City — all visible in the configure tab
-  - FnP: Order ID, SKU, Qty — readable from the Allocated section
-- No browser automation needed — direct Python call to `tcb/inventory.py`
+**⚠️ Needs verification with real orders:**
+- **FnP:** Check next real order log — look for `Order row extraction: N row(s)` and confirm `sku_raw` is populated. If `sku_raw=None`, the portal uses a product name format not yet in `_FNP_PRODUCT_TO_SKU` — add it. Check email body shows correct DB status.
+- **FC:** Check next real order log — confirm qty was read correctly (look for `qty=N (cell[N])`). Check city detection worked or is None. Check email body shows correct DB status.
+- After first real orders processed: verify records appear in Sales MIS dashboard.
 
-**Blocked by:** G5 and G6 live and stable.
+**Safety properties:**
+- Duplicate-check before every DB write — safe on retry runs
+- `--dry-run` skips DB writes but runs extraction (to test parsing without side effects)
+- DB failure never blocks challan download or email
 
 ---
 
