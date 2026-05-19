@@ -53,7 +53,7 @@ import os
 import re
 import sys
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -153,10 +153,35 @@ def _get_pending_count(page) -> int:
         return -1
 
 
+# ── Row-level parsing helpers ─────────────────────────────────────────────────
+
+def _parse_fc_order_date(raw: str) -> date | None:
+    """Parse '19-05-2026 19:45:55' or '19-05-2026' → date. Returns None on failure."""
+    try:
+        return datetime.strptime(raw.strip(), "%d-%m-%Y %H:%M:%S").date()
+    except ValueError:
+        pass
+    try:
+        return datetime.strptime(raw.strip().split()[0], "%d-%m-%Y").date()
+    except Exception:
+        return None
+
+
+def _parse_city_from_address(address: str) -> str | None:
+    """
+    Extract city from FC shipping address.
+    Format: '...street..., city, state, pincode'
+    Returns the third-from-last comma-separated segment.
+    """
+    parts = [p.strip() for p in address.split(",") if p.strip()]
+    return parts[-3] if len(parts) >= 3 else None
+
+
 # ── DB recording ──────────────────────────────────────────────────────────────
 
 def _record_fc_order(order_id: str, sku_id: str, qty: int,
-                     city: str | None, dry_run: bool) -> str:
+                     city: str | None, order_date: date | None,
+                     dry_run: bool) -> str:
     """
     Write one FC order to the orders table + decrement OWN_WH inventory.
     Checks for duplicates first (safe to call on retry runs).
@@ -192,13 +217,14 @@ def _record_fc_order(order_id: str, sku_id: str, qty: int,
             qty=qty,
             channel_id=6,
             selling_price=sp,
-            order_date=date.today(),
+            order_date=order_date or date.today(),
             platform_order_id=order_id,
             city=city,
             notes="fc_scraper",
             created_by="vignesh",
         )
-        logger.info("FC %s/%s recorded to DB (SP=%.0f).", order_id, sku_id, sp)
+        logger.info("FC %s/%s recorded to DB (SP=%.0f, date=%s).",
+                    order_id, sku_id, sp, order_date or date.today())
         return "recorded"
     except Exception as exc:
         logger.error("Failed to record FC %s/%s: %s", order_id, sku_id, exc)
@@ -319,24 +345,6 @@ def _process_one_order(context, gear_icon, order_id: str) -> tuple[list[Path], d
             except Exception:
                 continue
 
-        # ── Read City (search page text for known Indian cities) ──────────────
-        city: str | None = None
-        _known_cities = [
-            "Mumbai", "Delhi", "Bengaluru", "Bangalore", "Hyderabad", "Chennai",
-            "Gurgaon", "Gurugram", "Noida", "Pune", "Ahmedabad", "Kolkata",
-            "Jaipur", "Lucknow", "Chandigarh", "Surat", "Indore", "Thane",
-            "Navi Mumbai", "Faridabad", "Ghaziabad", "Patna", "Bhopal",
-        ]
-        try:
-            page_text = tab.inner_text("body")
-            for candidate in _known_cities:
-                if candidate.lower() in page_text.lower():
-                    city = candidate
-                    logger.info("Order %s: city=%s", order_id, city)
-                    break
-        except Exception as exc:
-            logger.debug("Order %s: city detection failed: %s", order_id, exc)
-
         # ── Step 1: Check header checkbox (select all items) ──────────────────
         header_cb = tab.locator("th input[type='checkbox'], thead input[type='checkbox']").first
         if header_cb.count() and header_cb.is_visible():
@@ -386,14 +394,56 @@ def _process_one_order(context, gear_icon, order_id: str) -> tuple[list[Path], d
         tab.wait_for_selector("text=Purchase Order:", timeout=15_000)
         time.sleep(1)
 
-        # 1. Select Box FIRST → "NonFCPackaging Material"
-        box_select = tab.locator("select").filter(
+        # 1. Select Box FIRST — try NonFCPackaging, fall back to Box No 4
+        active_select = None
+        packaging_mode = "nonfc"
+
+        nonfc_select = tab.locator("select").filter(
             has=tab.locator("option:has-text('NonFCPackaging')")
         ).first
-        box_select.wait_for(timeout=10_000)
-        box_select.select_option(label="NonFCPackaging Material")
+        try:
+            nonfc_select.wait_for(timeout=10_000)
+            nonfc_select.select_option(label="NonFCPackaging Material")
+            active_select = nonfc_select
+            logger.info("Order %s: Select Box set to NonFCPackaging Material.", order_id)
+        except PWTimeout:
+            # NonFCPackaging not available — try Box No 4
+            box4_select = tab.locator("select").filter(
+                has=tab.locator("option:has-text('Box No 4')")
+            ).first
+            try:
+                box4_select.wait_for(timeout=5_000)
+                # Get exact option label from the DOM (guards against label drift)
+                box4_label = tab.evaluate("""
+                    () => {
+                        for (const s of document.querySelectorAll('select')) {
+                            const opt = [...s.options].find(o => o.text.trim().startsWith('Box No 4'));
+                            if (opt) return opt.text.trim();
+                        }
+                        return null;
+                    }
+                """)
+                if not box4_label:
+                    raise RuntimeError(f"Order {order_id}: Box No 4 option text not found.")
+                box4_select.select_option(label=box4_label)
+                active_select = box4_select
+                packaging_mode = "box4"
+                logger.info("Order %s: NonFCPackaging not available — using Box No 4 (%s). "
+                            "L/B/H will be skipped (auto-filled by FC).", order_id, box4_label)
+            except (PWTimeout, RuntimeError):
+                # Neither option found — dump diagnostics before failing
+                all_selects = tab.evaluate("""
+                    () => [...document.querySelectorAll('select')].map(s => ({
+                        id: s.id, name: s.name,
+                        options: [...s.options].map(o => o.text.trim())
+                    }))
+                """)
+                logger.error("Order %s: No packaging select found. All selects: %s",
+                             order_id, all_selects)
+                raise RuntimeError(
+                    f"Order {order_id}: no packaging option (NonFCPackaging or Box No 4) found on PO panel."
+                )
         time.sleep(0.5)
-        logger.info("Order %s: Select Box set to NonFCPackaging Material.", order_id)
 
         # 2–5. Fill Weight / Length / Breadth / Height
         # Strategy: use the Select dropdown as an anchor — find the ancestor element
@@ -401,59 +451,71 @@ def _process_one_order(context, gear_icon, order_id: str) -> tuple[list[Path], d
         # This is more robust than matching by placeholder (portal uses non-standard names).
         po_container = None
         for xpath_levels in ["xpath=../..", "xpath=../../..", "xpath=../../../.."]:
-            candidate = box_select.locator(xpath_levels)
-            if candidate.count() and candidate.locator("input").count() >= 3:
+            candidate = active_select.locator(xpath_levels)
+            if candidate.count() and candidate.locator("input").count() >= 1:
                 po_container = candidate
                 break
 
-        if po_container:
-            po_inputs = po_container.locator("input")
-            n = po_inputs.count()
-            # Log all inputs so we can debug if order is wrong
-            for i in range(n):
-                ph = po_inputs.nth(i).get_attribute("placeholder") or ""
-                nm = po_inputs.nth(i).get_attribute("name") or ""
-                logger.info("Order %s: po_input[%d] placeholder='%s' name='%s'",
-                            order_id, i, ph, nm)
-
-            if n < 4:
-                raise RuntimeError(
-                    f"Order {order_id}: expected 4 dimension inputs in PO panel, found {n}."
-                )
-
-            # Fill in order: Weight [0], Length [1], Breadth [2], Height [3]
+        # Which fields to fill depends on packaging choice:
+        # NonFCPackaging → Weight + Length + Breadth + Height
+        # Box No 4       → Weight only (L/B/H auto-filled by FC portal)
+        if packaging_mode == "box4":
+            dim_values = [("weight_kg", dims["weight_kg"])]
+        else:
             dim_values = [
                 ("weight_kg",  dims["weight_kg"]),
                 ("length_cm",  dims["length_cm"]),
                 ("breadth_cm", dims["breadth_cm"]),
                 ("height_cm",  dims["height_cm"]),
             ]
+
+        if po_container:
+            po_inputs = po_container.locator("input")
+            n = po_inputs.count()
+            for i in range(n):
+                ph = po_inputs.nth(i).get_attribute("placeholder") or ""
+                nm = po_inputs.nth(i).get_attribute("name") or ""
+                logger.info("Order %s: po_input[%d] placeholder='%s' name='%s'",
+                            order_id, i, ph, nm)
+
+            if n < len(dim_values):
+                raise RuntimeError(
+                    f"Order {order_id}: expected {len(dim_values)} input(s) in PO panel, found {n}."
+                )
+
             for idx, (field, value) in enumerate(dim_values):
                 po_inputs.nth(idx).fill(str(value))
                 time.sleep(0.2)
                 logger.info("Order %s: po_input[%d] (%s) = %s", order_id, idx, field, value)
 
         else:
-            # Fallback: find inputs by placeholder/name across the whole page
             logger.warning("Order %s: PO container not found via anchor — falling back to page-level selectors.", order_id)
-            field_selectors = [
+            field_selectors_all = [
                 ("weight_kg",  "input[placeholder*='weight' i], input[name*='weight' i], input[id*='weight' i]"),
                 ("length_cm",  "input[placeholder*='length' i], input[name*='length' i], input[id*='length' i]"),
                 ("breadth_cm", "input[placeholder*='breadth' i], input[name*='breadth' i], input[id*='breadth' i]"),
                 ("height_cm",  "input[placeholder*='height' i], input[placeholder*=' ht' i], "
                                "input[name*='height' i], input[id*='height' i]"),
             ]
-            for field, sel in field_selectors:
+            # Only fill the fields relevant to the current packaging mode
+            active_fields = {f for f, _ in dim_values}
+            for field, sel in field_selectors_all:
+                if field not in active_fields:
+                    continue
                 inp = tab.locator(sel).first
                 if not inp.count():
-                    raise RuntimeError(f"Order {order_id}: could not find input for '{field}'. Selector: {sel}")
+                    raise RuntimeError(f"Order {order_id}: could not find input for '{field}'.")
                 inp.fill(str(dims[field]))
                 time.sleep(0.2)
                 logger.info("Order %s: filled %s = %s", order_id, field, dims[field])
 
-        logger.info("Order %s: dimensions filled — W=%.1f L=%s B=%s H=%s",
-                    order_id, dims["weight_kg"], dims["length_cm"],
-                    dims["breadth_cm"], dims["height_cm"])
+        if packaging_mode == "box4":
+            logger.info("Order %s: dimensions filled — W=%.1f (L/B/H auto-filled by FC).",
+                        order_id, dims["weight_kg"])
+        else:
+            logger.info("Order %s: dimensions filled — W=%.1f L=%s B=%s H=%s",
+                        order_id, dims["weight_kg"], dims["length_cm"],
+                        dims["breadth_cm"], dims["height_cm"])
 
         # ── Step 6: Click Save ────────────────────────────────────────────────
         # The page is an Angular SPA — scrollable content is inside a div container,
@@ -519,12 +581,12 @@ def _process_one_order(context, gear_icon, order_id: str) -> tuple[list[Path], d
         raise
 
     tab.close()
-    return [invoice_path, address_path], {"sku_id": style_code, "qty": qty, "city": city}
+    return [invoice_path, address_path], {"sku_id": style_code, "qty": qty}
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
-def run(dry_run: bool = False, headed: bool = False) -> dict:
+def run(dry_run: bool = False, headed: bool = False, no_email: bool = False) -> dict:
     """
     Full FC processing pipeline. Returns result dict:
       orders_processed  int   — number of orders successfully processed
@@ -607,6 +669,8 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
                 order_id = ""
                 gear_icon = None
                 row_index = -1
+                order_date_raw = ""
+                shipping_address = ""
 
                 for i in range(rows.count()):
                     row = rows.nth(i)
@@ -622,13 +686,23 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
                             if not gear.count():
                                 gear = row.locator("td").last.locator("a, button").first
                             gear_icon = gear
+                            # Read Order Date (col 2) and Shipping Address (col 5)
+                            try:
+                                order_date_raw   = row.locator("td").nth(2).inner_text().strip()
+                                shipping_address = row.locator("td").nth(5).inner_text().strip()
+                            except Exception:
+                                pass
                             break
 
                 if not order_id or gear_icon is None:
                     logger.info("No more unprocessed orders found.")
                     break
 
-                logger.info("Processing order: %s (row %d)", order_id, row_index)
+                city       = _parse_city_from_address(shipping_address)
+                order_date = _parse_fc_order_date(order_date_raw)
+                logger.info("Processing order: %s (row %d) date=%s city=%s",
+                            order_id, row_index, order_date, city)
+
                 try:
                     pdfs, order_info = _process_one_order(ctx, gear_icon, order_id)
                     all_pdfs.extend(pdfs)
@@ -637,14 +711,15 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
                     processed_ids.add(order_id)
                     db_status = _record_fc_order(
                         order_id, order_info["sku_id"], order_info["qty"],
-                        order_info["city"], dry_run,
+                        city, order_date, dry_run,
                     )
                     result["order_details"].append({
-                        "order_id": order_id,
-                        "sku_id":   order_info["sku_id"],
-                        "qty":      order_info["qty"],
-                        "city":     order_info["city"],
-                        "db_status": db_status,
+                        "order_id":   order_id,
+                        "sku_id":     order_info["sku_id"],
+                        "qty":        order_info["qty"],
+                        "city":       city,
+                        "order_date": order_date.isoformat() if order_date else None,
+                        "db_status":  db_status,
                     })
                     logger.info("Order %s: done. PDFs=%d DB=%s", order_id, len(pdfs), db_status)
                 except Exception as exc:
@@ -679,6 +754,10 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
         logger.warning("No PDFs downloaded despite pending orders — check logs.")
         return result
 
+    if no_email:
+        logger.info("--no-email: skipping email send. PDFs saved to %s", DOWNLOAD_DIR)
+        return result
+
     from automation.email_sender import send_with_attachments
 
     recipients = [
@@ -698,10 +777,11 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
 
         od_list = result.get("order_details", [])
         if od_list:
-            header  = f"  {'Order No':<22} {'SKU':<8} {'Qty':<5} {'City':<15} DB Status"
-            divider = "  " + "-" * 65
+            header  = f"  {'Order No':<22} {'SKU':<8} {'Qty':<5} {'Date':<12} {'City':<15} DB Status"
+            divider = "  " + "-" * 78
             rows_txt = "\n".join(
                 f"  {od['order_id']:<22} {od['sku_id']:<8} {od['qty']:<5} "
+                f"{(od.get('order_date') or '-'):<12} "
                 f"{(od.get('city') or '-'):<15} {od['db_status']}"
                 for od in od_list
             )
@@ -733,7 +813,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="First Cry order processor")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Process orders and download PDFs, but skip email")
+                        help="Process orders and download PDFs, but skip email and DB write")
+    parser.add_argument("--no-email", action="store_true",
+                        help="Process orders, write to DB, download PDFs — but skip email")
     parser.add_argument("--headed", action="store_true",
                         help="Show browser window — use for first-run debugging")
     args = parser.parse_args()
@@ -745,7 +827,7 @@ if __name__ == "__main__":
     logger.info("=" * 55)
 
     try:
-        result = run(dry_run=args.dry_run, headed=args.headed)
+        result = run(dry_run=args.dry_run, headed=args.headed, no_email=args.no_email)
         if result["skipped"]:
             print("No pending First Cry orders — nothing to do.")
         else:
