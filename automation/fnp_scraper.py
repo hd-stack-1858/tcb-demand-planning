@@ -67,6 +67,40 @@ logger = logging.getLogger(__name__)
 PORTAL_URL   = "https://partner.fnp.com/vendorapp/templates/index.html#/login/"
 DOWNLOAD_DIR = Path(__file__).parent.parent / "fnp_reports" / "challans"
 
+# FnP may show product names instead of TCB codes — map common names to SKU IDs.
+# Keys are lowercase. Update when new SKUs are listed on FnP.
+_FNP_PRODUCT_TO_SKU: dict[str, str] = {
+    "tiny splash hamper pink":     "TCB001",
+    "tiny splash hamper blue":     "TCB002",
+    "little looker hamper 6pcs":   "TCB003",
+    "little looker (6pcs)":        "TCB003",
+    "cosy cub hamper":             "TCB004",
+    "growing joy 0-6 months":      "TCB005",
+    "growing joy 0-6m":            "TCB005",
+    "growing joy 7-12 months":     "TCB006",
+    "growing joy 7-12m":           "TCB006",
+    "welcome to us hamper":        "TCB007",
+    "just arrived hamper bunny":   "TCB008",
+    "just arrived bunny":          "TCB008",
+    "hello parenthood hamper":     "TCB009",
+    "growing joy 0-12 months":     "TCB010",
+    "growing joy 0-12m":           "TCB010",
+    "just arrived hamper bear":    "TCB011",
+    "just arrived bear":           "TCB011",
+    "little looker hamper 4pcs":   "TCB012",
+    "little looker (4pcs)":        "TCB012",
+}
+
+
+def _parse_sku(raw: str | None) -> str | None:
+    """Resolve a raw portal string to a TCB SKU ID. Returns None if unresolvable."""
+    if not raw:
+        return None
+    s = raw.strip()
+    if re.match(r"^TCB\d{3}$", s, re.IGNORECASE):
+        return s.upper()
+    return _FNP_PRODUCT_TO_SKU.get(s.lower())
+
 
 # ── Login ──────────────────────────────────────────────────────────────────────
 
@@ -379,6 +413,109 @@ def _click_branding_challan(page) -> Path:
     return dest
 
 
+# ── Order extraction + DB recording ───────────────────────────────────────────
+
+def _read_order_rows(page) -> list[dict]:
+    """
+    Scrape order rows from the FnP 'Orders to be shipped' list page.
+    Returns list of {order_no, sku_raw, qty, cells}.
+    Logs all cell text to help debug SKU mapping issues.
+    Returns [] on any failure — never raises.
+    """
+    try:
+        rows = page.evaluate(r"""
+            () => {
+                const orders = [];
+                document.querySelectorAll('tbody').forEach(tbody => {
+                    tbody.querySelectorAll('tr').forEach(tr => {
+                        const cells = [...tr.querySelectorAll('td')].map(td =>
+                            (td.innerText || td.textContent || '').replace(/\s+/g, ' ').trim()
+                        );
+                        if (cells.length < 2) return;
+                        const rowText = cells.join('|');
+                        const orderNoMatch = rowText.match(/\b(\d{10})\b/);
+                        if (!orderNoMatch) return;
+                        const skuMatch = rowText.match(/\b(TCB\d{3})\b/i);
+                        let qty = 1;
+                        for (const cell of cells) {
+                            const n = parseInt(cell, 10);
+                            if (!isNaN(n) && n >= 1 && n <= 50 && cell.trim() === String(n)) {
+                                qty = n;
+                                break;
+                            }
+                        }
+                        orders.push({
+                            order_no: orderNoMatch[1],
+                            sku_raw:  skuMatch ? skuMatch[1].toUpperCase() : null,
+                            qty:      qty,
+                            cells:    cells,
+                        });
+                    });
+                });
+                return orders;
+            }
+        """)
+        logger.info("Order row extraction: %d row(s) found.", len(rows))
+        for row in rows:
+            logger.info("  Row — order_no=%s sku_raw=%s qty=%d cells=%s",
+                        row.get("order_no"), row.get("sku_raw"),
+                        row.get("qty", 1), row.get("cells", []))
+        return rows
+    except Exception as exc:
+        logger.warning("_read_order_rows failed: %s", exc)
+        return []
+
+
+def _record_fnp_order(order_no: str, sku_id: str, qty: int,
+                      city: str | None, dry_run: bool) -> str:
+    """
+    Write one FnP order to the orders table + decrement OWN_WH inventory.
+    Checks for duplicates first (safe to call on retry runs).
+    Returns: 'recorded', 'already_recorded', 'dry-run', or 'failed: <reason>'.
+    Never raises.
+    """
+    if dry_run:
+        return "dry-run"
+    try:
+        from tcb.db import get_client
+        from tcb.inventory import record_dropship_sale
+        from ingest.utils import get_sku_sp_at_date
+
+        db = get_client()
+        existing = (
+            db.table("orders")
+            .select("order_id")
+            .eq("channel_id", 5)
+            .eq("platform_order_id", order_no)
+            .eq("sku_id", sku_id)
+            .execute()
+        )
+        if existing.data:
+            logger.info("FnP %s/%s already in DB — skipping.", order_no, sku_id)
+            return "already_recorded"
+
+        sp = get_sku_sp_at_date(sku_id, date.today())
+        if sp is None:
+            return f"failed: no SP for {sku_id}"
+
+        record_dropship_sale(
+            sku_id=sku_id,
+            qty=qty,
+            channel_id=5,
+            selling_price=sp,
+            order_date=date.today(),
+            platform_order_id=order_no,
+            city=city,
+            notes="fnp_scraper",
+            created_by="vignesh",
+        )
+        logger.info("FnP %s/%s recorded to DB (SP=%.0f).", order_no, sku_id, sp)
+        return "recorded"
+    except Exception as exc:
+        logger.error("Failed to record FnP %s/%s: %s", order_no, sku_id, exc)
+        return f"failed: {exc}"
+
+
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
 def run(dry_run: bool = False, headed: bool = False) -> dict:
@@ -412,10 +549,12 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
         "challan_downloaded": False,
         "emailed": False,
         "skipped": False,
+        "order_details": [],
     }
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     pdf_paths: list[Path] = []
+    raw_order_rows: list[dict] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -488,6 +627,7 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
                 _click_column(page, "Orders to be shipped", col_idx)
                 count = _read_order_count(page)
                 total_ship += count if count > 0 else col_count
+                raw_order_rows.extend(_read_order_rows(page))
                 _select_all(page)
                 pdf = _click_branding_challan(page)
                 pdf_paths.append(pdf)
@@ -506,7 +646,28 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
 
         browser.close()
 
-    # ── Step 4: Email all PDFs in one message ──────────────────────────────────
+    # ── Step 4: Record orders to DB ───────────────────────────────────────────
+    order_details: list[dict] = []
+    for row in raw_order_rows:
+        order_no = row.get("order_no", "")
+        sku_raw  = row.get("sku_raw")
+        qty      = row.get("qty", 1)
+        sku_id   = _parse_sku(sku_raw)
+        if sku_id:
+            db_status = _record_fnp_order(order_no, sku_id, qty, None, dry_run)
+        else:
+            logger.warning("Could not resolve SKU for FnP order %s (raw=%r) — DB write skipped.",
+                           order_no, sku_raw)
+            db_status = f"unknown_sku ({sku_raw})"
+        order_details.append({
+            "order_no": order_no,
+            "sku_id":   sku_id or f"?({sku_raw})",
+            "qty":      qty,
+            "db_status": db_status,
+        })
+    result["order_details"] = order_details
+
+    # ── Step 5: Email all PDFs in one message ─────────────────────────────────
     if not pdf_paths:
         return result
 
@@ -526,10 +687,26 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
         n     = result["ship_count"] if result["ship_count"] > 0 else result["allocated_accepted"]
         today = date.today().strftime("%d-%b-%Y")
         subject = f"FnP Branding Challan — {today} ({n} order(s))"
+
+        if order_details:
+            header = f"  {'Order No':<14} {'SKU':<8} {'Qty':<5} DB Status"
+            divider = "  " + "-" * 50
+            rows_txt = "\n".join(
+                f"  {od['order_no']:<14} {od['sku_id']:<8} {od['qty']:<5} {od['db_status']}"
+                for od in order_details
+            )
+            db_block = f"{header}\n{divider}\n{rows_txt}"
+        else:
+            db_block = "  (Order details could not be parsed from portal — check log)"
+
         body = (
             f"Hi,\n\n"
-            f"Attached is the FnP Branding Challan for {n} order(s) on {today}.\n"
-            f"Please print and pack as per the challan.\n\n"
+            f"FnP order(s) processed on {today}.\n\n"
+            f"Orders recorded to DB:\n"
+            f"{db_block}\n\n"
+            f"If anything above looks wrong, fix it in Warehouse App → Ship Out "
+            f"before end of day.\n\n"
+            f"Challan attached — print and pack as per challan.\n\n"
             f"— Vignesh (automated)\n"
         )
         send_with_attachments(subject, body, recipients, pdf_paths, dry_run=dry_run)

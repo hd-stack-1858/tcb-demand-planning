@@ -50,6 +50,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import date
@@ -152,6 +153,58 @@ def _get_pending_count(page) -> int:
         return -1
 
 
+# ── DB recording ──────────────────────────────────────────────────────────────
+
+def _record_fc_order(order_id: str, sku_id: str, qty: int,
+                     city: str | None, dry_run: bool) -> str:
+    """
+    Write one FC order to the orders table + decrement OWN_WH inventory.
+    Checks for duplicates first (safe to call on retry runs).
+    Returns: 'recorded', 'already_recorded', 'dry-run', or 'failed: <reason>'.
+    Never raises.
+    """
+    if dry_run:
+        return "dry-run"
+    try:
+        from tcb.db import get_client
+        from tcb.inventory import record_dropship_sale
+        from ingest.utils import get_sku_sp_at_date
+
+        db = get_client()
+        existing = (
+            db.table("orders")
+            .select("order_id")
+            .eq("channel_id", 6)
+            .eq("platform_order_id", order_id)
+            .eq("sku_id", sku_id)
+            .execute()
+        )
+        if existing.data:
+            logger.info("FC %s/%s already in DB — skipping.", order_id, sku_id)
+            return "already_recorded"
+
+        sp = get_sku_sp_at_date(sku_id, date.today())
+        if sp is None:
+            return f"failed: no SP for {sku_id}"
+
+        record_dropship_sale(
+            sku_id=sku_id,
+            qty=qty,
+            channel_id=6,
+            selling_price=sp,
+            order_date=date.today(),
+            platform_order_id=order_id,
+            city=city,
+            notes="fc_scraper",
+            created_by="vignesh",
+        )
+        logger.info("FC %s/%s recorded to DB (SP=%.0f).", order_id, sku_id, sp)
+        return "recorded"
+    except Exception as exc:
+        logger.error("Failed to record FC %s/%s: %s", order_id, sku_id, exc)
+        return f"failed: {exc}"
+
+
 # ── Per-order processing ───────────────────────────────────────────────────────
 
 def _download_pdf_link(tab, link_text: str, dest: Path) -> Path:
@@ -201,11 +254,11 @@ def _download_pdf_link(tab, link_text: str, dest: Path) -> Path:
         raise RuntimeError(f"Could not download '{link_text}': {exc}") from exc
 
 
-def _process_one_order(context, gear_icon, order_id: str) -> list[Path]:
+def _process_one_order(context, gear_icon, order_id: str) -> tuple[list[Path], dict]:
     """
     Open the Configure Order tab for one order, fill the form, download PDFs.
 
-    Returns [invoice_pdf_path, packing_slip_pdf_path].
+    Returns ([invoice_pdf, packing_slip_pdf], {sku_id, qty, city}).
     """
     today_str = date.today().strftime("%Y%m%d")
     run_time  = time.strftime("%H%M")
@@ -253,6 +306,36 @@ def _process_one_order(context, gear_icon, order_id: str) -> list[Path]:
 
         dims = _get_dims(style_code)
         logger.info("Order %s: dims=%s", order_id, dims)
+
+        # ── Read Qty (scan for small standalone integer in table cells) ───────
+        qty = 1
+        for i in range(min(all_cells.count(), 50)):
+            try:
+                txt = all_cells.nth(i).inner_text().strip()
+                if txt.isdigit() and 1 <= int(txt) <= 50:
+                    qty = int(txt)
+                    logger.info("Order %s: qty=%d (cell[%d])", order_id, qty, i)
+                    break
+            except Exception:
+                continue
+
+        # ── Read City (search page text for known Indian cities) ──────────────
+        city: str | None = None
+        _known_cities = [
+            "Mumbai", "Delhi", "Bengaluru", "Bangalore", "Hyderabad", "Chennai",
+            "Gurgaon", "Gurugram", "Noida", "Pune", "Ahmedabad", "Kolkata",
+            "Jaipur", "Lucknow", "Chandigarh", "Surat", "Indore", "Thane",
+            "Navi Mumbai", "Faridabad", "Ghaziabad", "Patna", "Bhopal",
+        ]
+        try:
+            page_text = tab.inner_text("body")
+            for candidate in _known_cities:
+                if candidate.lower() in page_text.lower():
+                    city = candidate
+                    logger.info("Order %s: city=%s", order_id, city)
+                    break
+        except Exception as exc:
+            logger.debug("Order %s: city detection failed: %s", order_id, exc)
 
         # ── Step 1: Check header checkbox (select all items) ──────────────────
         header_cb = tab.locator("th input[type='checkbox'], thead input[type='checkbox']").first
@@ -436,7 +519,7 @@ def _process_one_order(context, gear_icon, order_id: str) -> list[Path]:
         raise
 
     tab.close()
-    return [invoice_path, address_path]
+    return [invoice_path, address_path], {"sku_id": style_code, "qty": qty, "city": city}
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
@@ -454,6 +537,7 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
         "pdfs_downloaded": 0,
         "emailed": False,
         "skipped": False,
+        "order_details": [],
     }
 
     if not SESSION_FILE.exists():
@@ -546,12 +630,23 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
 
                 logger.info("Processing order: %s (row %d)", order_id, row_index)
                 try:
-                    pdfs = _process_one_order(ctx, gear_icon, order_id)
+                    pdfs, order_info = _process_one_order(ctx, gear_icon, order_id)
                     all_pdfs.extend(pdfs)
                     result["orders_processed"] += 1
                     result["pdfs_downloaded"] += len(pdfs)
                     processed_ids.add(order_id)
-                    logger.info("Order %s: done. PDFs: %d", order_id, len(pdfs))
+                    db_status = _record_fc_order(
+                        order_id, order_info["sku_id"], order_info["qty"],
+                        order_info["city"], dry_run,
+                    )
+                    result["order_details"].append({
+                        "order_id": order_id,
+                        "sku_id":   order_info["sku_id"],
+                        "qty":      order_info["qty"],
+                        "city":     order_info["city"],
+                        "db_status": db_status,
+                    })
+                    logger.info("Order %s: done. PDFs=%d DB=%s", order_id, len(pdfs), db_status)
                 except Exception as exc:
                     logger.error("Order %s: FAILED — %s", order_id, exc)
                     processed_ids.add(order_id)  # mark as attempted, skip on next loop
@@ -600,11 +695,28 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
         n     = result["orders_processed"]
         today = date.today().strftime("%d-%b-%Y")
         subject = f"First Cry Orders — {today} ({n} order(s), {len(all_pdfs)} PDFs)"
+
+        od_list = result.get("order_details", [])
+        if od_list:
+            header  = f"  {'Order No':<22} {'SKU':<8} {'Qty':<5} {'City':<15} DB Status"
+            divider = "  " + "-" * 65
+            rows_txt = "\n".join(
+                f"  {od['order_id']:<22} {od['sku_id']:<8} {od['qty']:<5} "
+                f"{(od.get('city') or '-'):<15} {od['db_status']}"
+                for od in od_list
+            )
+            db_block = f"{header}\n{divider}\n{rows_txt}"
+        else:
+            db_block = "  (No orders processed)"
+
         body = (
             f"Hi,\n\n"
-            f"{n} First Cry order(s) processed on {today}.\n"
-            f"Attached: Invoice + Packing Slip for each order.\n\n"
-            f"Please print and pack.\n\n"
+            f"{n} First Cry order(s) processed on {today}.\n\n"
+            f"Orders recorded to DB:\n"
+            f"{db_block}\n\n"
+            f"If anything above looks wrong, fix it in Warehouse App → Ship Out "
+            f"before end of day.\n\n"
+            f"Attachments: Invoice + Packing Slip for each order.\n\n"
             f"— Vignesh (automated)\n"
         )
         send_with_attachments(subject, body, recipients, all_pdfs, dry_run=dry_run)
