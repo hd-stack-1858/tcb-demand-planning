@@ -18,8 +18,8 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | `inventory` + `inventory_transactions` | Item-level inventory, all movement types, location-aware |
 | `ingest/` scripts | Loaders for all 6 channels — upsert-safe, re-runnable |
 | `automation/amazon_sp_api.py` | SP-API client — orders report + finances, poll/download, feeds ingest scripts |
-| `ui/app.py` | Warehouse app — Ship Out, Inward, Assembly, Write-off, Reorder, Geography |
-| `ui/sales_app.py` | Sales MIS — Overview, Trends, By Channel, By SKU, Returns, Geography |
+| `ui/tinysteps_app.py` | Warehouse app — Ship Out, Inward, Assembly, Write-off, Reorder, Geography |
+| `ui/growthspurt_app.py` | Sales MIS — Overview, Trends, By Channel, By SKU, Returns, Geography |
 | Return reason fields | `return_reason`, `return_responsible`, `return_customer_verbatim` — all channels |
 | COGS / lot system | FIFO lot consumption for Amazon FBA and Blinkit |
 | `mcp/server.py` | Vignesh — FastMCP server, 9 tools, connected to Claude.ai + Claude Desktop |
@@ -80,7 +80,7 @@ Phase I           → Gets autonomy. Drafts POs, approves within guardrails, run
 - `get_velocity(sku_id, channel_id=None, lookback_weeks=8)` → avg weekly units from `orders`
 - `generate_forecast(lookback_weeks=8, horizon_months=3)` → extrapolate velocity × weeks → write to `demand_forecasts` with model='VELOCITY_AVG'
 
-**New tab in sales_app.py — 🔮 Forecast:**
+**New tab in growthspurt_app.py — 🔮 Forecast:**
 - Button: "Generate Forecast (last 8 weeks velocity)"
 - Editable table: SKU × Month1 / Month2 / Month3 (pre-filled, overridable)
 - Button: "Lock Final Demand" → upserts to `demand_forecasts` with model='USER_FINAL'
@@ -100,7 +100,7 @@ Phase I           → Gets autonomy. Drafts POs, approves within guardrails, run
 - `calculate_reorder_points()` → USER_FINAL demand → daily velocity per item via BOM → ROP = (daily_velocity × lead_time_days) + safety_stock
 - `calculate_reorder_quantities()` → suggest PO qty = max(MOQ, 6-week demand)
 
-**New tab in sales_app.py — 📦 Reorder Plan:**
+**New tab in growthspurt_app.py — 📦 Reorder Plan:**
 - Table: Item | Supplier | Current Stock | New ROP | Suggested Order Qty | Days Cover
 - Button: "Apply ROPs to Warehouse App" → bulk-updates `items.reorder_point` in DB
 
@@ -339,13 +339,23 @@ Track 2 — Vignesh agent layer (can start now that G is live):
 
 ---
 
+## Deferred / Backlog
+
+Items explicitly decided to skip for now but worth revisiting:
+
+| Item | Context | When to pick up |
+|------|---------|-----------------|
+| `sku_cogs_lot_txns` audit table | `sku_cogs_lots.qty_remaining` is mutated in-place by `_consume_lots_fifo()` and `refresh_blinkit_lots.py` with no log. Unlike inventory, there is no transaction trail — you can't tell which orders consumed a lot or whether a drop was a sale vs. a reconciliation. A log table (lot_id, event_type, qty_change, order_id, reference, txn_date) would close this gap. Code change: one extra insert inside `_consume_lots_fifo()` and `refresh_blinkit_lots.py`. | Before tax/accounting audit queries become needed — likely Phase D or E when COGS accuracy matters for forecasting |
+
+---
+
 ## Critical Files
 
 | File | Status |
 |------|--------|
 | `tcb/inventory.py` | ✅ Complete |
-| `ui/app.py` | ✅ Warehouse app complete |
-| `ui/sales_app.py` | ✅ Sales MIS complete (6 tabs + City filter) |
+| `ui/tinysteps_app.py` | ✅ Warehouse app complete |
+| `ui/growthspurt_app.py` | ✅ Sales MIS complete (6 tabs + City filter) |
 | `ingest/load_blinkit_sales.py` | ✅ Built |
 | `ingest/load_amazon_sales.py` | ✅ Built |
 | `ingest/load_amazon_payout.py` | ✅ Built |

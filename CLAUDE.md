@@ -43,8 +43,8 @@ Five objectives:
 | DB | Supabase (PostgreSQL) — `tcb/db.py` wraps all access |
 | Env | `TCB_ENV=dev` or `TCB_ENV=prod` — always dev for tests |
 | Tests | `pytest tests/` — set in `conftest.py`, always hits dev DB |
-| Inventory UI | Streamlit — `ui/app.py` |
-| Sales MIS UI | Streamlit — `ui/sales_app.py` (Phase C, not yet built) |
+| Inventory UI | Streamlit — `ui/tinysteps_app.py` |
+| Sales MIS UI | Streamlit — `ui/growthspurt_app.py` |
 | Agent UI | Claude Desktop + FastMCP — `mcp/server.py` (Phase F, not yet built) |
 
 ---
