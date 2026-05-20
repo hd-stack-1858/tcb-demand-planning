@@ -66,6 +66,7 @@ logger = logging.getLogger(__name__)
 
 PORTAL_URL   = "https://partner.fnp.com/vendorapp/templates/index.html#/login/"
 DOWNLOAD_DIR = Path(__file__).parent.parent / "data" / "fnp" / "auto"  # scraper writes challans here
+LOCK_FILE    = LOG_DIR / "fnp_scraper.lock"
 
 # FnP may show product names instead of TCB codes — map common names to SKU IDs.
 # Keys are lowercase. Update when new SKUs are listed on FnP.
@@ -263,7 +264,9 @@ def _return_to_dashboard(page) -> None:
     base = PORTAL_URL.replace("#/login/", "")
     logger.info("go_back() didn't land on dashboard — trying %s", base)
     page.goto(base, wait_until="domcontentloaded", timeout=60_000)
-    page.wait_for_selector("text=Allocated", timeout=30_000)
+    # Wait for the date-cell grid (same signal used in _login).
+    # "text=Allocated" is NOT safe — matches the hero-text paragraph too.
+    page.wait_for_selector("text=TODAY", timeout=30_000)
     time.sleep(2)
     logger.info("Dashboard loaded via base URL.")
 
@@ -373,8 +376,14 @@ def _click_accept(page) -> None:
 
 def _click_branding_challan(page) -> Path:
     """
-    Click the BRANDING CHALLAN button, capture the download, save to DOWNLOAD_DIR.
-    Returns the saved PDF path.
+    Click BRANDING CHALLAN and save the challan PDF.
+
+    FnP uses window.open() → the challan renders in a NEW TAB at /courierPrintChallans.
+    We capture the popup tab and save via page.pdf() (works headless).
+    Headed debug runs: page.pdf() is unsupported; a descriptive error is raised.
+
+    If the new tab shows "Failed to load PDF document", orders were not selected —
+    the table did not load before the button was clicked.
     """
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -397,20 +406,46 @@ def _click_branding_challan(page) -> Path:
 
     today_str = date.today().strftime("%Y%m%d")
     run_time  = time.strftime("%H%M")
+    dest      = DOWNLOAD_DIR / f"fnp_challan_{today_str}_{run_time}.pdf"
 
-    logger.info("Clicking BRANDING CHALLAN and waiting for download...")
-    with page.expect_download(timeout=60_000) as dl:
-        challan_btn.click()
+    # Normal case (orders selected): BRANDING CHALLAN triggers a direct file download.
+    # Error case (nothing selected): button opens /courierPrintChallans in a new tab.
+    # Try download first; if it times out, check for a popup tab (error path).
+    logger.info("Clicking BRANDING CHALLAN — waiting for direct download (30s)...")
+    try:
+        with page.expect_download(timeout=30_000) as dl:
+            challan_btn.click()
+        download = dl.value
+        if download.failure():
+            raise RuntimeError(f"Download failed: {download.failure()}")
+        filename = download.suggested_filename or dest.name
+        dest = DOWNLOAD_DIR / filename
+        download.save_as(str(dest))
+        logger.info("Challan saved: %s (%d bytes)", dest, dest.stat().st_size)
+        return dest
 
-    download = dl.value
-    if download.failure():
-        raise RuntimeError(f"Branding Challan download failed: {download.failure()}")
-
-    filename = download.suggested_filename or f"fnp_challan_{today_str}_{run_time}.pdf"
-    dest = DOWNLOAD_DIR / filename
-    download.save_as(str(dest))
-    logger.info("Challan saved: %s (%d bytes)", dest, dest.stat().st_size)
-    return dest
+    except PWTimeout:
+        # Download didn't fire — the portal may have opened a new tab (error path).
+        # Check if a popup was opened (no re-click needed — button was already clicked).
+        logger.warning("Download did not fire in 30s — checking for error popup tab...")
+        pages_after = page.context.pages
+        challan_page = next(
+            (p for p in pages_after if "courierPrint" in p.url or "PrintChallan" in p.url),
+            None,
+        )
+        if challan_page:
+            challan_page.wait_for_load_state("domcontentloaded", timeout=10_000)
+            cur_url = challan_page.url
+            challan_page.close()
+            raise RuntimeError(
+                f"BRANDING CHALLAN opened an error tab ({cur_url}) instead of downloading. "
+                "Orders were likely not selected — portal table rows did not load. "
+                "Check 'No table row selector matched' warnings above."
+            )
+        raise RuntimeError(
+            "BRANDING CHALLAN did not trigger a download after 30s and no error tab found. "
+            "Orders may not have been selected — check table loading warnings above."
+        )
 
 
 # ── Order extraction + DB recording ───────────────────────────────────────────
@@ -418,16 +453,103 @@ def _click_branding_challan(page) -> Path:
 def _read_order_rows(page) -> list[dict]:
     """
     Scrape order rows from the FnP 'Orders to be shipped' list page.
-    Returns list of {order_no, sku_raw, qty, cells}.
-    Logs all cell text to help debug SKU mapping issues.
+    Returns list of {order_no, sku_raw, qty, order_date, city, cells}.
+    order_date is a YYYY-MM-DD string if found, else None.
+    city is the first alpha-only cell that looks like a place name, else None.
+    Logs all cells to help debug extraction on first run.
     Returns [] on any failure — never raises.
     """
     try:
+        # Angular fetches order data via XHR after load — wait for at least one row.
+        # FnP may use non-standard table structure (no <tbody>) so try multiple selectors.
+        _waited = False
+        for _wait_sel in ["tbody tr", "table tr", "[ng-repeat]", "tr td", ".grid-body"]:
+            try:
+                page.wait_for_selector(_wait_sel, timeout=5_000)
+                time.sleep(1)
+                _waited = True
+                logger.info("Table rows found via selector '%s'.", _wait_sel)
+                break
+            except PWTimeout:
+                continue
+        if not _waited:
+            logger.warning("No table row selector matched after 25s — proceeding anyway. "
+                           "DOM structure dump follows.")
+            dom_debug = page.evaluate("""
+                () => ({
+                    tables:    document.querySelectorAll('table').length,
+                    tbodys:    document.querySelectorAll('tbody').length,
+                    trs:       document.querySelectorAll('tr').length,
+                    tds:       document.querySelectorAll('td').length,
+                    ngRepeats: document.querySelectorAll('[ng-repeat]').length,
+                    liItems:   document.querySelectorAll('li').length,
+                    divRows:   document.querySelectorAll('[class*="row"]').length,
+                    bodyHtml:  document.body.innerHTML.substring(0, 2000),
+                })
+            """)
+            logger.info("DOM debug: tables=%s tbodys=%s trs=%s tds=%s ngRepeats=%s "
+                        "liItems=%s divRows=%s",
+                        dom_debug.get('tables'), dom_debug.get('tbodys'),
+                        dom_debug.get('trs'), dom_debug.get('tds'),
+                        dom_debug.get('ngRepeats'), dom_debug.get('liItems'),
+                        dom_debug.get('divRows'))
+            logger.info("Body HTML (first 2000 chars): %s", dom_debug.get('bodyHtml', ''))
+
         rows = page.evaluate(r"""
             () => {
+                const MONTHS = {
+                    jan:'01', feb:'02', mar:'03', apr:'04', may:'05', jun:'06',
+                    jul:'07', aug:'08', sep:'09', oct:'10', nov:'11', dec:'12'
+                };
+
+                function parseDate(cell) {
+                    // DD-MM-YYYY or DD/MM/YYYY
+                    let m = cell.match(/\b(\d{2})[-\/](\d{2})[-\/](\d{4})\b/);
+                    if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+                    // YYYY-MM-DD
+                    m = cell.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+                    if (m) return m[0];
+                    // "18 May 2026" or "18-May-2026"
+                    m = cell.match(/\b(\d{1,2})[\s\-]([A-Za-z]{3,9})[\s\-](\d{4})\b/);
+                    if (m) {
+                        const mo = MONTHS[m[2].toLowerCase().substring(0, 3)];
+                        if (mo) return `${m[3]}-${mo}-${m[1].padStart(2, '0')}`;
+                    }
+                    return null;
+                }
+
+                // Words that appear in status/action columns — skip these for city
+                const SKIP_RE = /^(pending|active|shipped|delivered|cancelled|accept|ship|processing|branding|standard|express|online|payment|cod|prepaid|n\/a|na|yes|no)$/i;
+
+                function extractCity(cells, orderNo) {
+                    for (const cell of cells) {
+                        if (!cell || cell.length < 2 || cell.length > 50) continue;
+                        if (cell === orderNo) continue;
+                        if (/^\d+$/.test(cell)) continue;           // pure number
+                        if (/TCB\d{3}/i.test(cell)) continue;       // SKU code
+                        if (/\d{2}[-\/]\d{2}[-\/]\d{4}/.test(cell)) continue; // date
+                        if (/\d{4}-\d{2}-\d{2}/.test(cell)) continue;
+                        if (SKIP_RE.test(cell.trim())) continue;
+                        // City names are alphabetic (may include spaces, hyphens, dots)
+                        if (/^[A-Za-z][A-Za-z\s\-\.]*$/.test(cell) && cell.length >= 3) {
+                            return cell;
+                        }
+                    }
+                    return null;
+                }
+
+                // Collect candidate <tr> elements.
+                // FnP uses ng-repeat on <tr> directly inside <table> (no explicit <tbody>).
+                // querySelectorAll('table tr') finds those; 'tbody tr' finds standard tables.
+                // Deduplicate via a Set so tbody rows aren't processed twice.
+                const seenTrs = new Set();
+                const trList = [];
+                document.querySelectorAll('tbody tr, table tr').forEach(tr => {
+                    if (!seenTrs.has(tr)) { seenTrs.add(tr); trList.push(tr); }
+                });
+
                 const orders = [];
-                document.querySelectorAll('tbody').forEach(tbody => {
-                    tbody.querySelectorAll('tr').forEach(tr => {
+                trList.forEach(tr => {
                         const cells = [...tr.querySelectorAll('td')].map(td =>
                             (td.innerText || td.textContent || '').replace(/\s+/g, ' ').trim()
                         );
@@ -435,7 +557,9 @@ def _read_order_rows(page) -> list[dict]:
                         const rowText = cells.join('|');
                         const orderNoMatch = rowText.match(/\b(\d{10})\b/);
                         if (!orderNoMatch) return;
+
                         const skuMatch = rowText.match(/\b(TCB\d{3})\b/i);
+
                         let qty = 1;
                         for (const cell of cells) {
                             const n = parseInt(cell, 10);
@@ -444,30 +568,118 @@ def _read_order_rows(page) -> list[dict]:
                                 break;
                             }
                         }
+
+                        let orderDate = null;
+                        for (const cell of cells) {
+                            orderDate = parseDate(cell);
+                            if (orderDate) break;
+                        }
+
+                        const city = extractCity(cells, orderNoMatch[1]);
+
                         orders.push({
-                            order_no: orderNoMatch[1],
-                            sku_raw:  skuMatch ? skuMatch[1].toUpperCase() : null,
-                            qty:      qty,
-                            cells:    cells,
+                            order_no:   orderNoMatch[1],
+                            sku_raw:    skuMatch ? skuMatch[1].toUpperCase() : null,
+                            qty:        qty,
+                            order_date: orderDate,
+                            city:       city,
+                            cells:      cells,
                         });
-                    });
                 });
                 return orders;
             }
         """)
         logger.info("Order row extraction: %d row(s) found.", len(rows))
         for row in rows:
-            logger.info("  Row — order_no=%s sku_raw=%s qty=%d cells=%s",
-                        row.get("order_no"), row.get("sku_raw"),
-                        row.get("qty", 1), row.get("cells", []))
+            logger.info(
+                "  Row — order_no=%s sku_raw=%s qty=%d order_date=%s city=%s cells=%s",
+                row.get("order_no"), row.get("sku_raw"), row.get("qty", 1),
+                row.get("order_date"), row.get("city"), row.get("cells", []),
+            )
         return rows
     except Exception as exc:
         logger.warning("_read_order_rows failed: %s", exc)
         return []
 
 
+def _parse_challan_pdf(pdf_path: Path) -> list[dict]:
+    """
+    Extract order details from a downloaded FnP branding challan PDF.
+    Returns one dict per page (each page = one order):
+      {order_no, sku_raw, qty, order_date (date|None), city (str|None)}
+
+    Patterns confirmed on real challans:
+      Order No   : 7267211901            → 10-digit
+      Order Date : 19-05-2026            → DD-MM-YYYY
+      SKU        : GIFTS-TCB003_OP_NB25  → TCBxxx embedded
+      City       : last city-like word before 6-digit pincode in address
+    """
+    import pdfplumber
+    import re as _re
+    from datetime import datetime as _dt
+
+    results: list[dict] = []
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                text = page.extract_text() or ""
+
+                m = _re.search(r'Order No\s*:\s*(\d{10})', text)
+                if not m:
+                    logger.warning("PDF page %d: no Order No found — skipping.", page_num)
+                    continue
+                order_no = m.group(1)
+
+                m = _re.search(r'Order Date\s*:\s*(\d{2}-\d{2}-\d{4})', text)
+                order_date = None
+                if m:
+                    try:
+                        order_date = _dt.strptime(m.group(1), "%d-%m-%Y").date()
+                    except ValueError:
+                        logger.warning("PDF page %d: could not parse date %r", page_num, m.group(1))
+
+                # TCB SKU: no trailing \b — "GIFTS-TCB003_OP_NB25" has _ after digits (word char)
+                m = _re.search(r'\bTCB(\d{3})', text, _re.IGNORECASE)
+                sku_raw = f"TCB{m.group(1).upper()}" if m else None
+
+                # City: last city-like word before a 6-digit Indian pincode.
+                # Pattern 1: standard "City, - PINCODE" on same line.
+                city_raw = None
+                city_matches = _re.findall(
+                    r'([A-Za-z][A-Za-z\s]{1,25}),\s*[-–]?\s*\d{6}', text
+                )
+                if city_matches:
+                    city_raw = city_matches[-1].strip()
+                else:
+                    # Pattern 2 (PDF column-merge fallback): pincode starts a new line.
+                    # Scan backwards from that line start to find the last alpha-only token.
+                    pm = _re.search(r'(?:^|\n)(\d{6})\b', text)
+                    if pm:
+                        before = text[:pm.start()].strip()
+                        for token in reversed(_re.split(r'[,\n]+', before)):
+                            token = token.strip()
+                            if _re.match(r'^[A-Za-z][A-Za-z ]+$', token) and 3 <= len(token) <= 30:
+                                city_raw = token
+                                break
+
+                logger.info(
+                    "PDF page %d: order_no=%s sku=%s date=%s city=%s",
+                    page_num, order_no, sku_raw, order_date, city_raw,
+                )
+                results.append({
+                    "order_no":   order_no,
+                    "sku_raw":    sku_raw,
+                    "qty":        1,
+                    "order_date": order_date,
+                    "city":       city_raw,
+                })
+    except Exception as exc:
+        logger.error("_parse_challan_pdf failed on %s: %s", pdf_path.name, exc)
+    return results
+
+
 def _record_fnp_order(order_no: str, sku_id: str, qty: int,
-                      city: str | None, dry_run: bool) -> str:
+                      city: str | None, order_date: date, dry_run: bool) -> str:
     """
     Write one FnP order to the orders table + decrement OWN_WH inventory.
     Checks for duplicates first (safe to call on retry runs).
@@ -494,7 +706,7 @@ def _record_fnp_order(order_no: str, sku_id: str, qty: int,
             logger.info("FnP %s/%s already in DB — skipping.", order_no, sku_id)
             return "already_recorded"
 
-        sp = get_sku_sp_at_date(sku_id, date.today())
+        sp = get_sku_sp_at_date(sku_id, order_date)
         if sp is None:
             return f"failed: no SP for {sku_id}"
 
@@ -503,13 +715,14 @@ def _record_fnp_order(order_no: str, sku_id: str, qty: int,
             qty=qty,
             channel_id=5,
             selling_price=sp,
-            order_date=date.today(),
+            order_date=order_date,
             platform_order_id=order_no,
             city=city,
             notes="fnp_scraper",
             created_by="vignesh",
         )
-        logger.info("FnP %s/%s recorded to DB (SP=%.0f).", order_no, sku_id, sp)
+        logger.info("FnP %s/%s recorded to DB (date=%s city=%s SP=%.0f).",
+                    order_no, sku_id, order_date, city, sp)
         return "recorded"
     except Exception as exc:
         logger.error("Failed to record FnP %s/%s: %s", order_no, sku_id, exc)
@@ -517,6 +730,29 @@ def _record_fnp_order(order_no: str, sku_id: str, qty: int,
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
+
+def _acquire_lock() -> bool:
+    """Return True if this process owns the lock. False if another instance is running."""
+    if LOCK_FILE.exists():
+        try:
+            pid = int(LOCK_FILE.read_text().strip())
+            import subprocess
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True,
+            )
+            if str(pid) in result.stdout:
+                return False  # stale PID is still alive
+        except Exception:
+            pass
+        LOCK_FILE.unlink(missing_ok=True)
+    LOCK_FILE.write_text(str(os.getpid()))
+    return True
+
+
+def _release_lock() -> None:
+    LOCK_FILE.unlink(missing_ok=True)
+
 
 def run(dry_run: bool = False, headed: bool = False) -> dict:
     """
@@ -530,15 +766,26 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
     Retries once on PWTimeout — the FnP portal is intermittently slow (30–60+ s
     load times), causing transient navigation timeouts that resolve on a retry.
     """
-    for attempt in range(1, 3):
-        try:
-            return _run_once(dry_run=dry_run, headed=headed)
-        except PWTimeout as exc:
-            if attempt == 2:
-                raise
-            logger.warning("Attempt %d/2 timed out — retrying in 20s...", attempt)
-            time.sleep(20)
-    raise RuntimeError("unreachable")  # satisfies type checkers
+    if not _acquire_lock():
+        logger.warning("Another FnP scraper instance is running — exiting to avoid clash.")
+        return {
+            "allocated_accepted": 0, "ship_count": 0,
+            "challan_downloaded": False, "emailed": False,
+            "skipped": True, "order_details": [],
+            "lock_skipped": True,
+        }
+    try:
+        for attempt in range(1, 3):
+            try:
+                return _run_once(dry_run=dry_run, headed=headed)
+            except PWTimeout as exc:
+                if attempt == 2:
+                    raise
+                logger.warning("Attempt %d/2 timed out — retrying in 20s...", attempt)
+                time.sleep(20)
+        raise RuntimeError("unreachable")  # satisfies type checkers
+    finally:
+        _release_lock()
 
 
 def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
@@ -627,11 +874,13 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
                 _click_column(page, "Orders to be shipped", col_idx)
                 count = _read_order_count(page)
                 total_ship += count if count > 0 else col_count
-                raw_order_rows.extend(_read_order_rows(page))
                 _select_all(page)
                 pdf = _click_branding_challan(page)
                 pdf_paths.append(pdf)
                 result["challan_downloaded"] = True
+                # Parse order details from the downloaded challan PDF (authoritative source).
+                # This replaces portal table scraping — challan has correct date, city, SKU.
+                raw_order_rows.extend(_parse_challan_pdf(pdf))
                 _return_to_dashboard(page)
 
             result["ship_count"] = total_ship
@@ -647,23 +896,35 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
         browser.close()
 
     # ── Step 4: Record orders to DB ───────────────────────────────────────────
+    # raw_order_rows now comes from _parse_challan_pdf() — order_date is already
+    # a date object (or None), city is a raw string ready for normalise_city().
+    from ingest.utils import normalise_city
+
     order_details: list[dict] = []
     for row in raw_order_rows:
-        order_no = row.get("order_no", "")
-        sku_raw  = row.get("sku_raw")
-        qty      = row.get("qty", 1)
-        sku_id   = _parse_sku(sku_raw)
+        order_no   = row.get("order_no", "")
+        sku_raw    = row.get("sku_raw")
+        qty        = row.get("qty", 1)
+        city       = normalise_city(row.get("city"))
+        order_date = row.get("order_date") or date.today()
+
+        if row.get("order_date") is None:
+            logger.warning("No order_date in challan for %s — using today.", order_no)
+
+        sku_id = _parse_sku(sku_raw)
         if sku_id:
-            db_status = _record_fnp_order(order_no, sku_id, qty, None, dry_run)
+            db_status = _record_fnp_order(order_no, sku_id, qty, city, order_date, dry_run)
         else:
             logger.warning("Could not resolve SKU for FnP order %s (raw=%r) — DB write skipped.",
                            order_no, sku_raw)
             db_status = f"unknown_sku ({sku_raw})"
         order_details.append({
-            "order_no": order_no,
-            "sku_id":   sku_id or f"?({sku_raw})",
-            "qty":      qty,
-            "db_status": db_status,
+            "order_no":   order_no,
+            "sku_id":     sku_id or f"?({sku_raw})",
+            "qty":        qty,
+            "order_date": str(order_date),
+            "city":       city or "—",
+            "db_status":  db_status,
         })
     result["order_details"] = order_details
 
@@ -689,10 +950,11 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
         subject = f"FnP Branding Challan — {today} ({n} order(s))"
 
         if order_details:
-            header = f"  {'Order No':<14} {'SKU':<8} {'Qty':<5} DB Status"
-            divider = "  " + "-" * 50
+            header  = f"  {'Order No':<14} {'SKU':<8} {'Qty':<5} {'Date':<12} {'City':<18} DB Status"
+            divider = "  " + "-" * 70
             rows_txt = "\n".join(
-                f"  {od['order_no']:<14} {od['sku_id']:<8} {od['qty']:<5} {od['db_status']}"
+                f"  {od['order_no']:<14} {od['sku_id']:<8} {od['qty']:<5} "
+                f"{od['order_date']:<12} {od['city']:<18} {od['db_status']}"
                 for od in order_details
             )
             db_block = f"{header}\n{divider}\n{rows_txt}"
@@ -735,6 +997,9 @@ if __name__ == "__main__":
 
     try:
         result = run(dry_run=args.dry_run, headed=args.headed)
+        if result.get("lock_skipped"):
+            print("Another FnP scraper instance is already running — exiting.")
+            sys.exit(0)
         if result["skipped"]:
             print("No FnP orders found — nothing to do.")
         else:
