@@ -80,7 +80,7 @@ logger = logging.getLogger(__name__)
 PORTAL_URL        = "https://in-vcom.brainbees.com/#/"
 PENDING_ORDERS_URL = "https://in-vcom.brainbees.com/#/ordermanagement/pendingorders"
 SESSION_FILE      = Path(__file__).parent.parent / ".fc_session" / "state.json"
-DOWNLOAD_DIR = Path(__file__).parent.parent / "fc_reports" / "orders"
+DOWNLOAD_DIR = Path(__file__).parent.parent / "data" / "firstcry" / "auto"  # scraper writes invoices/packing slips here
 DIMS_FILE    = Path(__file__).parent / "fc_dimensions.json"
 
 

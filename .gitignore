@@ -3,17 +3,14 @@
 .env.dev
 
 # Excel master files — stay local, not needed for the running app
-master files/
 *.xlsx
 *.xls
 *.csv
 
 # Keep assets/ (logo etc.) — do NOT ignore images
 
-# Raw data downloads — stay local, data already in DB
-blinkit_inventory/
-blinkit_reports/
-amazon_reports/
+# All downloaded reports and reference files — stay local, data already in DB
+data/
 
 # Temp files
 *.tmp
@@ -41,6 +38,7 @@ build/
 .blinkit_session/
 .fc_session/
 
-# Downloaded reports — data stays local, not in source control
+# Legacy report folders (being migrated to data/) — keep ignoring until fully moved
 fnp_reports/
 fc_reports/
+firstcry_reports/

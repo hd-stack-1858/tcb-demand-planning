@@ -65,7 +65,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 PORTAL_URL   = "https://partner.fnp.com/vendorapp/templates/index.html#/login/"
-DOWNLOAD_DIR = Path(__file__).parent.parent / "fnp_reports" / "challans"
+DOWNLOAD_DIR = Path(__file__).parent.parent / "data" / "fnp" / "auto"  # scraper writes challans here
 
 # FnP may show product names instead of TCB codes — map common names to SKU IDs.
 # Keys are lowercase. Update when new SKUs are listed on FnP.

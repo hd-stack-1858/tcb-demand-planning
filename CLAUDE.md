@@ -63,14 +63,41 @@ Five objectives:
 ## Directory Layout
 
 ```
-setup/          SQL migrations (numbered) + seed scripts
-tcb/            Python library: db.py, inventory.py, catalog.py
-tests/          pytest suite (test_phase_a.py complete)
-ingest/         Channel CSV loaders — Phase B (to be built)
-ui/             Streamlit apps
-mcp/            FastMCP server for Claude Desktop — Phase F (to be built)
-.claude/        Local Claude memory — gitignored, do not commit
+setup/              SQL migrations (numbered) + seed scripts
+setup/archive/      One-off _fix_*.py and _check_*.py scripts (not part of migrations)
+tcb/                Python library: db.py, inventory.py, catalog.py
+tests/              pytest suite (test_phase_a.py complete)
+ingest/             Channel CSV loaders — Phase B (to be built)
+ui/                 Streamlit apps
+mcp/                FastMCP server for Claude Desktop — Phase F (to be built)
+automation/         Playwright scrapers + daily runner
+assets/             Static assets (logo, product images)
+docs/               Build plan and reference docs
+.claude/            Local Claude memory — gitignored, do not commit
 ```
+
+## Data Folder Layout
+
+All downloaded reports and reference files live under `data/` (gitignored). Rule: **code writes → `auto/`, user-provides → `manual/`**.
+
+```
+data/
+  fnp/
+    auto/       FnP branding challans — written by fnp_scraper.py
+    manual/     CDA export .xls files, delivery reports (download from FnP portal manually)
+  firstcry/
+    auto/       FC invoices + packing slips — written by fc_scraper.py
+    manual/     Manually downloaded FC reports
+  blinkit/
+    auto/       MTD sales reports (.xlsx) — written by blinkit_scraper.py
+    manual/     Performance reports, inventory reports, payout sheets (download manually)
+  amazon/
+    auto/       SP-API downloaded reports — written by amazon_sp_api.py (future)
+    manual/     Payout sheets, search term reports (download from Seller Central manually)
+  reference/    Master files: BOM, supplier mapping, batch cost uploads (was "master files/")
+```
+
+When adding a new automation or a new channel: place scraper output in `data/<channel>/auto/`, user-provided files in `data/<channel>/manual/`.
 
 ---
 
