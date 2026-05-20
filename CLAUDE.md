@@ -87,13 +87,19 @@ data/
     manual/     CDA export .xls files, delivery reports (download from FnP portal manually)
   firstcry/
     auto/       FC invoices + packing slips — written by fc_scraper.py
-    manual/     Manually downloaded FC reports
+    manual/     Manually downloaded FC reports (order status exports)
   blinkit/
     auto/       MTD sales reports (.xlsx) — written by blinkit_scraper.py
-    manual/     Performance reports, inventory reports, payout sheets (download manually)
+    manual/
+      inventory/          Inventory snapshot reports (download manually)
+      payout/             Monthly payout sheets — one subfolder per payout period
+      product_performance/ Performance/seller data CSVs (download manually)
   amazon/
     auto/       SP-API downloaded reports — written by amazon_sp_api.py (future)
-    manual/     Payout sheets, search term reports (download from Seller Central manually)
+    manual/
+      sales/    Search term reports, order reports (download from Seller Central)
+      payout/   Monthly payout transaction files
+      returns/  Return reason reports
   reference/    Master files: BOM, supplier mapping, batch cost uploads (was "master files/")
 ```
 
