@@ -14,13 +14,13 @@ Usage:
 Session auth: relies on .blinkit_session/state.json saved by blinkit_auth.py.
 If session is expired, raises BlinkitSessionExpired (exit code 2 → WhatsApp alert).
 
-Navigation flow (Blinkit seller portal):
+Navigation flow (Blinkit seller portal — verified against live UI):
     1. seller.blinkit.com → load saved session
     2. Left sidebar → "Performance" icon
-    3. Sub-nav → "Product Performance" (or "Item Performance")
-    4. Tab → "Detail" (not Summary)
-    5. Set date = today
-    6. Click Download/Export
+    3. Top tab → "Product Expansion" (NOT "Sales Performance")
+    4. Click header checkbox to select ALL products
+    5. Hover "Reports" dropdown (top-right) → click "Detailed Report"
+    6. Wait 7–8 minutes for CSV generation and auto-download
     7. Save CSV to data/blinkit/auto/product_performance/detail/
 
 Note: Run with --headed on first use to verify selectors against the live portal.
@@ -230,116 +230,152 @@ def scrape(headed: bool = False) -> Path:
         page.wait_for_load_state('domcontentloaded', timeout=15_000)
         time.sleep(2)
 
-        # ── Step 3: Navigate to Product Performance / Item Performance ────────
-        # Blinkit may call this section differently; try both names.
-        product_perf_clicked = False
-        for label in ['Product Performance', 'Item Performance', 'Item Wise', 'Product Wise']:
-            if _click_by_text(page, label, timeout=5_000) or _click_js(page, label):
-                product_perf_clicked = True
+        # ── Step 3: Click "Product Expansion" tab ────────────────────────────
+        # The Performance page has multiple top-level tabs. We need "Product Expansion"
+        # (NOT "Sales Performance"). Try exact match first, then partial.
+        pe_clicked = False
+        for label in ['Product Expansion', 'Expansion']:
+            if _click_by_text(page, label, timeout=8_000) or _click_js(page, label):
+                pe_clicked = True
+                logger.info("Clicked Product Expansion tab: '%s'", label)
                 break
             if _click_by_text_partial(page, label, timeout=5_000):
-                product_perf_clicked = True
+                pe_clicked = True
+                logger.info("Clicked Product Expansion tab (partial): '%s'", label)
                 break
 
-        if not product_perf_clicked:
-            # May already be on product performance after clicking Performance
-            logger.warning("Could not find 'Product Performance' sub-nav — proceeding on current page")
+        if not pe_clicked:
+            logger.warning("Could not find 'Product Expansion' tab — proceeding on current page")
+            _log_visible_links(page)
 
         page.wait_for_load_state('domcontentloaded', timeout=15_000)
-        time.sleep(2)
-        logger.info('URL after navigation: %s', page.url)
+        time.sleep(3)
+        logger.info('URL after Product Expansion click: %s', page.url)
 
-        # ── Step 4: Click Detail tab (not Summary) ────────────────────────────
-        detail_clicked = False
-        for label in ['Detail', 'Detailed', 'Item Level', 'SKU Level']:
-            if _click_by_text(page, label, timeout=5_000) or _click_js(page, label):
-                detail_clicked = True
-                logger.info("Clicked Detail tab: '%s'", label)
-                break
-
-        if not detail_clicked:
-            logger.warning("Could not find Detail tab — proceeding (may already be on Detail view)")
-
-        page.wait_for_load_state('domcontentloaded', timeout=10_000)
-        time.sleep(2)
-
-        # ── Step 5: Set date to today ─────────────────────────────────────────
-        # Blinkit performance detail typically defaults to today or yesterday.
-        # Try to set date picker to today if visible.
-        today_str = date.today().strftime('%d %b %Y')  # e.g. "21 May 2026"
-        date_selectors = [
-            "[class*='datepicker']",
-            "[class*='date-picker']",
-            "input[type='date']",
-            "[class*='DatePicker']",
+        # ── Step 4: Click header checkbox to select ALL products ──────────────
+        # There is a checkbox in the table header row that selects all items.
+        header_cb_selectors = [
+            "thead input[type='checkbox']",
+            "th input[type='checkbox']",
+            "[class*='header'] input[type='checkbox']",
+            "table input[type='checkbox']:first-of-type",
+            "input[type='checkbox']:first-of-type",
         ]
-        for sel in date_selectors:
+        cb_clicked = False
+        for sel in header_cb_selectors:
             try:
                 el = page.locator(sel).first
-                if el.count() and el.is_visible():
-                    # Fill if it's an input, otherwise click and type
-                    el.click()
+                el.wait_for(state='visible', timeout=8_000)
+                el.click()
+                time.sleep(1)
+                logger.info('Clicked header checkbox via: %s', sel)
+                cb_clicked = True
+                break
+            except Exception:
+                continue
+
+        if not cb_clicked:
+            # Fallback: click via JS looking for any unchecked header checkbox
+            try:
+                clicked = page.evaluate("""
+                    () => {
+                        const cb = document.querySelector(
+                            'thead input[type="checkbox"], th input[type="checkbox"]'
+                        );
+                        if (cb && !cb.checked) { cb.click(); return true; }
+                        if (cb) { return true; }  // already checked
+                        return false;
+                    }
+                """)
+                if clicked:
                     time.sleep(1)
-                    logger.info('Date picker opened via: %s', sel)
-                    break
+                    logger.info('Header checkbox clicked via JS fallback')
+                    cb_clicked = True
             except Exception:
-                continue
-        # Don't fail if date picker isn't found — today is usually the default
+                pass
 
-        time.sleep(2)
-
-        # ── Step 6: Download the CSV ──────────────────────────────────────────
-        logger.info('Waiting for download button...')
-        download_selectors = [
-            "button:has-text('Download')",
-            "button:has-text('Export')",
-            "button:has-text('Export CSV')",
-            "button:has-text('Download CSV')",
-            "[aria-label*='download' i]",
-            "[aria-label*='export' i]",
-            "[class*='download' i] button",
-            "a:has-text('Download')",
-            "a:has-text('Export')",
-        ]
-
-        # Wait for any download button to appear
-        download_el = None
-        for sel in download_selectors:
-            try:
-                el = page.locator(sel).first
-                el.wait_for(state='visible', timeout=10_000)
-                download_el = el
-                logger.info('Found download button: %s', sel)
-                break
-            except Exception:
-                continue
-
-        if download_el is None:
+        if not cb_clicked:
             _log_visible_links(page)
             browser.close()
             raise RuntimeError(
-                'Could not find Download/Export button on Product Performance Detail page. '
-                'Run with --headed to debug. The UI may have changed.'
+                'Could not find header checkbox on Product Expansion tab. '
+                'Run with --headed to debug.'
             )
 
+        time.sleep(2)
+
+        # ── Step 5: Open "Reports" dropdown → click "Detailed Report" ─────────
+        # The Reports dropdown is on the top-right of the page.
+        reports_clicked = False
+        for label in ['Reports', 'Report']:
+            if _click_by_text(page, label, timeout=8_000) or _click_js(page, label):
+                reports_clicked = True
+                logger.info("Opened Reports dropdown: '%s'", label)
+                break
+
+        if not reports_clicked:
+            # Try aria/class selectors for a dropdown button
+            for sel in [
+                "button:has-text('Reports')",
+                "[class*='report' i] button",
+                "[aria-label*='report' i]",
+            ]:
+                try:
+                    el = page.locator(sel).first
+                    el.wait_for(state='visible', timeout=5_000)
+                    el.click()
+                    time.sleep(1)
+                    reports_clicked = True
+                    logger.info('Opened Reports dropdown via selector: %s', sel)
+                    break
+                except Exception:
+                    continue
+
+        if not reports_clicked:
+            _log_visible_links(page)
+            browser.close()
+            raise RuntimeError(
+                'Could not find Reports dropdown on Product Expansion tab. '
+                'Run with --headed to debug.'
+            )
+
+        time.sleep(1)
+
+        # ── Step 6: Click "Detailed Report" — this triggers the download ─────
+        # Must be inside expect_download() so Playwright captures the file event.
         today_prefix = date.today().strftime('%Y%m%d')
         expected_name = f'blinkit_performance_detail_{today_prefix}.csv'
+        logger.info('Clicking Detailed Report and waiting for CSV (up to 10 min)...')
 
-        logger.info('Clicking download and capturing file...')
-        with page.expect_download(timeout=90_000) as dl_info:
-            download_el.click()
-            time.sleep(3)
-            # If clicking opened a panel, look for a secondary trigger
+        with page.expect_download(timeout=600_000) as dl_info:  # 10-minute timeout
+            detailed_clicked = False
+            for label in ['Detailed Report', 'Detailed', 'Detail Report']:
+                if _click_by_text(page, label, timeout=5_000) or _click_js(page, label):
+                    detailed_clicked = True
+                    logger.info("Clicked dropdown item: '%s'", label)
+                    break
+
+            if not detailed_clicked:
+                _log_visible_links(page)
+                browser.close()
+                raise RuntimeError(
+                    'Could not find "Detailed Report" in Reports dropdown. '
+                    'Run with --headed to debug.'
+                )
+
+            # If a confirmation modal appears before the download begins
+            time.sleep(5)
             for secondary in [
                 "button:has-text('Download')",
                 "button:has-text('Confirm')",
                 "button:has-text('Export')",
                 "[class*='modal'] button:has-text('Download')",
+                "[class*='modal'] button:has-text('Confirm')",
             ]:
                 try:
                     el2 = page.locator(secondary).first
                     if el2.count() and el2.is_visible():
-                        logger.info('Secondary trigger: %s', secondary)
+                        logger.info('Modal confirm button found: %s', secondary)
                         el2.click()
                         break
                 except Exception:
@@ -365,14 +401,15 @@ def ingest(csv_path: Path, dry_run: bool = False):
     """Run blinkit_performance_loader on the downloaded file."""
     from ingest.blinkit_performance_loader import (
         build_sku_lookup, build_ds_location_lookup, build_wh_location_lookup,
-        process_file
+        build_ds_parent_lookup, process_file
     )
     print(f'\nIngesting: {csv_path.name}')
-    sku_lookup = build_sku_lookup()
-    ds_lookup  = build_ds_location_lookup()
-    wh_lookup  = build_wh_location_lookup()
+    sku_lookup       = build_sku_lookup()
+    ds_lookup        = build_ds_location_lookup()
+    wh_lookup        = build_wh_location_lookup()
+    ds_parent_lookup = build_ds_parent_lookup()
     if not dry_run:
-        process_file(csv_path, sku_lookup, ds_lookup, wh_lookup)
+        process_file(csv_path, sku_lookup, ds_lookup, wh_lookup, ds_parent_lookup)
     else:
         print('  DRY RUN — no DB writes')
 

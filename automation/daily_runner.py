@@ -1,10 +1,13 @@
 """
-Daily automation runner — runs at 12:00 noon IST via Windows Task Scheduler.
+Daily automation runner — runs at 12:01 PM IST via Windows Task Scheduler.
 
 Sequence:
-  12:00  → G1: Amazon SP-API (orders + finances)
-  12:00  → G2: Blinkit scraper (parallel with Amazon)
-  12:15  → G3: WhatsApp briefing (after both complete)
+  12:01  → G1: Amazon SP-API (orders + finances)
+  12:01  → G2: Blinkit scraper (MTD sales)
+  ~12:15 → G3: WhatsApp briefing (after G1 + G2 complete)
+  ~12:15 → G4: Blinkit performance scraper + loader (runs LAST — 7-8 min download)
+  [G5: Blinkit SOH scraper — not yet built, placeholder below]
+  [G6: Blinkit ageing scraper — weekly/Monday, not yet built]
 
 Exit codes:
   0  — success
@@ -150,6 +153,27 @@ def _send_whatsapp(amazon_result: dict, blinkit_result: dict, dry_run: bool) -> 
         logger.error("WhatsApp send failed: %s", exc)
 
 
+def _run_performance() -> dict:
+    """G4: Blinkit performance scraper + loader. Runs last — download takes 7-8 min."""
+    logger.info("Blinkit performance scraper (G4): starting...")
+    proc = subprocess.run(
+        [PYTHON, str(PROJECT / "automation" / "blinkit_performance_scraper.py")],
+        capture_output=True, text=True, cwd=str(PROJECT),
+        env={**os.environ, "TCB_ENV": "prod"},
+        timeout=720,  # 12-minute hard cap (download is 7-8 min + ingest overhead)
+    )
+
+    if proc.returncode == 0:
+        logger.info("Blinkit performance scraper: OK — %s", proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "done")
+        return {"status": "ok"}
+    elif proc.returncode == 2:
+        logger.warning("Blinkit performance session expired — same session as sales scraper.")
+        return {"status": "session_expired"}
+    else:
+        logger.error("Blinkit performance scraper failed (exit %d):\n%s", proc.returncode, proc.stderr[-500:])
+        return {"status": "error", "exit_code": proc.returncode, "stderr": proc.stderr}
+
+
 def run(dry_run: bool = False) -> int:
     """Run full pipeline. Returns exit code."""
     logger.info("=" * 60)
@@ -165,12 +189,16 @@ def run(dry_run: bool = False) -> int:
     # Wait a moment to ensure DB writes are committed before querying for summary
     time.sleep(5)
 
-    # Send WhatsApp briefing
+    # Send WhatsApp briefing (G3) — before the long performance download
     _send_whatsapp(amazon_result, blinkit_result, dry_run=dry_run)
+
+    # G4: Blinkit performance scraper + loader (runs last — 7-8 min download)
+    perf_result = _run_performance()
 
     # Determine exit code + send targeted email alerts for any failures
     amazon_ok  = all(v == "ok" for v in amazon_result.values())
     blinkit_ok = blinkit_result.get("status") == "ok"
+    perf_ok    = perf_result.get("status") == "ok"
 
     try:
         from automation.email_sender import send_alert
@@ -207,18 +235,32 @@ def run(dry_run: bool = False) -> int:
                     f"Log: {log}"
                 ),
             )
+
+        perf_status = perf_result.get("status")
+        if perf_status == "session_expired":
+            # Session already alerted above for sales scraper; just log
+            logger.warning("Performance scraper: same session expiry as sales scraper.")
+        elif perf_status != "ok":
+            send_alert(
+                subject=f"⚠️ Blinkit Performance Scraper — Failed ({today})",
+                body=(
+                    f"Blinkit performance scraper (G4) failed (exit {perf_result.get('exit_code', '?')}).\n\n"
+                    f"{perf_result.get('stderr', '')[:500]}\n\n"
+                    f"Log: {log}"
+                ),
+            )
     except Exception as exc:
         logger.warning("Could not send failure alert email: %s", exc)
 
-    if amazon_ok and blinkit_ok:
+    if amazon_ok and blinkit_ok and perf_ok:
         logger.info("All done — success.")
         return 0
-    elif amazon_ok or blinkit_ok:
-        logger.warning("Partial success — one source failed.")
-        return 1
-    else:
-        logger.error("Both sources failed.")
+    elif not amazon_ok and not blinkit_ok and not perf_ok:
+        logger.error("All sources failed.")
         return 2
+    else:
+        logger.warning("Partial success — one or more sources failed.")
+        return 1
 
 
 if __name__ == "__main__":
