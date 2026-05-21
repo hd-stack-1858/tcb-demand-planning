@@ -1,6 +1,6 @@
 # Sales MIS + Demand Planning System — Build Plan
 
-*Last updated: 18-May 2026*
+*Last updated: 21-May 2026*
 
 ---
 
@@ -29,8 +29,9 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | `automation/daily_runner.py` | Orchestrator — G1 (Amazon) + G2 (Blinkit) + G3 (WhatsApp), logs to automation/logs/. HTTPError exception handler fixed. |
 | Windows Task Scheduler — daily_runner | "Blinkit Sales_Daily Run" — triggers daily_runner.py at 12:01 IST. First run: 16-May-2026. |
 | `automation/fnp_scraper.py` | Playwright scraper — accepts FnP orders, downloads Branding Challan PDF, emails. Live tested 17-May-2026 (3 orders). Runs 11:00/14:00/16:00 IST ✅ Active. |
-| `automation/fc_scraper.py` + `fc_auth.py` | Playwright scraper — accepts FC orders, fills shipment dims, downloads Invoice+PackingSlip PDFs, emails. Dry-run passed 17-May-2026. Runs 10:30/20:00 IST ✅ Active. |
+| `automation/fc_scraper.py` + `fc_auth.py` | Playwright scraper — accepts FC orders, fills shipment dims, downloads Invoice+PackingSlip PDFs, emails. Multi-item order fix 21-May (row-by-row SKU+qty, all Status dropdowns). Runs 10:30/20:00 IST ✅ Active. |
 | `automation/email_sender.py` | SMTP email helper — `send_with_attachments()` + `send_alert()`. `send_alert()` supports `EMAIL_HIMANSHU_ALT` for backup delivery to personal Gmail. |
+| **Blinkit Replenishment (Phase J)** | See section below. Full end-to-end replenishment engine built 21-May-2026. |
 
 ---
 
@@ -45,8 +46,9 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | E | Reorder Integration | 🔲 Pending |
 | F | Vignesh — MCP tool server (9 tools) | ✅ Done |
 | G | Daily Automation — data pipeline + WhatsApp briefing | 🚧 G7 built, needs real-order verification |
-| H | Vignesh as Proactive Agent — memory + scheduling + decision logic | 🚧 Next |
+| H | Vignesh as Proactive Agent — memory + scheduling + decision logic | 🔲 Next |
 | I | Full Autonomy — approval gates, self-monitoring, agent loop | 🔲 Pending |
+| J | Blinkit Replenishment Model | ✅ Done (21-May-2026) — pending items below |
 
 ---
 
@@ -325,9 +327,44 @@ Vignesh: → creates PO in DB, marks SENT, logs decision, sets 3-day follow-up r
 
 ---
 
+## Phase J — Blinkit Replenishment Model ✅ Done (21-May-2026)
+
+Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine computes units to ship per WH × SKU from ADS velocity + inventory snapshot, writes pre-formatted Excel.
+
+### What Was Built
+
+| File | Purpose |
+|------|---------|
+| `tcb/replenishment.py` | Engine + Excel output. `--dry-run` to preview. |
+| `ingest/blinkit_performance_loader.py` | DS master refresh (Pass 0a) + eligibility (Pass 1) + ADS (Pass 2) |
+| `ingest/blinkit_inventory_loader.py` | SOH snapshot loader (run on replenishment day) |
+| `automation/blinkit_performance_scraper.py` | Daily Playwright download of performance CSVs |
+| `setup/22_blinkit_replenishment_tables.sql` | Migration — 5 new tables |
+
+**Formula:** `target_stock = total_ads × 37 (30d coverage + 7d buffer)` | Gate: ₹1.5L per WH
+
+**Excel output (6 sheets):** Overview-SKU, Overview-WH, Ship Now, Full Plan, Summary (per-WH gate), Geo (city breakdown per WH)
+
+**DS master:** 629 active dark stores seeded across 20 WHs. Hash-based DS codes (ES numbers not globally unique). `is_active` synced on every loader run.
+
+### J — Pending Items
+
+| Item | Priority | Notes |
+|------|----------|-------|
+| City callout flag in Excel | High | Add column in Overview flagging `ds_not_launched > 0` as "X cities need panel activation" — agreed 21-May |
+| Daily performance scraper scheduler | High | `blinkit_performance_scraper.py` must run daily — no Task Scheduler job created yet. Data loss is permanent (Blinkit no retroactive access) |
+| Ageing report loader | Medium | `blinkit_ageing_snapshots` table exists, loader not built. Needed for >60 day recall rule |
+| WH-OOS fallback ADS | Low | Explicitly deferred — Himanshu knows affected WHs (Hyd H3) by heart for now |
+| Streamlit tab in tinysteps_app.py | Low | Deferred until CLI fully validated against several real replenishment cycles |
+
+---
+
 ## Build Order Going Forward
 
 ```
+Immediate:
+  J (pending). City callout in replen Excel + daily scraper Task Scheduler job
+
 Track 1 — Forecasting + Reorder (no blockers):
   D. Demand Forecasting Engine (tcb/forecasting.py + Forecast tab in sales_app)
   E. Reorder Integration + Vignesh tool (tcb/reorder.py + Reorder Plan tab)
@@ -372,9 +409,14 @@ Items explicitly decided to skip for now but worth revisiting:
 | `automation/fnp_scraper.py` | ✅ Live. Angular timing + load wait fix 18-May (retry loop, startsWith match) |
 | `automation/email_sender.py` | ✅ Built — SMTP sender, EMAIL_HIMANSHU_ALT backup support added |
 | FnP Task Scheduler jobs | ✅ Active — 11:00, 14:00, 16:00 IST |
-| `automation/fc_scraper.py` + `fc_auth.py` | ✅ Live + tested — email confirmed 18-May (1 real order, PDF sent) |
+| `automation/fc_scraper.py` + `fc_auth.py` | ✅ Live + tested. Multi-item fix 21-May: row-by-row SKU scan, all Status dropdowns set to Accepted, weights summed across items |
 | `automation/fc_dimensions.json` | ✅ All 12 SKUs filled |
 | FC Task Scheduler jobs | ✅ Active — 10:30, 20:00 IST (from 17-May-2026 evening) |
+| `tcb/replenishment.py` | ✅ Phase J — replenishment engine + Excel (6 sheets) |
+| `ingest/blinkit_performance_loader.py` | ✅ Phase J — DS master refresh + eligibility + ADS loader |
+| `ingest/blinkit_inventory_loader.py` | ✅ Phase J — SOH snapshot loader |
+| `automation/blinkit_performance_scraper.py` | ✅ Phase J — daily perf CSV download. ⚠️ Task Scheduler job NOT YET CREATED |
+| `setup/22_blinkit_replenishment_tables.sql` | ✅ Phase J — applied to prod |
 | `automation/vignesh_monitor.py` | 🔲 Phase H2 |
 | `tcb/forecasting.py` | 🔲 Phase D |
 | `tcb/reorder.py` | 🔲 Phase E |
