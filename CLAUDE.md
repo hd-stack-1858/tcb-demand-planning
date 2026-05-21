@@ -107,6 +107,80 @@ When adding a new automation or a new channel: place scraper output in `data/<ch
 
 ---
 
+## Blinkit Replenishment System — Key Rules
+
+Phase H is implemented. Core files: `tcb/replenishment.py` (engine + Excel), `ingest/blinkit_performance_loader.py` (DS master + ADS loader), `ingest/blinkit_inventory_loader.py` (SOH snapshot), `automation/blinkit_performance_scraper.py` (daily Playwright download).
+
+### Blinkit Seller Process (must understand before touching this system)
+
+Launching a SKU in a new city is a **3-step gate**:
+1. **Blinkit panel activation** — Himanshu activates the city/DS in the Blinkit seller panel. Until this happens, Blinkit will NOT send stock to that city's dark stores, even if the WH has it.
+2. **WH stocking** — Ship stock to the supplying WH.
+3. **DS distribution** — Blinkit distributes from WH to activated dark stores automatically.
+
+`ds_not_launched` (status = `launch_awaited`) means step 1 has not been done. Do NOT recommend shipping stock to serve these DS until panel activation is confirmed. Flag them as "Action needed: activate city in Blinkit panel" — not as a pure stock shortage.
+
+### DS Eligibility Status Taxonomy
+
+All status values come from the `Darkstore remark` column in the performance CSV (mapped by keyword rules in the loader):
+
+| Status | Meaning | Include in ADS? |
+|--------|---------|----------------|
+| `active` | DS selling the SKU (`Considered for assessment = Y`) | Yes |
+| `launch_awaited` | City not activated in Blinkit panel | No |
+| `darkstore_closed` | Physical store closed (per-SKU-DS — only set if SKU was live there) | No |
+| `sku_moved_out_low_sales` | SKU redistributed out due to low sales | No |
+| `sku_city_exited` | SKU pulled from that city entirely | No |
+| `sku_recalled` | SKU recalled | No |
+
+`darkstore_closed` is recorded per SKU-DS pair, not per DS. If a store closes and a SKU was never listed there, no `darkstore_closed` row exists for that pair — it simply has no eligibility record.
+
+### ADS Formula
+
+`ADS per DS = SUM(total_orders on non-OOS days) / COUNT(non-OOS days)` within the latest assessment period for that SKU.
+
+Three states:
+- `wh_oos_flag = True` → WH was dry that day → **exclude from denominator AND numerator**
+- `wh_oos_flag = False, orders = 0` → in-stock, no sale → counts as zero-sale day (denominator++)
+- `wh_oos_flag = False, orders > 0` → normal sale day
+
+**WH-OOS blind spot:** If a WH has been out of stock for the entire assessment period, ADS=0 and target_stock=0 — but this means we've never given the WH stock to sell, not that demand is zero. Hyd H3 exhibits this. Requires manual attention or city-average fallback (not yet implemented).
+
+### Replenishment Formula
+
+```
+target_stock = total_ads × (coverage_days + transit_buffer) = total_ads × 37
+units_to_ship = max(0, target_stock − effective_stock)
+effective_stock = wh_soh + units_incoming + units_in_transit
+```
+
+- Coverage = 30 days, transit buffer = 7 days
+- Gate = ₹1.5L invoice value **per WH** (not aggregate)
+- Output: `data/blinkit/auto/replenishment_plan_YYYYMMDD.xlsx` (5 sheets: Overview-SKU, Overview-WH, Ship Now, Full Plan, Summary)
+
+### Performance Data Rules
+
+- **Daily download is mandatory** — Blinkit does not allow retroactive access to past performance data. Missing a day means losing that day's ADS signal permanently.
+- Performance CSV lives in `data/blinkit/manual/product_performance/` (downloaded manually or via `automation/blinkit_performance_scraper.py`)
+- DS master is auto-refreshed from CSVs on every loader run (Pass 0a) — new DS are seeded, `is_active` is synced from latest file
+- **ES numbers are NOT globally unique across cities** — e.g. ES7 exists in both Faridabad and Kochi. DS unique codes use MD5 hash of full name, not ES number alone.
+
+### WH Geography (Blinkit)
+
+| WH Code | WH Name | Key Cities Served |
+|---------|---------|-------------------|
+| BLK_WH_1873 | Bengaluru B3 | Bengaluru + Ballari, Bidar, Hosur, Kurnool (outlying) |
+| BLK_WH_5397 | Bengaluru B5 | Bengaluru + all South India: Kochi, Coimbatore, Mysore, Mangaluru, Trivandrum, Davanagere, Manipal, Chikkamagaluru |
+| BLK_WH_2681 | Coimbatore C1 | Coimbatore (also partially served by B5) |
+| BLK_WH_5096 | Faridabad | Faridabad + NCR south |
+| BLK_WH_2010 | Kundli | NCR north/Haryana |
+| BLK_WH_2576 | Noida N1 | Noida/UP |
+| BLK_WH_3201 | Hyderabad H3 | Hyderabad + surrounding AP/Telangana |
+
+Full 20-WH mapping lives in `_PERF_WH_TO_CODE` dict in `tcb/replenishment.py`.
+
+---
+
 ## Build Phase Status
 
 See `docs/build_plan.md` for full detail and scope per phase. (`docs/build_plan_original.md` has the original v1 plan for reference.)
@@ -120,3 +194,24 @@ See `docs/build_plan.md` for full detail and scope per phase. (`docs/build_plan_
 | E | Reorder Integration | 🔲 Pending |
 | F | MCP Server — Claude Desktop integration | 🔲 Pending |
 | G | (Details lost — ask Himanshu to recall) | ❓ Unknown |
+| H | Blinkit Replenishment Model | 🔲 Next — see `docs/blinkit_replenishment.md` |
+
+---
+
+## Skill routing
+
+When the user's request matches an available skill, invoke it via the Skill tool. When in doubt, invoke the skill.
+
+Key routing rules:
+- Product ideas/brainstorming → invoke /office-hours
+- Strategy/scope → invoke /plan-ceo-review
+- Architecture → invoke /plan-eng-review
+- Design system/plan review → invoke /design-consultation or /plan-design-review
+- Full review pipeline → invoke /autoplan
+- Bugs/errors → invoke /investigate
+- QA/testing site behavior → invoke /qa or /qa-only
+- Code review/diff check → invoke /review
+- Visual polish → invoke /design-review
+- Ship/deploy/PR → invoke /ship or /land-and-deploy
+- Save progress → invoke /context-save
+- Resume context → invoke /context-restore
