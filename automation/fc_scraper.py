@@ -6,16 +6,16 @@ Flow per run:
   1. Load saved session (from fc_auth.py) — no reCAPTCHA needed
   2. Navigate to Pending Orders
   3. For each pending order (one by one):
-       a. Click gear icon → new tab opens (B2C Configure Order)
+       a. Click gear icon -> new tab opens (B2C Configure Order)
        b. Check header checkbox (select all items)
-       c. Set Status → "Accepted"
-       d. Set Select Shipment → "New Shipment"
+       c. Set Status -> "Accepted"
+       d. Set Select Shipment -> "New Shipment"
        e. Click "Send Item in Po"
        f. Fill Weight / Select Box / Length / Breadth / Height from fc_dimensions.json
        g. Click Save
        h. Handle "No Records Found" popup if present (click OK)
-       i. Click "Print Invoice" → download PDF
-       j. Click "Print Address" → download PDF
+       i. Click "Print Invoice" -> download PDF
+       j. Click "Print Address" -> download PDF
        k. Close configure tab
   4. Email all downloaded PDFs (Invoice + Packing Slip for each order) to Himanshu + Dilwar
 
@@ -146,7 +146,7 @@ def _get_pending_count(page) -> int:
         # Format: "Pending Orders [ B2C : 1 & B2B : 0 ]"
         b2c = re.search(r'B2C\s*:\s*(\d+)', heading)
         count = int(b2c.group(1)) if b2c else -1
-        logger.info("Pending Orders heading: '%s' → B2C count: %d", heading.strip(), count)
+        logger.info("Pending Orders heading: '%s' -> B2C count: %d", heading.strip(), count)
         return count
     except Exception as exc:
         logger.warning("Could not read pending count: %s", exc)
@@ -156,7 +156,7 @@ def _get_pending_count(page) -> int:
 # ── Row-level parsing helpers ─────────────────────────────────────────────────
 
 def _parse_fc_order_date(raw: str) -> date | None:
-    """Parse '19-05-2026 19:45:55' or '19-05-2026' → date. Returns None on failure."""
+    """Parse '19-05-2026 19:45:55' or '19-05-2026' -> date. Returns None on failure."""
     try:
         return datetime.strptime(raw.strip(), "%d-%m-%Y %H:%M:%S").date()
     except ValueError:
@@ -253,7 +253,7 @@ def _download_pdf_link(tab, link_text: str, dest: Path) -> Path:
         if download.failure():
             raise RuntimeError(f"Download failed: {download.failure()}")
         download.save_as(str(dest))
-        logger.info("Downloaded '%s' → %s (%d bytes)", link_text, dest.name, dest.stat().st_size)
+        logger.info("Downloaded '%s' -> %s (%d bytes)", link_text, dest.name, dest.stat().st_size)
         return dest
     except Exception:
         pass
@@ -274,7 +274,7 @@ def _download_pdf_link(tab, link_text: str, dest: Path) -> Path:
         resp = requests.get(pdf_url, cookies=cookies, timeout=30)
         resp.raise_for_status()
         dest.write_bytes(resp.content)
-        logger.info("Downloaded '%s' via new-tab → %s (%d bytes)", link_text, dest.name, len(resp.content))
+        logger.info("Downloaded '%s' via new-tab -> %s (%d bytes)", link_text, dest.name, len(resp.content))
         return dest
     except Exception as exc:
         raise RuntimeError(f"Could not download '{link_text}': {exc}") from exc
@@ -299,51 +299,77 @@ def _process_one_order(context, gear_icon, order_id: str) -> tuple[list[Path], d
     logger.info("Order %s: configure tab opened. URL: %s", order_id, tab.url)
 
     try:
-        # ── Read Style Code (to look up dimensions) ───────────────────────────
+        # ── Read all line items (SKU + qty per row) ──────────────────────────────
         # Wait for the table to render before scanning
         tab.wait_for_selector("table td", timeout=15_000)
         time.sleep(1)
 
         import re
-        style_code = ""
-        all_cells = tab.locator("table td")
-        logger.info("Order %s: scanning %d table cells for TCB style code...", order_id, all_cells.count())
-        for i in range(all_cells.count()):
-            try:
-                cell_text = all_cells.nth(i).inner_text().strip()
-                logger.debug("Order %s: cell[%d] = '%s'", order_id, i, cell_text)
-                if re.match(r'^TCB\d+$', cell_text, re.IGNORECASE):
-                    style_code = cell_text.upper()
-                    logger.info("Order %s: found style_code='%s' in cell[%d]", order_id, style_code, i)
-                    break
-            except Exception:
-                continue
 
-        if not style_code:
-            # Log all cell contents to help diagnose
-            all_texts = []
-            for i in range(min(all_cells.count(), 30)):
+        # Scan row-by-row so we can associate qty with its SKU
+        order_items: list[dict] = []  # [{sku_id, qty}, ...]
+        body_rows = tab.locator("tbody tr")
+        total_cells = tab.locator("table td")
+        logger.info("Order %s: scanning %d rows / %d cells for TCB line items...",
+                    order_id, body_rows.count(), total_cells.count())
+
+        for row_i in range(body_rows.count()):
+            row_el = body_rows.nth(row_i)
+            cells = row_el.locator("td")
+            cell_count = cells.count()
+            row_sku = ""
+            for ci in range(cell_count):
                 try:
-                    all_texts.append(f"[{i}]='{all_cells.nth(i).inner_text().strip()}'")
+                    cell_text = cells.nth(ci).inner_text().strip()
+                    if re.match(r'^TCB\d+$', cell_text, re.IGNORECASE):
+                        row_sku = cell_text.upper()
+                        # Look for qty in the next few cells after the SKU
+                        row_qty = 1
+                        for qi in range(ci + 1, min(ci + 6, cell_count)):
+                            qt = cells.nth(qi).inner_text().strip()
+                            if qt.isdigit() and 1 <= int(qt) <= 50:
+                                row_qty = int(qt)
+                                break
+                        order_items.append({"sku_id": row_sku, "qty": row_qty})
+                        logger.info("Order %s: row[%d] -> sku=%s qty=%d",
+                                    order_id, row_i, row_sku, row_qty)
+                        break  # one SKU per row
+                except Exception:
+                    continue
+
+        if not order_items:
+            # Fallback: scan all cells flat for any TCB code
+            for i in range(total_cells.count()):
+                try:
+                    cell_text = total_cells.nth(i).inner_text().strip()
+                    if re.match(r'^TCB\d+$', cell_text, re.IGNORECASE):
+                        order_items.append({"sku_id": cell_text.upper(), "qty": 1})
+                        logger.warning("Order %s: fallback flat-scan found %s (qty assumed 1)",
+                                       order_id, cell_text.upper())
+                except Exception:
+                    continue
+
+        if not order_items:
+            all_texts = []
+            for i in range(min(total_cells.count(), 30)):
+                try:
+                    all_texts.append(f"[{i}]='{total_cells.nth(i).inner_text().strip()}'")
                 except Exception:
                     pass
-            logger.error("Order %s: style_code not found. First 30 cells: %s", order_id, ", ".join(all_texts))
-            raise ValueError(f"Could not read Style Code for order {order_id}")
+            logger.error("Order %s: no TCB SKU found. First 30 cells: %s",
+                         order_id, ", ".join(all_texts))
+            raise ValueError(f"Could not read any SKU for order {order_id}")
 
-        dims = _get_dims(style_code)
-        logger.info("Order %s: dims=%s", order_id, dims)
-
-        # ── Read Qty (scan for small standalone integer in table cells) ───────
-        qty = 1
-        for i in range(min(all_cells.count(), 50)):
-            try:
-                txt = all_cells.nth(i).inner_text().strip()
-                if txt.isdigit() and 1 <= int(txt) <= 50:
-                    qty = int(txt)
-                    logger.info("Order %s: qty=%d (cell[%d])", order_id, qty, i)
-                    break
-            except Exception:
-                continue
+        # Compute shipment dims: sum weight across all items × qty, share L/B/H from primary SKU
+        primary_sku = order_items[0]["sku_id"]
+        primary_dims = _get_dims(primary_sku)
+        total_weight = sum(_get_dims(it["sku_id"])["weight_kg"] * it["qty"] for it in order_items)
+        dims = {**primary_dims, "weight_kg": round(total_weight, 3)}
+        if len(order_items) > 1:
+            logger.warning("Order %s: MULTI-ITEM ORDER — %d line items: %s. "
+                           "Combined weight=%.3f kg, L/B/H from %s.",
+                           order_id, len(order_items), order_items, total_weight, primary_sku)
+        logger.info("Order %s: shipment dims=%s", order_id, dims)
 
         # ── Step 1: Check header checkbox (select all items) ──────────────────
         header_cb = tab.locator("th input[type='checkbox'], thead input[type='checkbox']").first
@@ -352,21 +378,28 @@ def _process_one_order(context, gear_icon, order_id: str) -> tuple[list[Path], d
             time.sleep(0.5)
             logger.info("Order %s: header checkbox checked.", order_id)
         else:
-            # Click individual row checkbox
             row_cb = tab.locator("tbody td input[type='checkbox']").first
             row_cb.check()
             time.sleep(0.5)
 
-        # ── Step 2: Set Status → "Accepted" ───────────────────────────────────
-        # The Status column is the last <select> in the table rows
-        # Use the one that currently shows "Select" (not yet set)
-        status_select = tab.locator("td select, table select").first
-        status_select.wait_for(timeout=10_000)
-        status_select.select_option(label="Accepted")
-        time.sleep(0.5)
-        logger.info("Order %s: status set to Accepted.", order_id)
+        # ── Step 2: Set Status -> "Accepted" on EVERY item row ─────────────────
+        # tbody-scoped selector avoids catching the "Select Shipment" dropdown below the table.
+        # Multi-item orders have one Status <select> per row — all must be Accepted or FC
+        # won't generate the PO panel after "Send Item in Po".
+        row_status_selects = tab.locator("tbody tr td select")
+        n_status = row_status_selects.count()
+        if n_status == 0:
+            raise RuntimeError(f"Order {order_id}: no Status dropdowns found in table rows.")
+        logger.info("Order %s: setting Accepted on %d Status dropdown(s).", order_id, n_status)
+        for si in range(n_status):
+            try:
+                row_status_selects.nth(si).select_option(label="Accepted")
+                time.sleep(0.3)
+                logger.info("Order %s: Status[%d] -> Accepted.", order_id, si)
+            except Exception as exc:
+                logger.warning("Order %s: could not set Status[%d]: %s", order_id, si, exc)
 
-        # ── Step 3: Set Select Shipment → "New Shipment" ──────────────────────
+        # ── Step 3: Set Select Shipment -> "New Shipment" ──────────────────────
         # "Select Shipment" dropdown is below the table (not inside it)
         shipment_select = tab.locator("select").filter(
             has=tab.locator("option:has-text('New Shipment')")
@@ -457,8 +490,8 @@ def _process_one_order(context, gear_icon, order_id: str) -> tuple[list[Path], d
                 break
 
         # Which fields to fill depends on packaging choice:
-        # NonFCPackaging → Weight + Length + Breadth + Height
-        # Box No 4       → Weight only (L/B/H auto-filled by FC portal)
+        # NonFCPackaging -> Weight + Length + Breadth + Height
+        # Box No 4       -> Weight only (L/B/H auto-filled by FC portal)
         if packaging_mode == "box4":
             dim_values = [("weight_kg", dims["weight_kg"])]
         else:
@@ -581,7 +614,7 @@ def _process_one_order(context, gear_icon, order_id: str) -> tuple[list[Path], d
         raise
 
     tab.close()
-    return [invoice_path, address_path], {"sku_id": style_code, "qty": qty}
+    return [invoice_path, address_path], order_items
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
@@ -704,27 +737,37 @@ def run(dry_run: bool = False, headed: bool = False, no_email: bool = False) -> 
                             order_id, row_index, order_date, city)
 
                 try:
-                    pdfs, order_info = _process_one_order(ctx, gear_icon, order_id)
+                    pdfs, order_items_list = _process_one_order(ctx, gear_icon, order_id)
                     all_pdfs.extend(pdfs)
                     result["orders_processed"] += 1
                     result["pdfs_downloaded"] += len(pdfs)
                     processed_ids.add(order_id)
-                    db_status = _record_fc_order(
-                        order_id, order_info["sku_id"], order_info["qty"],
-                        city, order_date, dry_run,
-                    )
-                    result["order_details"].append({
-                        "order_id":   order_id,
-                        "sku_id":     order_info["sku_id"],
-                        "qty":        order_info["qty"],
-                        "city":       city,
-                        "order_date": order_date.isoformat() if order_date else None,
-                        "db_status":  db_status,
-                    })
-                    logger.info("Order %s: done. PDFs=%d DB=%s", order_id, len(pdfs), db_status)
+                    for item in order_items_list:
+                        db_status = _record_fc_order(
+                            order_id, item["sku_id"], item["qty"],
+                            city, order_date, dry_run,
+                        )
+                        result["order_details"].append({
+                            "order_id":   order_id,
+                            "sku_id":     item["sku_id"],
+                            "qty":        item["qty"],
+                            "city":       city,
+                            "order_date": order_date.isoformat() if order_date else None,
+                            "db_status":  db_status,
+                        })
+                        logger.info("Order %s/%s: done. PDFs=%d DB=%s",
+                                    order_id, item["sku_id"], len(pdfs), db_status)
                 except Exception as exc:
                     logger.error("Order %s: FAILED — %s", order_id, exc)
                     processed_ids.add(order_id)  # mark as attempted, skip on next loop
+                    result["order_details"].append({
+                        "order_id":   order_id,
+                        "sku_id":     "?",
+                        "qty":        "?",
+                        "city":       city,
+                        "order_date": order_date.isoformat() if order_date else None,
+                        "db_status":  f"FAILED: {exc}",
+                    })
 
                 # Brief pause between orders
                 time.sleep(2)
@@ -794,7 +837,7 @@ def run(dry_run: bool = False, headed: bool = False, no_email: bool = False) -> 
             f"{n} First Cry order(s) processed on {today}.\n\n"
             f"Orders recorded to DB:\n"
             f"{db_block}\n\n"
-            f"If anything above looks wrong, fix it in Warehouse App → Ship Out "
+            f"If anything above looks wrong, fix it in Warehouse App -> Ship Out "
             f"before end of day.\n\n"
             f"Attachments: Invoice + Packing Slip for each order.\n\n"
             f"— Vignesh (automated)\n"
