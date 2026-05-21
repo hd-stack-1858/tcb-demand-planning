@@ -45,7 +45,7 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | D | Demand Forecasting Engine | 🔲 Pending |
 | E | Reorder Integration | 🔲 Pending |
 | F | Vignesh — MCP tool server (9 tools) | ✅ Done |
-| G | Daily Automation — data pipeline + WhatsApp briefing | 🚧 G7 built, needs real-order verification |
+| G | Daily Automation — data pipeline + WhatsApp briefing | ✅ Done |
 | H | Vignesh as Proactive Agent — memory + scheduling + decision logic | 🔲 Next |
 | I | Full Autonomy — approval gates, self-monitoring, agent loop | 🔲 Pending |
 | J | Blinkit Replenishment Model | ✅ Done (21-May-2026) — pending items below |
@@ -218,7 +218,7 @@ Playwright-based. Loads saved session → processes each pending B2C order (acce
 - Schedule: 10:30 IST + 20:00 IST via Windows Task Scheduler ✅ Active (from 17-May-2026 evening)
 - Email test passed 18-May-2026: 10:30 run picked up 1 real order, PDF downloaded and emailed ✅
 
-### G7 — FnP + FC Layer 1 order recording 🚧 Built — Needs verification with real orders
+### G7 — FnP + FC Layer 1 order recording ✅ Done
 
 **Goal:** Complete the automation loop — scrapers accept orders, email PDFs, AND now auto-record each sale to DB (orders table + inventory decrement) so Sales MIS has same-day data without manual Ship Out.
 
@@ -234,8 +234,7 @@ Playwright-based. Loads saved session → processes each pending B2C order (acce
 **Verification status:**
 - **FC: ✅ Live-tested 19-May-2026** — order 13812306MQDC22099B (TCB010, qty=1, New Delhi, 2026-05-19). Order Date and City read from table row. Box No 4 fallback triggered (NonFCPackaging Material removed by FC). Weight-only fill worked. PDFs downloaded. DB recorded. Email sent.
   - Note: `NonFCPackaging Material` option appears to be permanently removed from FC portal. If it returns, scraper will use it automatically. If absent for many more days, clean up the dead primary path.
-- **FnP: ⚠️ Pending** — Check next real order log for `Order row extraction: N row(s)`. If `sku_raw=None`, the portal shows a product name format not in `_FNP_PRODUCT_TO_SKU` — add it from the `cells=` log line. Check email body shows correct DB status.
-- After first FnP order: verify record appears in Sales MIS dashboard.
+- **FnP: ✅ Verified (22-May-2026)** — Live-tested with real orders. Order extraction, DB recording, and email body (with DB status column) all confirmed working.
 
 **Safety properties:**
 - Duplicate-check before every DB write — safe on retry runs
