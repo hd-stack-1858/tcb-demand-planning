@@ -1,6 +1,6 @@
 # Sales MIS + Demand Planning System — Build Plan
 
-*Last updated: 21-May 2026*
+*Last updated: 22-May 2026*
 
 ---
 
@@ -26,7 +26,7 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | `automation/blinkit_scraper.py` + `blinkit_auth.py` | Playwright scraper — logs into Blinkit portal, downloads last-7d XLSX, ingests to DB. Headless timing fixed 17-May (sleep 8s, selector timeout 10s). |
 | `automation/whatsapp.py` | Meta Cloud API sender — daily briefing to Himanshu + Shubhra. Newline sanitization added (flattens `\n` → ` | ` before API call). Live tested 17-May-2026. |
 | `automation/daily_summary.py` | Queries yesterday's orders, formats WhatsApp message. PENDING orders included in unit count (matches MIS). |
-| `automation/daily_runner.py` | Orchestrator — G1 (Amazon) + G2 (Blinkit) + G3 (WhatsApp), logs to automation/logs/. HTTPError exception handler fixed. |
+| `automation/daily_runner.py` | Orchestrator — G1 (Amazon) + G2 (Blinkit sales) + G3 (WhatsApp) + G4 (Blinkit performance scraper, runs last ~20 min). Logs to automation/logs/. HTTPError exception handler fixed. |
 | Windows Task Scheduler — daily_runner | "Blinkit Sales_Daily Run" — triggers daily_runner.py at 12:01 IST. First run: 16-May-2026. |
 | `automation/fnp_scraper.py` | Playwright scraper — accepts FnP orders, downloads Branding Challan PDF, emails. Live tested 17-May-2026 (3 orders). Runs 11:00/14:00/16:00 IST ✅ Active. |
 | `automation/fc_scraper.py` + `fc_auth.py` | Playwright scraper — accepts FC orders, fills shipment dims, downloads Invoice+PackingSlip PDFs, emails. Multi-item order fix 21-May (row-by-row SKU+qty, all Status dropdowns). Runs 10:30/20:00 IST ✅ Active. |
@@ -352,8 +352,9 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 | Item | Priority | Notes |
 |------|----------|-------|
 | City callout flag in Excel | High | Add column in Overview flagging `ds_not_launched > 0` as "X cities need panel activation" — agreed 21-May |
-| Daily performance scraper scheduler | High | `blinkit_performance_scraper.py` must run daily — no Task Scheduler job created yet. Data loss is permanent (Blinkit no retroactive access) |
-| Ageing report loader | Medium | `blinkit_ageing_snapshots` table exists, loader not built. Needed for >60 day recall rule |
+| ~~Daily performance scraper scheduler~~ | ~~High~~ | ✅ Done 22-May — wired into `daily_runner.py` as G4 (runs last, 12-min timeout). No separate Task Scheduler job needed. |
+| Blinkit SOH scraper (G5) | Medium | Portal flow not yet shown. Will be wired into daily_runner after G4. |
+| Blinkit ageing scraper (G6, weekly) | Medium | Portal flow not yet shown. Weekly (Mondays). `blinkit_ageing_snapshots` table exists, loader not built. Needed for >60 day recall rule. |
 | WH-OOS fallback ADS | Low | Explicitly deferred — Himanshu knows affected WHs (Hyd H3) by heart for now |
 | Streamlit tab in tinysteps_app.py | Low | Deferred until CLI fully validated against several real replenishment cycles |
 
@@ -363,7 +364,7 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 
 ```
 Immediate:
-  J (pending). City callout in replen Excel + daily scraper Task Scheduler job
+  J (pending). City callout in replen Excel + SOH scraper (G5) + ageing scraper (G6, weekly)
 
 Track 1 — Forecasting + Reorder (no blockers):
   D. Demand Forecasting Engine (tcb/forecasting.py + Forecast tab in sales_app)
@@ -415,7 +416,7 @@ Items explicitly decided to skip for now but worth revisiting:
 | `tcb/replenishment.py` | ✅ Phase J — replenishment engine + Excel (6 sheets) |
 | `ingest/blinkit_performance_loader.py` | ✅ Phase J — DS master refresh + eligibility + ADS loader |
 | `ingest/blinkit_inventory_loader.py` | ✅ Phase J — SOH snapshot loader |
-| `automation/blinkit_performance_scraper.py` | ✅ Phase J — daily perf CSV download. ⚠️ Task Scheduler job NOT YET CREATED |
+| `automation/blinkit_performance_scraper.py` | ✅ Phase J — daily perf CSV download. Wired into daily_runner.py (G4, 22-May). Navigation fixed: Product Expansion tab → header checkbox → Reports → Detailed Report. 10-min download timeout. |
 | `setup/22_blinkit_replenishment_tables.sql` | ✅ Phase J — applied to prod |
 | `automation/vignesh_monitor.py` | 🔲 Phase H2 |
 | `tcb/forecasting.py` | 🔲 Phase D |
