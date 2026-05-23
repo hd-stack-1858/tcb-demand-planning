@@ -25,7 +25,6 @@ Usage:
 """
 
 import os
-import re
 import sys
 import argparse
 from datetime import date, timedelta
@@ -192,13 +191,13 @@ def load_wh_locations() -> pd.DataFrame:
 
 def load_ds_locations() -> pd.DataFrame:
     rows = _sb_execute(lambda: sb.table('partner_locations')
-                       .select('location_id, name, code, parent_location_id')
+                       .select('location_id, name, code, parent_location_id, city')
                        .eq('location_type', 'DARKSTORE')
                        .eq('channel_id', BLINKIT_CHANNEL_ID)
                        .eq('is_active', True)
                        .execute().data)
     return pd.DataFrame(rows) if rows else pd.DataFrame(
-        columns=['location_id', 'name', 'code', 'parent_location_id'])
+        columns=['location_id', 'name', 'code', 'parent_location_id', 'city'])
 
 
 def load_excluded_ds_skus() -> set[tuple]:
@@ -623,15 +622,6 @@ def compute_overview(
 
 # ── Geo Summary ────────────────────────────────────────────────────────────────
 
-# Extract city from DS name: strip prefix (LT / SS / ES / Super Store), take first word.
-_CITY_RE = re.compile(r'^(?:Super\s+Store|LT|SS|ES)\s+(\S+)', re.IGNORECASE)
-
-
-def _ds_city(name: str) -> str:
-    m = _CITY_RE.match(name.strip())
-    return m.group(1) if m else name.strip().split()[0]
-
-
 def compute_geo_summary(wh_df: pd.DataFrame, eligibility_df: pd.DataFrame) -> pd.DataFrame:
     """
     One row per WH. Columns:
@@ -642,7 +632,7 @@ def compute_geo_summary(wh_df: pd.DataFrame, eligibility_df: pd.DataFrame) -> pd
     # Load all DS regardless of is_active
     all_ds_rows = _paginate(
         'partner_locations',
-        'location_id,name,parent_location_id',
+        'location_id,name,city,parent_location_id',
         location_type='DARKSTORE',
         channel_id=BLINKIT_CHANNEL_ID,
     )
@@ -650,7 +640,12 @@ def compute_geo_summary(wh_df: pd.DataFrame, eligibility_df: pd.DataFrame) -> pd
         return pd.DataFrame()
     all_ds = pd.DataFrame(all_ds_rows)
     all_ds['parent_location_id'] = all_ds['parent_location_id'].astype('Int64')
-    all_ds['city'] = all_ds['name'].apply(_ds_city)
+    # Use city stored in DB (populated from performance CSV "Delivery City" column).
+    # Fall back to first word of DS name for any rows where city is still NULL.
+    all_ds['city'] = all_ds.apply(
+        lambda r: r['city'] if r['city'] else r['name'].strip().split()[0],
+        axis=1,
+    )
 
     # DS sets from eligibility
     closed_ds  = set(eligibility_df.loc[eligibility_df['status'] == 'darkstore_closed', 'location_id'])
@@ -665,16 +660,24 @@ def compute_geo_summary(wh_df: pd.DataFrame, eligibility_df: pd.DataFrame) -> pd
         total_ds   = len(wh_ds)
         ds_closed  = int(wh_ds['location_id'].isin(closed_ds).sum())
 
-        # Cities from all DS under this WH
-        all_cities  = sorted(wh_ds['city'].unique())
+        # Non-closed DS count per city (for the "(N)" annotation)
+        non_closed_ds = wh_ds[~wh_ds['location_id'].isin(closed_ds)]
+        city_open_count = non_closed_ds.groupby('city')['location_id'].nunique().to_dict()
+
+        def _city_label(city: str) -> str:
+            n = city_open_count.get(city, 0)
+            return f"{city} ({n})" if n else city
+
+        # Cities from all DS under this WH (with non-closed DS count)
+        all_cities  = [_city_label(c) for c in sorted(wh_ds['city'].unique())]
 
         # DS with ≥1 active SKU → live cities
         live_mask   = wh_ds['location_id'].map(lambda x: active_skus_per_ds.get(x, 0) >= 1)
-        live_cities = sorted(wh_ds.loc[live_mask, 'city'].unique())
+        live_cities = [_city_label(c) for c in sorted(wh_ds.loc[live_mask, 'city'].unique())]
 
         # DS with ≥6 active SKUs → major-presence cities
         big_mask    = wh_ds['location_id'].map(lambda x: active_skus_per_ds.get(x, 0) >= 6)
-        big_cities  = sorted(wh_ds.loc[big_mask, 'city'].unique())
+        big_cities  = [_city_label(c) for c in sorted(wh_ds.loc[big_mask, 'city'].unique())]
 
         rows.append({
             'wh_name':           wh['name'],

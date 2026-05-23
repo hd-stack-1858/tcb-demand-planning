@@ -214,46 +214,62 @@ def _ds_code(name: str) -> str:
 
 # ── Pass 0a: seed DS master from performance file ──────────────────────────────
 
-def scan_ds_from_files(files: list[Path]) -> tuple[dict[str, str], set[str]]:
+def scan_ds_from_files(files: list[Path]) -> tuple[dict[str, str], dict[str, str], set[str]]:
     """
-    Quick 2-column scan of all performance CSVs.
+    Quick 3-column scan of all performance CSVs.
     Returns:
       ds_to_wh_name: {ds_name → serving_wh_name}  (latest WH per DS name wins)
+      ds_to_city:    {ds_name → delivery_city}     (latest city per DS name wins)
       latest_ds:     set of DS names in the chronologically latest file
     """
-    all_pairs:  list[tuple[str, str, str]] = []   # (filename, ds_name, wh_name)
+    all_pairs:  list[tuple[str, str, str, str]] = []   # (filename, ds_name, wh_name, city)
     for fpath in files:
         try:
             hdr = pd.read_csv(fpath, nrows=0)
             hdr.columns = [c.strip() for c in hdr.columns]
             if not REQUIRED_COLS.issubset(set(hdr.columns)):
                 continue
-            df = pd.read_csv(fpath, usecols=['Darkstore name', 'Serving warehouse'],
-                             low_memory=False)
+            col_names = set(hdr.columns)
+            city_col = 'City' if 'City' in col_names else (
+                       'Delivery City' if 'Delivery City' in col_names else None)
+            cols = ['Darkstore name', 'Serving warehouse']
+            if city_col:
+                cols.append(city_col)
+            df = pd.read_csv(fpath, usecols=cols, low_memory=False)
             df.columns = [c.strip() for c in df.columns]
-            df = df.dropna()
-            for ds, wh in zip(df['Darkstore name'], df['Serving warehouse']):
-                all_pairs.append((fpath.name, str(ds).strip(), str(wh).strip()))
+            df = df.dropna(subset=['Darkstore name', 'Serving warehouse'])
+            for _, row in df.iterrows():
+                city = str(row.get(city_col, '') or '').strip() if city_col else ''
+                all_pairs.append((
+                    fpath.name,
+                    str(row['Darkstore name']).strip(),
+                    str(row['Serving warehouse']).strip(),
+                    city,
+                ))
         except Exception:
             continue
 
     if not all_pairs:
-        return {}, set()
+        return {}, {}, set()
 
     # Latest file DS list (for is_active=False logic)
     latest_file = sorted({p[0] for p in all_pairs})[-1]
     latest_ds   = {p[1] for p in all_pairs if p[0] == latest_file}
 
-    # ds_name → WH name (latest file wins, then alphabetically last)
-    ds_to_wh: dict[str, str] = {}
-    for fname, ds, wh in sorted(all_pairs, key=lambda x: x[0]):
-        ds_to_wh[ds] = wh   # later (later filename) overwrites
+    # ds_name → WH name and city (latest file wins, then alphabetically last)
+    ds_to_wh:   dict[str, str] = {}
+    ds_to_city: dict[str, str] = {}
+    for fname, ds, wh, city in sorted(all_pairs, key=lambda x: x[0]):
+        ds_to_wh[ds] = wh
+        if city:
+            ds_to_city[ds] = city
 
-    return ds_to_wh, latest_ds
+    return ds_to_wh, ds_to_city, latest_ds
 
 
 def refresh_ds_master(ds_to_wh_name: dict[str, str], wh_lookup: dict,
-                      ds_lookup: dict) -> int:
+                      ds_lookup: dict,
+                      ds_to_city: dict[str, str] | None = None) -> int:
     """
     Seed any DS that appear in the performance file but are missing from
     partner_locations.  Never deletes or deactivates — only inserts.
@@ -287,6 +303,8 @@ def refresh_ds_master(ds_to_wh_name: dict[str, str], wh_lookup: dict,
         if code in existing_codes:
             continue  # code collision — DS already exists under a different name variant
 
+        city = (ds_to_city or {}).get(ds_name) or None
+
         new_rows.append({
             'channel_id':         4,
             'location_type':      'DARKSTORE',
@@ -295,6 +313,7 @@ def refresh_ds_master(ds_to_wh_name: dict[str, str], wh_lookup: dict,
             'parent_location_id': wh_id,
             'is_active':          True,
             'external_id':        None,
+            'city':               city,
         })
         existing_codes.add(code)   # prevent duplicate within this batch
 
@@ -308,6 +327,39 @@ def refresh_ds_master(ds_to_wh_name: dict[str, str], wh_lookup: dict,
         print(f'  [WARN] Pass 0a: {len(skipped_wh)} WH names not in WH_PERF_TO_CODE (DS skipped): '
               f'{sorted(skipped_wh)}')
     return inserted
+
+
+def update_ds_cities(ds_to_city: dict[str, str], ds_lookup: dict) -> int:
+    """
+    For every DS with a known city from the performance CSV, update
+    partner_locations.city if it is currently NULL or different.
+    Returns count of rows updated.
+    """
+    if not ds_to_city:
+        return 0
+
+    # Fetch current city values for all Blinkit DS
+    rows = sb.table('partner_locations') \
+             .select('location_id, name, city') \
+             .eq('location_type', 'DARKSTORE') \
+             .eq('channel_id', 4) \
+             .execute().data
+    current_city: dict[int, str | None] = {r['location_id']: r.get('city') for r in rows}
+
+    updated = 0
+    for ds_name, city in ds_to_city.items():
+        if not city:
+            continue
+        loc_id = ds_lookup.get(ds_name.lower()) or ds_lookup.get(_bare_name(ds_name))
+        if not loc_id:
+            continue
+        if current_city.get(loc_id) == city:
+            continue  # already correct
+        sb.table('partner_locations').update({'city': city}) \
+          .eq('location_id', loc_id).execute()
+        updated += 1
+
+    return updated
 
 
 def update_is_active(latest_ds_names: set[str], ds_lookup: dict,
@@ -615,8 +667,9 @@ def main():
     # Pass 0a: seed missing DS from performance files into partner_locations
     if not args.dry_run:
         print('\nPass 0a: refreshing DS master from performance files...')
-        ds_to_wh_name, latest_ds = scan_ds_from_files(files)
-        new_ds_count = refresh_ds_master(ds_to_wh_name, wh_lookup, ds_lookup)
+        ds_to_wh_name, ds_to_city, latest_ds = scan_ds_from_files(files)
+        new_ds_count = refresh_ds_master(ds_to_wh_name, wh_lookup, ds_lookup,
+                                         ds_to_city=ds_to_city)
         if new_ds_count:
             print(f'  Inserted {new_ds_count} new DS into partner_locations')
             # Rebuild lookup so subsequent passes see the new DS
@@ -625,6 +678,8 @@ def main():
             print(f'  Dark stores (updated): {len(ds_lookup)}')
         else:
             print(f'  No new DS found')
+        city_updated = update_ds_cities(ds_to_city, ds_lookup)
+        print(f'  City backfill: {city_updated} DS city values updated')
 
     print(f'\nFiles to process: {len(files)}')
     total_ins = 0
