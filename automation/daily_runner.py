@@ -6,7 +6,8 @@ Sequence:
   12:01  → G2: Blinkit scraper (MTD sales)
   ~12:15 → G3: WhatsApp briefing (after G1 + G2 complete)
   ~12:15 → G4: Blinkit SOH scraper + ingest (immediate download, ~30 sec)
-  ~12:16 → G5: Blinkit performance scraper + loader (runs LAST — 7-8 min download)
+  ~12:16 → G5: Blinkit performance scraper + loader (7-8 min download)
+  ~12:25 → G6: Dev DB ping (keep Supabase free-tier active — prevent 7-day auto-pause)
 
 Exit codes:
   0  — success
@@ -194,6 +195,31 @@ def _run_performance() -> dict:
         return {"status": "error", "exit_code": proc.returncode, "stderr": proc.stderr}
 
 
+def _ping_dev_db() -> None:
+    """Open and immediately close a dev DB connection to prevent Supabase free-tier pause."""
+    try:
+        from dotenv import dotenv_values
+        dev = dotenv_values(Path(__file__).parent.parent / ".env.dev")
+        url = dev.get("DEV_DB_URL", "")
+        if not url:
+            logger.warning("Dev DB ping: DEV_DB_URL not set — skipping.")
+            return
+        s = url[len("postgresql://"):]
+        ui, hi   = s.rsplit("@", 1)
+        user, pw = ui.split(":", 1)
+        hp, db   = hi.rsplit("/", 1)
+        host, port = hp.rsplit(":", 1)
+        import psycopg2
+        psycopg2.connect(
+            host=host, port=int(port), dbname=db,
+            user=user, password=pw, sslmode="require",
+            connect_timeout=15,
+        ).close()
+        logger.info("Dev DB ping: OK")
+    except Exception as exc:
+        logger.warning("Dev DB ping failed (non-fatal): %s", exc)
+
+
 def run(dry_run: bool = False) -> int:
     """Run full pipeline. Returns exit code."""
     logger.info("=" * 60)
@@ -288,6 +314,9 @@ def run(dry_run: bool = False) -> int:
             )
     except Exception as exc:
         logger.warning("Could not send failure alert email: %s", exc)
+
+    # Last step — ping dev DB to prevent Supabase free-tier auto-pause (7-day inactivity limit)
+    _ping_dev_db()
 
     if amazon_ok and blinkit_ok and soh_ok and perf_ok:
         logger.info("All done — success.")
