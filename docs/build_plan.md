@@ -350,7 +350,7 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 
 | Item | Priority | Notes |
 |------|----------|-------|
-| City callout flag in Excel | High | Add column in Overview flagging `ds_not_launched > 0` as "X cities need panel activation" — agreed 21-May |
+| ~~City callout flag in Excel~~ | ~~High~~ | ✅ Closed — Geo tab already shows this; no extra column needed. |
 | ~~Daily performance scraper scheduler~~ | ~~High~~ | ✅ Done 22-May — wired into `daily_runner.py` as G4 (runs last, 12-min timeout). No separate Task Scheduler job needed. |
 | Blinkit SOH scraper (G5) | Medium | Portal flow not yet shown. Will be wired into daily_runner after G4. |
 | Blinkit ageing scraper (G6, weekly) | Medium | Portal flow not yet shown. Weekly (Mondays). `blinkit_ageing_snapshots` table exists, loader not built. Needed for >60 day recall rule. |
