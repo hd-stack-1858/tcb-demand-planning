@@ -3,8 +3,9 @@ Blinkit Inventory Snapshot Loader (SOH)
 ========================================
 Loads a Blinkit SOH (Stock on Hand) CSV into blinkit_inventory_snapshots.
 
-Download the SOH report from Blinkit seller portal on the day you run replenishment.
-Save to: data/blinkit/manual/inventory/SOH/
+SOH is now downloaded automatically by automation/blinkit_soh_scraper.py (daily runner G4).
+Auto files land in: data/blinkit/auto/inventory/SOH/
+Manual override: drop a file in the same folder and it will be picked up as the latest.
 
 Usage:
     python ingest/blinkit_inventory_loader.py                       # latest file in SOH/
@@ -37,7 +38,7 @@ env = os.environ.get('TCB_ENV', 'prod')
 load_dotenv('.env' if env == 'prod' else '.env.dev')
 sb = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_KEY'])
 
-SOH_DIR = Path('data/blinkit/manual/inventory/SOH')
+SOH_DIR = Path('data/blinkit/auto/inventory/SOH')
 
 # SOH warehouse name → partner_locations code
 # SOH name takes precedence; performance_name alias is for the loader, not stored.
@@ -50,6 +51,8 @@ WH_SOH_NAME_TO_CODE = {
     'Faridabad - Feeder':        'BLK_WH_5096',
     'Mumbai M10 - Feeder':       'BLK_WH_2123',
     'Pune P3 - Feeder Warehouse':'BLK_WH_4572',
+    'Chennai C5 - Feeder':       'BLK_WH_3262',
+    'Noida N1 - Feeder':         'BLK_WH_2576',
     # Farukhnagar SR: closed — its SOH is merged into Faridabad below
     'Farukhnagar - SR':          'BLK_WH_5096',  # redirect to Faridabad
 }

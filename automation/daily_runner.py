@@ -5,8 +5,8 @@ Sequence:
   12:01  → G1: Amazon SP-API (orders + finances)
   12:01  → G2: Blinkit scraper (MTD sales)
   ~12:15 → G3: WhatsApp briefing (after G1 + G2 complete)
-  ~12:15 → G4: Blinkit performance scraper + loader (runs LAST — 7-8 min download)
-  [G5: Blinkit SOH scraper — not yet built, placeholder below]
+  ~12:15 → G4: Blinkit SOH scraper + ingest (immediate download, ~30 sec)
+  ~12:16 → G5: Blinkit performance scraper + loader (runs LAST — 7-8 min download)
   [G6: Blinkit ageing scraper — weekly/Monday, not yet built]
 
 Exit codes:
@@ -153,9 +153,30 @@ def _send_whatsapp(amazon_result: dict, blinkit_result: dict, dry_run: bool) -> 
         logger.error("WhatsApp send failed: %s", exc)
 
 
+def _run_soh() -> dict:
+    """G4: Blinkit SOH scraper + ingest. Immediate download (~30 sec)."""
+    logger.info("Blinkit SOH scraper (G4): starting...")
+    proc = subprocess.run(
+        [PYTHON, str(PROJECT / "automation" / "blinkit_soh_scraper.py")],
+        capture_output=True, text=True, cwd=str(PROJECT),
+        env={**os.environ, "TCB_ENV": "prod"},
+        timeout=120,  # 2-minute cap — download is immediate
+    )
+
+    if proc.returncode == 0:
+        logger.info("Blinkit SOH scraper: OK — %s", proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "done")
+        return {"status": "ok"}
+    elif proc.returncode == 2:
+        logger.warning("Blinkit SOH session expired — same session as sales scraper.")
+        return {"status": "session_expired"}
+    else:
+        logger.error("Blinkit SOH scraper failed (exit %d):\n%s", proc.returncode, proc.stderr[-500:])
+        return {"status": "error", "exit_code": proc.returncode, "stderr": proc.stderr}
+
+
 def _run_performance() -> dict:
-    """G4: Blinkit performance scraper + loader. Runs last — download takes 7-8 min."""
-    logger.info("Blinkit performance scraper (G4): starting...")
+    """G5: Blinkit performance scraper + loader. Runs last — download takes 7-8 min."""
+    logger.info("Blinkit performance scraper (G5): starting...")
     proc = subprocess.run(
         [PYTHON, str(PROJECT / "automation" / "blinkit_performance_scraper.py")],
         capture_output=True, text=True, cwd=str(PROJECT),
@@ -189,15 +210,19 @@ def run(dry_run: bool = False) -> int:
     # Wait a moment to ensure DB writes are committed before querying for summary
     time.sleep(5)
 
-    # Send WhatsApp briefing (G3) — before the long performance download
+    # Send WhatsApp briefing (G3) — before the longer downloads
     _send_whatsapp(amazon_result, blinkit_result, dry_run=dry_run)
 
-    # G4: Blinkit performance scraper + loader (runs last — 7-8 min download)
+    # G4: Blinkit SOH scraper + ingest (immediate download — ~30 sec)
+    soh_result = _run_soh()
+
+    # G5: Blinkit performance scraper + loader (runs last — 7-8 min download)
     perf_result = _run_performance()
 
     # Determine exit code + send targeted email alerts for any failures
     amazon_ok  = all(v == "ok" for v in amazon_result.values())
     blinkit_ok = blinkit_result.get("status") == "ok"
+    soh_ok     = soh_result.get("status") == "ok"
     perf_ok    = perf_result.get("status") == "ok"
 
     try:
@@ -236,6 +261,19 @@ def run(dry_run: bool = False) -> int:
                 ),
             )
 
+        soh_status = soh_result.get("status")
+        if soh_status == "session_expired":
+            logger.warning("SOH scraper: same session expiry as sales scraper.")
+        elif soh_status != "ok":
+            send_alert(
+                subject=f"⚠️ Blinkit SOH Scraper — Failed ({today})",
+                body=(
+                    f"Blinkit SOH scraper (G4) failed (exit {soh_result.get('exit_code', '?')}).\n\n"
+                    f"{soh_result.get('stderr', '')[:500]}\n\n"
+                    f"Log: {log}"
+                ),
+            )
+
         perf_status = perf_result.get("status")
         if perf_status == "session_expired":
             # Session already alerted above for sales scraper; just log
@@ -244,7 +282,7 @@ def run(dry_run: bool = False) -> int:
             send_alert(
                 subject=f"⚠️ Blinkit Performance Scraper — Failed ({today})",
                 body=(
-                    f"Blinkit performance scraper (G4) failed (exit {perf_result.get('exit_code', '?')}).\n\n"
+                    f"Blinkit performance scraper (G5) failed (exit {perf_result.get('exit_code', '?')}).\n\n"
                     f"{perf_result.get('stderr', '')[:500]}\n\n"
                     f"Log: {log}"
                 ),
@@ -252,10 +290,10 @@ def run(dry_run: bool = False) -> int:
     except Exception as exc:
         logger.warning("Could not send failure alert email: %s", exc)
 
-    if amazon_ok and blinkit_ok and perf_ok:
+    if amazon_ok and blinkit_ok and soh_ok and perf_ok:
         logger.info("All done — success.")
         return 0
-    elif not amazon_ok and not blinkit_ok and not perf_ok:
+    elif not amazon_ok and not blinkit_ok and not soh_ok and not perf_ok:
         logger.error("All sources failed.")
         return 2
     else:

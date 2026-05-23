@@ -352,7 +352,7 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 |------|----------|-------|
 | ~~City callout flag in Excel~~ | ~~High~~ | ✅ Closed — Geo tab already shows this; no extra column needed. |
 | ~~Daily performance scraper scheduler~~ | ~~High~~ | ✅ Done 22-May — wired into `daily_runner.py` as G4 (runs last, 12-min timeout). No separate Task Scheduler job needed. |
-| Blinkit SOH scraper (G5) | Medium | Portal flow not yet shown. Will be wired into daily_runner after G4. |
+| ~~Blinkit SOH scraper (G4)~~ | ~~Medium~~ | ✅ Done 23-May — `automation/blinkit_soh_scraper.py`. Inventory → Bulk reports → Download Stock on Hand. Saves to `data/blinkit/auto/inventory/SOH/InventoryData_{day}{Mon}{year}.xlsx`, ingests to DB. Wired into daily_runner as G4 (after WhatsApp, before performance). `ingest/blinkit_inventory_loader.py` now defaults to auto path. |
 | Blinkit ageing scraper (G6, weekly) | Medium | Portal flow not yet shown. Weekly (Mondays). `blinkit_ageing_snapshots` table exists, loader not built. Needed for >60 day recall rule. |
 | WH-OOS fallback ADS | Low | Explicitly deferred — Himanshu knows affected WHs (Hyd H3) by heart for now |
 | Streamlit tab in tinysteps_app.py | Low | Deferred until CLI fully validated against several real replenishment cycles |
@@ -379,7 +379,7 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 
 ```
 Immediate:
-  J (pending). City callout in replen Excel + SOH scraper (G5) + ageing scraper (G6, weekly)
+  J (pending). Ageing scraper (G6, weekly — portal flow needed from Himanshu)
 
 Track 1 — Forecasting + Reorder (no blockers):
   D. Demand Forecasting Engine (tcb/forecasting.py + Forecast tab in sales_app)
@@ -431,7 +431,8 @@ Items explicitly decided to skip for now but worth revisiting:
 | `tcb/replenishment.py` | ✅ Phase J — replenishment engine + Excel (6 sheets) |
 | `ingest/blinkit_performance_loader.py` | ✅ Phase J — DS master refresh + eligibility + ADS loader |
 | `ingest/blinkit_inventory_loader.py` | ✅ Phase J — SOH snapshot loader |
-| `automation/blinkit_performance_scraper.py` | ✅ Phase J — daily perf CSV download. Wired into daily_runner.py (G4, 22-May). Navigation fixed: Product Expansion tab → header checkbox → Reports → Detailed Report. 10-min download timeout. |
+| `automation/blinkit_soh_scraper.py` | ✅ Phase J G4 — daily SOH download + ingest. Inventory → Bulk reports → Download Stock on Hand. Saves date-stamped XLSX to auto/inventory/SOH/. |
+| `automation/blinkit_performance_scraper.py` | ✅ Phase J G5 — daily perf CSV download. Navigation: Product Expansion tab → header checkbox → Reports → Detailed Report. 10-min download timeout. |
 | `setup/22_blinkit_replenishment_tables.sql` | ✅ Phase J — applied to prod |
 | `automation/vignesh_monitor.py` | 🔲 Phase H2 |
 | `tcb/forecasting.py` | 🔲 Phase D |
