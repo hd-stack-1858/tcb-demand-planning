@@ -7,7 +7,6 @@ Sequence:
   ~12:15 → G3: WhatsApp briefing (after G1 + G2 complete)
   ~12:15 → G4: Blinkit SOH scraper + ingest (immediate download, ~30 sec)
   ~12:16 → G5: Blinkit performance scraper + loader (runs LAST — 7-8 min download)
-  [G6: Blinkit ageing scraper — weekly/Monday, not yet built]
 
 Exit codes:
   0  — success

@@ -294,7 +294,7 @@ def refresh_ds_master(ds_to_wh_name: dict[str, str], wh_lookup: dict,
             'code':               code,
             'parent_location_id': wh_id,
             'is_active':          True,
-            'external_id':        None,   # populated later from ageing report
+            'external_id':        None,
         })
         existing_codes.add(code)   # prevent duplicate within this batch
 

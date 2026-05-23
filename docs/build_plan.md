@@ -353,7 +353,7 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 | ~~City callout flag in Excel~~ | ~~High~~ | ✅ Closed — Geo tab already shows this; no extra column needed. |
 | ~~Daily performance scraper scheduler~~ | ~~High~~ | ✅ Done 22-May — wired into `daily_runner.py` as G4 (runs last, 12-min timeout). No separate Task Scheduler job needed. |
 | ~~Blinkit SOH scraper (G4)~~ | ~~Medium~~ | ✅ Done 23-May — `automation/blinkit_soh_scraper.py`. Inventory → Bulk reports → Download Stock on Hand. Saves to `data/blinkit/auto/inventory/SOH/InventoryData_{day}{Mon}{year}.xlsx`, ingests to DB. Wired into daily_runner as G4 (after WhatsApp, before performance). `ingest/blinkit_inventory_loader.py` now defaults to auto path. |
-| Blinkit ageing scraper (G6, weekly) | Medium | Portal flow not yet shown. Weekly (Mondays). `blinkit_ageing_snapshots` table exists, loader not built. Needed for >60 day recall rule. |
+| ~~Blinkit ageing scraper (G6, weekly)~~ | ~~Medium~~ | ✅ Dropped 23-May — critical analysis concluded ageing adds no value to the replenishment quantity decision. Replen formula (ADS × 37 − effective_stock) already prevents over-replenishment; sku_moved_out_low_sales status already captures the downstream signal. `blinkit_ageing_snapshots` table dropped from prod. Manual portal check sufficient for the rare recall decision. |
 | WH-OOS fallback ADS | Low | Explicitly deferred — Himanshu knows affected WHs (Hyd H3) by heart for now |
 | Streamlit tab in tinysteps_app.py | Low | Deferred until CLI fully validated against several real replenishment cycles |
 
@@ -365,6 +365,7 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 - `amazon_locations` — same; Amazon WH lives in `partner_locations` as `AZ_BLR8`
 - `distribution_rules` — empty, no code references
 - `replenishment_recommendations` — empty, no code references
+- `blinkit_ageing_snapshots` — empty, loader never built; ageing dropped from scope (see G6 above)
 
 **`data/blinkit/auto/` restructured:**
 - `auto/sales/` — Blinkit sales XLSX downloads (`blinkit_scraper.py`)
@@ -378,9 +379,6 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 ## Build Order Going Forward
 
 ```
-Immediate:
-  J (pending). Ageing scraper (G6, weekly — portal flow needed from Himanshu)
-
 Track 1 — Forecasting + Reorder (no blockers):
   D. Demand Forecasting Engine (tcb/forecasting.py + Forecast tab in sales_app)
   E. Reorder Integration + Vignesh tool (tcb/reorder.py + Reorder Plan tab)
