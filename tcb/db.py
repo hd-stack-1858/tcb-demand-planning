@@ -99,21 +99,6 @@ def get_low_stock_alerts():
 
 
 
-def get_monthly_mis(months: int = 3):
-    """Return monthly MIS summary for the last N months."""
-    from datetime import date
-    from dateutil.relativedelta import relativedelta
-    cutoff = (date.today() - relativedelta(months=months)).strftime("%Y-%m-01")
-    return (
-        get_client()
-        .table("v_monthly_mis")
-        .select("*")
-        .gte("month", cutoff)
-        .execute()
-        .data
-    )
-
-
 def get_orders_raw(start_date: str | None = None, end_date: str | None = None) -> list[dict]:
     """Fetch all orders for MIS dashboard, with channel and sku names merged in Python."""
     db = get_client()

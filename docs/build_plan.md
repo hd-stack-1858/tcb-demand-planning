@@ -366,6 +366,13 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 - `distribution_rules` — empty, no code references
 - `replenishment_recommendations` — empty, no code references
 - `blinkit_ageing_snapshots` — empty, loader never built; ageing dropped from scope (see G6 above)
+- `purchase_orders` / `purchase_order_items` — empty Phase F skeleton; will recreate at Phase F build time
+
+**Prod DB views dropped:**
+- `v_blinkit_reconciliation` — referenced `blinkit_locations` (dropped) + tables that never existed
+- `v_amazon_reconciliation` — referenced `amazon_fba_inventory` + tables that never existed
+- `v_darkstore_doc` — referenced `darkstores`, `darkstore_inventory`, `darkstore_sales` (never existed)
+- `v_monthly_mis` — broken (wrong column schema); `get_monthly_mis()` dead function removed from `tcb/db.py`; will redesign with correct P&L columns when Phase C is built
 
 **`data/blinkit/auto/` restructured:**
 - `auto/sales/` — Blinkit sales XLSX downloads (`blinkit_scraper.py`)
