@@ -9,7 +9,7 @@ Navigation flow (from seller portal):
   2. Left sidebar → click "Performance" icon (bar chart, 2nd icon)
   3. Period dropdown — leave at default "Last 7 days" (no click needed)
   4. Click "Reports" button (top-right, has download icon)
-  5. File downloads to data/blinkit/auto/
+  5. File downloads to data/blinkit/auto/sales/
   6. Ingest via ingest/load_blinkit_sales.py
 
 Why "Last 7 days" not "Current Month":
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 PORTAL_URL    = "https://seller.blinkit.com"
 SESSION_FILE  = Path(__file__).parent.parent / ".blinkit_session" / "state.json"
-DOWNLOAD_DIR  = Path(__file__).parent.parent / "data" / "blinkit" / "auto"  # scraper writes MTD sales reports here
+DOWNLOAD_DIR  = Path(__file__).parent.parent / "data" / "blinkit" / "auto" / "sales"  # scraper writes MTD sales reports here
 
 
 class BlinkitSessionExpired(Exception):

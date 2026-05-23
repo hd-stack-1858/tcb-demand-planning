@@ -1,6 +1,6 @@
 # Sales MIS + Demand Planning System — Build Plan
 
-*Last updated: 22-May 2026*
+*Last updated: 23-May 2026*
 
 ---
 
@@ -356,6 +356,22 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 | Blinkit ageing scraper (G6, weekly) | Medium | Portal flow not yet shown. Weekly (Mondays). `blinkit_ageing_snapshots` table exists, loader not built. Needed for >60 day recall rule. |
 | WH-OOS fallback ADS | Low | Explicitly deferred — Himanshu knows affected WHs (Hyd H3) by heart for now |
 | Streamlit tab in tinysteps_app.py | Low | Deferred until CLI fully validated against several real replenishment cycles |
+
+### J — DB + Folder Cleanup (23-May-2026)
+
+**Prod DB tables dropped:**
+- `blinkit_performance_summary` — empty, no code ever wrote to it; detail CSVs are a superset
+- `blinkit_locations` — data fully migrated into `partner_locations` (migration 009); all FKs re-pointed
+- `amazon_locations` — same; Amazon WH lives in `partner_locations` as `AZ_BLR8`
+- `distribution_rules` — empty, no code references
+- `replenishment_recommendations` — empty, no code references
+
+**`data/blinkit/auto/` restructured:**
+- `auto/sales/` — Blinkit sales XLSX downloads (`blinkit_scraper.py`)
+- `auto/replenishment/` — replenishment plan Excel (`replenishment.py`)
+- `auto/product_performance/` — unchanged
+
+**Blinkit summary CSV:** Decided not to download going forward. Summary report is a strict subset of the detail CSVs already downloaded daily — every column is derivable from the DB.
 
 ---
 

@@ -68,7 +68,7 @@ COVERAGE_DAYS    = 30
 TRANSIT_BUFFER   = 7
 MIN_INVOICE_VALUE = 150_000  # ₹1.5L gate per WH
 PERF_LOOKBACK    = 60        # days of performance data to load
-OUTPUT_DIR       = Path('data/blinkit/auto')
+OUTPUT_DIR       = Path('data/blinkit/auto/replenishment')
 BLINKIT_CHANNEL_ID   = 4
 BLINKIT_CHANNEL_CODE = 'BLK'
 
@@ -416,6 +416,11 @@ def compute_replenishment_plan(
         transit_stock   = total_ads * transit_buffer_days
         target_stock    = total_demand + transit_stock
 
+        # Floor: newly launched or long-OOS SKUs may have near-zero ADS → target=0.
+        # Guarantee at least 1 unit per active DS so we don't starve live stores.
+        ads_floor_applied = target_stock < active_ds_count
+        target_stock      = max(target_stock, active_ds_count)
+
         # Effective stock from latest inventory snapshot
         inv_row = inv_df[
             (inv_df['location_id'] == wh_id) & (inv_df['sku_id'] == sku_id)
@@ -446,6 +451,8 @@ def compute_replenishment_plan(
         a_end   = first_data['assessment_end'].iloc[0]   if not first_data.empty else None
 
         notes = []
+        if ads_floor_applied:
+            notes.append(f'ADS floor applied — target raised to {active_ds_count} (1 per active DS)')
         if ds_with_data < active_ds_count:
             notes.append(f'{active_ds_count - ds_with_data} DS missing performance data')
         if ds_with_oos > 0:

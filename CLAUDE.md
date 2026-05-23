@@ -156,7 +156,7 @@ effective_stock = wh_soh + units_incoming + units_in_transit
 
 - Coverage = 30 days, transit buffer = 7 days
 - Gate = ₹1.5L invoice value **per WH** (not aggregate)
-- Output: `data/blinkit/auto/replenishment_plan_YYYYMMDD.xlsx` (5 sheets: Overview-SKU, Overview-WH, Ship Now, Full Plan, Summary)
+- Output: `data/blinkit/auto/replenishment/replenishment_plan_YYYYMMDD.xlsx` (5 sheets: Overview-SKU, Overview-WH, Ship Now, Full Plan, Summary)
 
 ### Performance Data Rules
 

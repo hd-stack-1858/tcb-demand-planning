@@ -155,8 +155,8 @@ ingest/blinkit_inventory_loader.py
 # Generate replenishment plan for current date
 python -m tcb.replenishment --snapshot-date 2026-06-01
 
-# Output: data/blinkit/auto/replenishment_plan_20260601.xlsx
-# (follows project convention: automation output → data/<channel>/auto/)
+# Output: data/blinkit/auto/replenishment/replenishment_plan_20260601.xlsx
+# (follows project convention: automation output → data/<channel>/auto/<type>/)
 ```
 
 ### RO upload (manual for now)
