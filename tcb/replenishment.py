@@ -666,7 +666,7 @@ def compute_geo_summary(wh_df: pd.DataFrame, eligibility_df: pd.DataFrame) -> pd
 
         def _city_label(city: str) -> str:
             n = city_open_count.get(city, 0)
-            return f"{city} ({n})" if n else city
+            return f"{city} ({n})" if n else f"{city} (closed)"
 
         # Cities from all DS under this WH (with non-closed DS count)
         all_cities  = [_city_label(c) for c in sorted(wh_ds['city'].unique())]
