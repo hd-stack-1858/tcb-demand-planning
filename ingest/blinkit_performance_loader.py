@@ -42,6 +42,7 @@ BATCH_SIZE     = 200
 
 INSUFFICIENT_INV = 'Insufficient Inventory at warehouse for transfers'
 ITEM_NOT_RESTOCKED = 'Item not restocked by you on serving warehouse for last 30 days'
+FE_MOVEMENT_BLOCKED = 'FE movement bottlenecked due to store space'
 
 # Keyword-based remark rules — ALL keywords must appear in the remark (case-insensitive).
 # More robust than exact matching: survives "(in progress)", punctuation changes, minor rewording.
@@ -504,7 +505,15 @@ def update_eligibility(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict):
                 continue
             last_remark = remark
         else:
-            continue  # N with no remark — no actionable status
+            # N with blank Darkstore remark — check Col S (Remarks) for FE movement block
+            remarks_s = str(row.get('Remarks', '') or '').strip()
+            if FE_MOVEMENT_BLOCKED in remarks_s:
+                status      = 'ds_choked'
+                last_remark = remarks_s
+            else:
+                if remarks_s:
+                    print(f'  [WARN] Unclassified N-row (blank DS remark), Remarks: {remarks_s!r}')
+                continue  # no actionable status
 
         records.append({
             'location_id':  ds_id,
@@ -608,6 +617,21 @@ def upsert_ads(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict, wh_lookup: d
         print(f'  [WARN] DS not in partner_locations — skipped {len(unknown_ds)} unique DS '
               f'(run seed_blinkit_ds_master.sql first): {len(unknown_ds)} stores')
 
+    # Trigger 2: Y-rows where available_hours=0 but wh_oos_flag=False
+    # This should never fire — all Available=0 rows have wh_oos_flag=True by design.
+    # If it does fire, Blinkit changed their remark logic and our wh_oos_flag is wrong.
+    t2_rows = y_rows[
+        (y_rows['avail_h'].notna()) &
+        (y_rows['avail_h'] == 0) &
+        ~y_rows['Remarks'].fillna('').str.contains(INSUFFICIENT_INV, case=False) &
+        ~y_rows['Remarks'].fillna('').str.contains(ITEM_NOT_RESTOCKED, case=False)
+    ]
+    if not t2_rows.empty:
+        print(f'\n[ALERT] Trigger 2: {len(t2_rows)} Y-row(s) have available_hours=0 '
+              f'but wh_oos_flag=False (DS-level OOS not captured by WH remark).')
+        print('  These DS may have been out of stock at the darkstore level independently.')
+        print('  Check these rows and review the wh_oos detection logic.')
+
     return inserted, skipped
 
 
@@ -706,7 +730,74 @@ def main():
         activated, deactivated = update_is_active(latest_ds, ds_lookup_final, all_blinkit_ds_ids)
         print(f'  Active: {activated} | Deactivated: {deactivated}')
 
+    # Trigger 1: DS that are active in DB but absent from the latest file entirely
+    # (vanished-Y DS — went active then dropped without going through N first)
+    if not args.dry_run:
+        _check_trigger1_vanished_y(files, sku_lookup, ds_lookup)
+
     print('\nDone.')
+
+
+def _check_trigger1_vanished_y(files: list[Path], sku_lookup: dict, ds_lookup: dict):
+    """
+    Trigger 1: Alert if any DS-SKU pair is status='active' in DB
+    but completely absent from the latest performance file.
+    These DS were selling (Y) then vanished without going through N — raise with Blinkit.
+    """
+    if not files:
+        return
+
+    latest_file = max(files, key=lambda f: f.stat().st_mtime)
+
+    try:
+        hdr = pd.read_csv(latest_file, nrows=0)
+        hdr.columns = [c.strip() for c in hdr.columns]
+        if not REQUIRED_COLS.issubset(set(hdr.columns)):
+            return
+        df = pd.read_csv(latest_file,
+                         usecols=['Item ID', 'Darkstore name'],
+                         low_memory=False)
+        df.columns = [c.strip() for c in df.columns]
+    except Exception:
+        return
+
+    df = df.dropna(subset=['Item ID', 'Darkstore name'])
+
+    # All DS-SKU pairs present in latest file (Y or N)
+    latest_pairs: set[tuple] = set()
+    for _, row in df.iterrows():
+        sku_id = sku_lookup.get(str(row['Item ID']).strip())
+        raw_ds = str(row['Darkstore name']).strip()
+        ds_id  = ds_lookup.get(raw_ds.lower()) or ds_lookup.get(_bare_name(raw_ds))
+        if sku_id and ds_id:
+            latest_pairs.add((ds_id, sku_id))
+
+    # Active DS-SKU pairs in DB
+    page, offset, page_size = [], 0, 1000
+    while True:
+        batch = (sb.table('blinkit_ds_sku_eligibility')
+                   .select('location_id,sku_id')
+                   .eq('status', 'active')
+                   .range(offset, offset + page_size - 1)
+                   .execute().data)
+        page.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+
+    active_db_pairs = {(r['location_id'], r['sku_id']) for r in page}
+    vanished = active_db_pairs - latest_pairs
+
+    if vanished:
+        print(f'\n[ALERT] Trigger 1: {len(vanished)} DS-SKU pair(s) are active in DB '
+              f'but absent from latest file ({latest_file.name}).')
+        print('  These DS were selling (Y) but vanished from the assessment file.')
+        print('  Raise with Blinkit to understand why they dropped.')
+        shown = sorted(vanished)[:20]
+        for ds_id, sku_id in shown:
+            print(f'    location_id={ds_id}, sku_id={sku_id}')
+        if len(vanished) > 20:
+            print(f'    ... and {len(vanished) - 20} more')
 
 
 if __name__ == '__main__':

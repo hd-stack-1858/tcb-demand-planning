@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS blinkit_ds_sku_eligibility (
                           'darkstore_closed',      -- Blinkit permanently closed this DS
                           'sku_moved_out_low_sales', -- Blinkit redistributed due to low sales
                           'sku_city_exited',       -- we opted out of this city for this SKU (permanent)
-                          'sku_recalled'           -- we initiated recall (requires manual relaunch)
+                          'sku_recalled',          -- we initiated recall (requires manual relaunch)
+                          'ds_choked'              -- DS launched but FE movement bottlenecked (no shelf space)
                       )),
     last_remark   TEXT,          -- raw darkstore_remark text from performance file
     updated_date  DATE NOT NULL, -- date of the performance file row that set this status

@@ -3,6 +3,7 @@ The Cradle Box — Sales MIS Dashboard (Phase C)
 Read-only analytics. Auth via Streamlit Cloud viewer allowlist (no code needed).
 """
 import sys, os
+from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # Bridge Streamlit Cloud secrets → env vars so that tcb/db.py can read them.
@@ -24,7 +25,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from tcb.db import get_orders_raw
+from tcb.db import get_orders_raw, get_blinkit_city_ds, get_skus, get_client
 
 st.set_page_config(
     page_title="TCB Sales MIS",
@@ -1672,8 +1673,9 @@ def main():
         st.info("No data for the selected filters.")
         return
 
-    t1, t2, t3, t4, t5, t6 = st.tabs([
-        "📊 Overview", "📈 Trends", "🏪 By Channel", "📦 By SKU", "🔄 Returns", "🗺️ Geography",
+    t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+        "📊 Overview", "📈 Trends", "🏪 By Channel", "📦 By SKU",
+        "🔄 Returns", "🗺️ Geography", "🟡 Blinkit Deepdive",
     ])
     with t1:
         tab_overview(raw_df, fdf, filters["net_mode"], filters)
@@ -1687,6 +1689,531 @@ def main():
         tab_returns(raw_df, fdf, filters)
     with t6:
         tab_geography(fdf, filters["net_mode"])
+    with t7:
+        tab_blinkit_deepdive()
+
+
+# ── Blinkit Deepdive tab ───────────────────────────────────────────────────────
+
+_STATUS_META = [
+    ("active",                  "Active",              "#22C55E"),
+    ("launch_awaited",          "Not launched",        "#F97316"),
+    ("sku_moved_out_low_sales",  "Inactive (low sale)", "#EAB308"),
+    ("ds_choked",               "Choked",              "#06B6D4"),
+    ("sku_city_exited",         "City exit",           "#EF4444"),
+    ("sku_recalled",            "Recalled",            "#7C3AED"),
+    ("darkstore_closed",        "DS closed",           "#94A3B8"),
+    ("no_data",                 "Not deployed",        "#CBD5E1"),
+]
+_STATUS_LABEL = {k: lbl for k, lbl, _ in _STATUS_META}
+_STATUS_COLOR = {k: col for k, _, col in _STATUS_META}
+
+
+@st.cache_data(ttl=300)
+def _load_city_ds(sku_id: str) -> pd.DataFrame:
+    rows = get_blinkit_city_ds(sku_id)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+_REPLEN_PARQUET = Path("data/blinkit/auto/replenishment/replenishment_plan_latest.parquet")
+
+
+@st.cache_data(show_spinner=False)
+def _load_replen_plan(_mtime: float) -> "pd.DataFrame":
+    """Read pre-computed replen plan from parquet. Cache busts only when the file changes."""
+    if _REPLEN_PARQUET.exists():
+        return pd.read_parquet(_REPLEN_PARQUET)
+    return pd.DataFrame()
+
+
+def _get_replen_plan() -> "pd.DataFrame":
+    mtime = _REPLEN_PARQUET.stat().st_mtime if _REPLEN_PARQUET.exists() else 0.0
+    return _load_replen_plan(mtime)
+
+
+def _load_wh_summary(sku_id: str) -> list:
+    plan_df = _get_replen_plan()
+    if plan_df.empty:
+        return []
+    sku_rows = plan_df[plan_df["sku_id"] == sku_id]
+    result = []
+    for _, r in sku_rows.iterrows():
+        result.append({
+            "wh_name":         r["wh_name"],
+            "active_ds":       int(r["active_ds_count"]),
+            "choked_ds_count": int(r.get("ds_choked_count", 0)),
+            "wh_stock":        int(r["units_wh"]) + int(r["units_incoming"]),
+            "ds_stock":        int(r["units_ds"]) + int(r["units_transit"]),
+            "total_inventory": int(r["effective_stock"]),
+            "target_stock":    int(r["target_stock"]),
+            "oos_ds_count":    int(r["ds_with_oos"]),
+        })
+    return sorted(result, key=lambda x: x["wh_name"])
+
+
+@st.cache_data(ttl=300)
+def _load_wh_list() -> list:
+    db = get_client()
+    rows = (db.table("partner_locations")
+              .select("location_id,name,code")
+              .eq("channel_id", 4)
+              .eq("location_type", "WH")
+              .eq("is_active", True)
+              .execute().data)
+    return sorted(rows, key=lambda r: r["name"])
+
+
+@st.cache_data(ttl=300)
+def _load_all_ds_raw() -> list:
+    db = get_client()
+    return (db.table("partner_locations")
+              .select("location_id,name,city,parent_location_id,is_active")
+              .eq("channel_id", 4)
+              .eq("location_type", "DARKSTORE")
+              .limit(2000)
+              .execute().data)
+
+
+@st.cache_data(ttl=300)
+def _load_all_elig() -> list:
+    db = get_client()
+    return (db.table("blinkit_ds_sku_eligibility")
+              .select("location_id,sku_id,status")
+              .limit(20000)
+              .execute().data)
+
+
+def tab_blinkit_deepdive() -> None:
+    """Blinkit Deepdive — stacked horizontal bar of dark store status per city, per SKU."""
+    st.markdown("#### Darkstore Launch Status")
+
+    # SKU selector
+    sku_rows  = get_skus(active_only=True)
+    sku_names = {r["sku_id"]: f"{r['sku_id']} — {r['name']}" for r in sku_rows}
+    sku_ids   = list(sku_names.keys())
+    if not sku_ids:
+        st.warning("No SKUs found.")
+        return
+
+    selected_sku = st.selectbox(
+        "Select SKU", sku_ids,
+        format_func=lambda x: sku_names[x],
+        key="blk_deepdive_sku",
+    )
+
+    df = _load_city_ds(selected_sku)
+    if df.empty:
+        st.info("No Blinkit dark store data found. Run the performance loader first.")
+        return
+
+    # ── Top 15 cities by total DS count ───────────────────────────────────────
+    city_totals   = df.groupby("city").size().sort_values(ascending=False)
+    top15_cities  = city_totals.head(15).index.tolist()
+    df10          = df[df["city"].isin(top15_cities)].copy()
+
+    # Pivot: rows = city (sorted by total, bottom-to-top for horizontal bar), cols = status counts
+    pivot = (
+        df10.groupby(["city", "status"])
+        .size()
+        .unstack(fill_value=0)
+    )
+    # Ensure all status columns exist
+    for key, _, _ in _STATUS_META:
+        if key not in pivot.columns:
+            pivot[key] = 0
+    # Sort cities: largest total at top (plotly horizontal bars are bottom-up)
+    pivot = pivot.loc[top15_cities[::-1]]
+
+    city_labels = [f"{c}  ({city_totals[c]})" for c in pivot.index]
+
+    # ── Summary KPIs above the chart ──────────────────────────────────────────
+    total      = len(df10)
+    active_us  = int((df10["status"] == "active").sum())
+    not_launch = int((df10["status"] == "launch_awaited").sum())
+    low_sales  = int((df10["status"] == "sku_moved_out_low_sales").sum())
+    choked     = int((df10["status"] == "ds_choked").sum())
+    exited     = int((df10["status"] == "sku_city_exited").sum())
+    recalled   = int((df10["status"] == "sku_recalled").sum())
+    closed     = int((df10["status"] == "darkstore_closed").sum())
+
+    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
+    c1.metric("Total DS",            total)
+    c2.metric("DS closed",           closed)
+    c3.metric("City exit",           exited)
+    c4.metric("Recalled",            recalled)
+    c5.metric("Inactive (low sale)", low_sales)
+    c6.metric("Not launched",        not_launch)
+    c7.metric("Choked",              choked)
+    c8.metric("Active",              active_us)
+
+    fig = go.Figure()
+    for key, label, color in _STATUS_META:
+        counts = pivot[key].tolist()
+        if sum(counts) == 0:
+            continue
+        fig.add_trace(go.Bar(
+            name=label,
+            x=counts,
+            y=city_labels,
+            orientation="h",
+            marker_color=color,
+            hovertemplate=f"<b>%{{y}}</b><br>{label}: %{{x}}<extra></extra>",
+            text=[str(v) if v > 0 else "" for v in counts],
+            textposition="inside",
+            insidetextanchor="middle",
+            textfont=dict(color="white", size=11),
+        ))
+
+    fig.update_layout(
+        barmode="stack",
+        height=480,
+        margin=dict(l=10, r=20, t=10, b=10),
+        xaxis=dict(title="Dark store count", tickfont=dict(size=11)),
+        yaxis=dict(tickfont=dict(size=12)),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=-0.30,
+            xanchor="left", x=0, font=dict(size=11),
+        ),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Inventory Health table ─────────────────────────────────────────────────
+    st.markdown("#### Inventory Health")
+    wh_rows = _load_wh_summary(selected_sku)
+    if wh_rows:
+        wh_df = pd.DataFrame(wh_rows)
+
+        def _health_pct(total_inv, target):
+            if target > 0:
+                return int(round(total_inv / target * 100))
+            return None
+
+        def _health_str(total_inv, target):
+            v = _health_pct(total_inv, target)
+            return f"{v}%" if v is not None else "N/A"
+
+        display_rows = []
+        for r in wh_rows:
+            display_rows.append({
+                "Warehouse":              r["wh_name"],
+                "Active DS":              r["active_ds"],
+                "Choked DS":              r["choked_ds_count"],
+                "WH Stock (SOH+Planned)": r["wh_stock"],
+                "DS Stock (SOH+In-transit)": r["ds_stock"],
+                "Total Inventory":        r["total_inventory"],
+                "Target Stock":           r["target_stock"],
+                "Health":                 _health_str(r["total_inventory"], r["target_stock"]),
+                "Starving DS":            r["oos_ds_count"],
+            })
+
+        total_inv = wh_df["total_inventory"].sum()
+        total_tgt = wh_df["target_stock"].sum()
+        display_rows.append({
+            "Warehouse":              "TOTAL",
+            "Active DS":              int(wh_df["active_ds"].sum()),
+            "Choked DS":              int(wh_df["choked_ds_count"].sum()),
+            "WH Stock (SOH+Planned)": int(wh_df["wh_stock"].sum()),
+            "DS Stock (SOH+In-transit)": int(wh_df["ds_stock"].sum()),
+            "Total Inventory":        int(total_inv),
+            "Target Stock":           int(total_tgt),
+            "Health":                 _health_str(total_inv, total_tgt),
+            "Starving DS":            int(wh_df["oos_ds_count"].sum()),
+        })
+
+        inv_df   = pd.DataFrame(display_rows)
+        is_total = [False] * (len(inv_df) - 1) + [True]
+
+        def _health_color(val):
+            if not isinstance(val, str) or val == "N/A":
+                return ""
+            try:
+                v = float(val.replace("%", ""))
+                if v < 70:
+                    return "color: red; font-weight: bold"
+                if v < 85:
+                    return "color: darkorange; font-weight: bold"
+                return "color: green; font-weight: bold"
+            except ValueError:
+                return ""
+
+        st.dataframe(
+            inv_df.style
+            .map(_health_color, subset=["Health"])
+            .apply(
+                lambda row: ["font-weight: bold"] * len(row) if is_total[row.name] else [""] * len(row),
+                axis=1,
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No warehouse inventory data. Run the inventory and performance loaders first.")
+
+    # ── Data Quality Alerts ────────────────────────────────────────────────────
+    st.markdown("#### Data Quality Alerts")
+    st.caption("These alerts fire only when anomalies are detected — all clear means no output below.")
+
+    try:
+        db = get_client()
+        plan_df = _get_replen_plan()
+
+        # Trigger 1: DB active count > plan active count for this SKU
+        # Signals DS that are marked active in DB but absent from current performance data
+        db_active_rows = (
+            db.table("blinkit_ds_sku_eligibility")
+            .select("location_id")
+            .eq("sku_id", selected_sku)
+            .eq("status", "active")
+            .execute()
+            .data
+        )
+        db_active_count = len(db_active_rows)
+        plan_active_count = (
+            int(plan_df[plan_df["sku_id"] == selected_sku]["active_ds_count"].sum())
+            if not plan_df.empty else 0
+        )
+        if db_active_count > plan_active_count:
+            discrepancy = db_active_count - plan_active_count
+            st.warning(
+                f"**Trigger 1 — Vanished-Y DS:** {db_active_count} DS marked `active` in DB "
+                f"but only {plan_active_count} appear in current performance data. "
+                f"**{discrepancy} DS may have been dropped from assessment while still active** "
+                f"(went Y → absent without going through N). Raise with Blinkit."
+            )
+
+        # Trigger 2: Y-row with available_hours=0 but wh_oos_flag=False
+        # DS-level OOS not captured by WH remark — should never fire under current Blinkit logic
+        t2_rows = (
+            db.table("blinkit_performance_ads")
+            .select("data_date, location_id")
+            .eq("sku_id", selected_sku)
+            .eq("wh_oos_flag", False)
+            .eq("available_hours", 0)
+            .limit(50)
+            .execute()
+            .data
+        )
+        if t2_rows:
+            st.warning(
+                f"**Trigger 2 — DS-level OOS:** {len(t2_rows)} performance row(s) found where "
+                f"`available_hours=0` but `wh_oos_flag=False`. The WH had stock but the DS "
+                f"showed 0 available hours — possible DS-level OOS not captured by WH remark. "
+                f"Review wh_oos detection logic."
+            )
+
+    except Exception as exc:
+        st.error(f"Data quality check failed: {exc}")
+
+    # ── Warehouse Status ───────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Warehouse Status")
+
+    try:
+        wh_list  = _load_wh_list()
+        all_ds   = _load_all_ds_raw()
+        all_elig = _load_all_elig()
+    except Exception as exc:
+        st.error(f"Failed to load warehouse data: {exc}")
+        return
+
+    if not wh_list:
+        st.info("No warehouse data found.")
+        return
+
+    sku_name_map = {r["sku_id"]: r["name"] for r in get_skus(active_only=False)}
+
+    col_wh, col_city = st.columns([1, 1])
+    with col_wh:
+        sel_wh_name = st.selectbox("Warehouse", [r["name"] for r in wh_list], key="wh_status_wh")
+    sel_wh_id = next(r["location_id"] for r in wh_list if r["name"] == sel_wh_name)
+
+    wh_all_ds   = [d for d in all_ds if d["parent_location_id"] == sel_wh_id]
+    cities_here = sorted({d["city"] for d in wh_all_ds if d.get("city")})
+    with col_city:
+        sel_city = st.selectbox("City", ["All"] + cities_here, key="wh_status_city")
+
+    if sel_city == "All":
+        city_ds_ids = {d["location_id"] for d in wh_all_ds}
+    else:
+        city_ds_ids = {d["location_id"] for d in wh_all_ds if d.get("city") == sel_city}
+
+    # Count statuses per SKU for the selected DS set
+    from collections import defaultdict
+    sku_statuses: dict = defaultdict(lambda: defaultdict(int))
+    for e in all_elig:
+        if e["location_id"] in city_ds_ids:
+            sku_statuses[e["sku_id"]][e["status"]] += 1
+
+    # Replen plan for this WH (WH-level columns)
+    try:
+        plan_df = _get_replen_plan()
+        wh_plan = plan_df[plan_df["wh_location_id"] == sel_wh_id] if not plan_df.empty else pd.DataFrame()
+    except Exception:
+        wh_plan = pd.DataFrame()
+
+    wh_status_rows = []
+    for sku_id in sorted(sku_statuses):
+        s = sku_statuses[sku_id]
+        if s.get("active", 0) == 0:
+            continue
+        pr = wh_plan[wh_plan["sku_id"] == sku_id] if not wh_plan.empty else pd.DataFrame()
+        wh_status_rows.append({
+            "SKU Code":        sku_id,
+            "SKU Name":        sku_name_map.get(sku_id, sku_id),
+            "Total DS":        sum(s.values()),
+            "Closed":          s.get("darkstore_closed", 0) + s.get("sku_moved_out_low_sales", 0),
+            "Exited/Recalled": s.get("sku_city_exited", 0) + s.get("sku_recalled", 0),
+            "Choked":          s.get("ds_choked", 0),
+            "Not Launched":    s.get("launch_awaited", 0),
+            "Active":          s.get("active", 0),
+            "Total ADS":       round(float(pr["total_ads"].iloc[0]), 2) if not pr.empty else 0.0,
+            "Total Inventory": int(pr["effective_stock"].iloc[0]) if not pr.empty else 0,
+            "Target Stock":    int(pr["target_stock"].iloc[0]) if not pr.empty else 0,
+            "To Ship":         int(pr["units_to_ship"].iloc[0]) if not pr.empty else 0,
+            "Invoice Value":   int(pr["invoice_value"].iloc[0]) if not pr.empty else 0,
+        })
+
+    if wh_status_rows:
+        st.dataframe(pd.DataFrame(wh_status_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No SKUs found for this WH / City selection.")
+
+    # ── Replen plan refresh + download ────────────────────────────────────────
+    import glob as _glob, subprocess as _sp, datetime as _dt
+
+    _plan_age = ""
+    if _REPLEN_PARQUET.exists():
+        _mtime = _dt.datetime.fromtimestamp(_REPLEN_PARQUET.stat().st_mtime)
+        _plan_age = f"Plan last generated: {_mtime.strftime('%d-%b-%Y %H:%M')}"
+
+    _col_age, _col_btn = st.columns([3, 1])
+    with _col_age:
+        if _plan_age:
+            st.caption(_plan_age)
+        else:
+            st.caption("No plan generated yet — click Refresh to generate.")
+    with _col_btn:
+        _refresh = st.button("🔄 Refresh & Download Replen Plan", key="replen_refresh_btn")
+
+    if _refresh:
+        with st.spinner("Generating replenishment plan (~30s)…"):
+            _result = _sp.run(
+                ["python", "tcb/replenishment.py"],
+                capture_output=True, text=True, encoding="utf-8",
+                cwd=str(Path(".").resolve()),
+            )
+        if _result.returncode == 0:
+            _replen_files = sorted(_glob.glob(
+                "data/blinkit/auto/replenishment/replenishment_plan_*.xlsx"), reverse=True)
+            if _replen_files:
+                with open(_replen_files[0], "rb") as _fh:
+                    st.session_state["_replen_dl_bytes"] = _fh.read()
+                    st.session_state["_replen_dl_fname"] = os.path.basename(_replen_files[0])
+            st.success("Plan refreshed!")
+        else:
+            st.error(f"Plan generation failed:\n{_result.stderr[-600:]}")
+
+    # Show download button: use freshly generated bytes if available, else latest file on disk
+    _dl_bytes = st.session_state.get("_replen_dl_bytes")
+    _dl_fname = st.session_state.get("_replen_dl_fname")
+    if not _dl_bytes:
+        _replen_files = sorted(_glob.glob(
+            "data/blinkit/auto/replenishment/replenishment_plan_*.xlsx"), reverse=True)
+        if _replen_files:
+            with open(_replen_files[0], "rb") as _fh:
+                _dl_bytes = _fh.read()
+            _dl_fname = os.path.basename(_replen_files[0])
+    if _dl_bytes:
+        st.download_button(
+            "⬇ Download Replenishment Plan",
+            _dl_bytes,
+            file_name=_dl_fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_replen_excel",
+        )
+
+    # ── Warehouse — City Mapping ───────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Warehouse — City Mapping")
+
+    ds_city_lkp = {d["location_id"]: (d.get("city") or "") for d in all_ds}
+
+    html_rows = []
+    for wh in wh_list:
+        wid   = wh["location_id"]
+        w_ds  = [d for d in all_ds if d["parent_location_id"] == wid]
+        w_ids = {d["location_id"] for d in w_ds}
+
+        ds_closed_count = len({
+            e["location_id"] for e in all_elig
+            if e["location_id"] in w_ids and e["status"] == "darkstore_closed"
+        })
+
+        # All cities served by this WH (from DS records)
+        all_wh_cities = sorted({
+            ds_city_lkp.get(d["location_id"], "")
+            for d in w_ds if ds_city_lkp.get(d["location_id"], "")
+        })
+
+        # Active SKU count per city + WH-level SKUs launched
+        city_active_skus: dict = defaultdict(set)
+        wh_active_skus: set = set()
+        for e in all_elig:
+            if e["location_id"] in w_ids and e["status"] == "active":
+                city = ds_city_lkp.get(e["location_id"], "")
+                if city:
+                    city_active_skus[city].add(e["sku_id"])
+                wh_active_skus.add(e["sku_id"])
+
+        # DS count per city (for the label)
+        city_ds_count: dict = defaultdict(int)
+        for d in w_ds:
+            city = ds_city_lkp.get(d["location_id"], "")
+            if city:
+                city_ds_count[city] += 1
+
+        city_parts = []
+        for city in all_wh_cities:
+            active_skus = len(city_active_skus.get(city, set()))
+            ds_count    = city_ds_count.get(city, 0)
+            if active_skus == 0:
+                color = "#374151"  # black/dark — no SKUs launched in this city
+            elif active_skus >= 10:
+                color = "#22C55E"
+            elif active_skus >= 5:
+                color = "#F97316"
+            else:
+                color = "#EF4444"
+            city_parts.append(
+                f'<span style="color:{color};font-weight:500">{city}&nbsp;({ds_count})</span>'
+            )
+
+        html_rows.append(
+            f"<tr style='border-bottom:1px solid #e5e7eb'>"
+            f"<td style='padding:6px 14px;white-space:nowrap'>{wh['name']}</td>"
+            f"<td style='padding:6px 14px;text-align:center'>{len(w_ds)}</td>"
+            f"<td style='padding:6px 14px;text-align:center'>{ds_closed_count}</td>"
+            f"<td style='padding:6px 14px;text-align:center'>{len(wh_active_skus)}</td>"
+            f"<td style='padding:6px 14px;line-height:1.8'>{',&nbsp; '.join(city_parts) or '—'}</td>"
+            f"</tr>"
+        )
+
+    mapping_html = (
+        "<table style='border-collapse:collapse;width:100%;font-size:13px'>"
+        "<thead><tr style='border-bottom:2px solid #9ca3af;background:rgba(0,0,0,0.03)'>"
+        "<th style='padding:7px 14px;text-align:left'>Warehouse</th>"
+        "<th style='padding:7px 14px;text-align:center'>Total DS</th>"
+        "<th style='padding:7px 14px;text-align:center'>DS Closed</th>"
+        "<th style='padding:7px 14px;text-align:center'>SKUs Launched</th>"
+        "<th style='padding:7px 14px;text-align:left'>Cities Served</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(html_rows)}</tbody></table>"
+    )
+    st.markdown(mapping_html, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":

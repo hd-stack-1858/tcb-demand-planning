@@ -46,7 +46,7 @@ def get_skus(active_only=True):
     db = get_client()
     q = db.table("skus").select("*")
     if active_only:
-        q = q.eq("is_active", True)
+        q = q.eq("is_discontinued", False)
     return q.order("sku_id").execute().data
 
 
@@ -138,6 +138,61 @@ def get_orders_raw(start_date: str | None = None, end_date: str | None = None) -
         row["channel_code"] = ch.get("code", "")
         row["sku_name"]     = sk.get("name", row["sku_id"])
     return orders
+
+
+def get_blinkit_city_ds(sku_id: str) -> list[dict]:
+    """
+    For a given SKU, return one row per Blinkit dark store with:
+      location_id, name, city, status (from eligibility, or 'no_data' if absent)
+    Used by the Blinkit Deepdive dashboard tab.
+    """
+    db = get_client()
+
+    # All active Blinkit DS with city
+    ds_rows = (
+        db.table("partner_locations")
+        .select("location_id, name, city")
+        .eq("channel_id", 4)
+        .eq("location_type", "DARKSTORE")
+        .eq("is_active", True)
+        .execute().data
+    )
+    if not ds_rows:
+        return []
+
+    # Eligibility for this SKU
+    elig_rows = (
+        db.table("blinkit_ds_sku_eligibility")
+        .select("location_id, status")
+        .eq("sku_id", sku_id)
+        .execute().data
+    )
+    elig_map = {r["location_id"]: r["status"] for r in elig_rows}
+
+    for row in ds_rows:
+        row["status"] = elig_map.get(row["location_id"], "no_data")
+        if not row.get("city"):
+            row["city"] = row["name"].strip().split()[0]
+
+    # For no_data DS: if the store is darkstore_closed for any other SKU,
+    # the physical store is closed — promote to darkstore_closed.
+    no_data_ids = [r["location_id"] for r in ds_rows if r["status"] == "no_data"]
+    if no_data_ids:
+        cross_elig = (
+            db.table("blinkit_ds_sku_eligibility")
+            .select("location_id, status")
+            .in_("location_id", no_data_ids)
+            .eq("status", "darkstore_closed")
+            .execute().data
+        )
+        closed_ids = {r["location_id"] for r in cross_elig}
+        for row in ds_rows:
+            if row["status"] == "no_data" and row["location_id"] in closed_ids:
+                row["status"] = "darkstore_closed"
+
+    return ds_rows
+
+
 
 
 def record_transaction(txn: dict):

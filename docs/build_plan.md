@@ -1,6 +1,6 @@
 # Sales MIS + Demand Planning System — Build Plan
 
-*Last updated: 23-May 2026*
+*Last updated: 24-May 2026*
 
 ---
 
@@ -356,6 +356,27 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 | ~~Blinkit ageing scraper (G6, weekly)~~ | ~~Medium~~ | ✅ Dropped 23-May — critical analysis concluded ageing adds no value to the replenishment quantity decision. Replen formula (ADS × 37 − effective_stock) already prevents over-replenishment; sku_moved_out_low_sales status already captures the downstream signal. `blinkit_ageing_snapshots` table dropped from prod. Manual portal check sufficient for the rare recall decision. |
 | WH-OOS fallback ADS | Low | Explicitly deferred — Himanshu knows affected WHs (Hyd H3) by heart for now |
 | Streamlit tab in tinysteps_app.py | Low | Deferred until CLI fully validated against several real replenishment cycles |
+
+### J — ds_choked + Data Quality Triggers (24-May-2026) — Pending Review
+
+Built 24-May-2026. **Review tomorrow (25-May) before committing.**
+
+| Change | File | What it does |
+|--------|------|--------------|
+| `ds_choked` status classification | `ingest/blinkit_performance_loader.py` | N-rows with blank DS remark + FE movement bottleneck in Col S → `status='ds_choked'` instead of silently dropped. Affects ~291 DS-SKU pairs. |
+| Trigger 1 — vanished-Y DS | `ingest/blinkit_performance_loader.py` | After each loader run: compares DB `status='active'` vs latest CSV DS-SKU pairs. Prints `[ALERT]` for any active DS absent from latest file. |
+| Trigger 2 — DS-level OOS | `ingest/blinkit_performance_loader.py` | Y-rows with `available_hours=0` and no WH OOS remark → `[ALERT]`. Forward guard; currently never fires. |
+| Replen engine + Excel | `tcb/replenishment.py` | `ds_choked` in `_STATUS_COLS`; `_load_elig_for_plan()` returns choked counts; `ds_choked_count` in plan rows; `load_perf_ds_active_y()` for non-tautological check; new `ds_choked` column in Overview-SKU + Overview-WH sheets. |
+| Dashboard — Blinkit Deepdive | `ui/growthspurt_app.py` | `ds_choked` in status chart (amber); 8-column KPI row; Choked DS column in Inventory Health table; Data Quality Alerts section (Trigger 1 + 2 warning banners). |
+| One-time reset script | `setup/archive/_reset_blinkit_performance.py` | TRUNCATE eligibility + ADS tables, reload from latest CSV by mtime. Run once before daily downloads resume to get a clean start. |
+
+**Reset completed 24-May-2026:** `_reset_blinkit_performance.py --go` run successfully.
+- 5,041 eligibility rows | 11,181 ADS rows loaded from latest file (23-May)
+- 19 `ds_choked` rows correctly classified | 221 `active` | 628 `launch_awaited` | 74 `darkstore_closed`
+- Prod CHECK constraint updated to include `ds_choked` (run manually in Supabase SQL editor)
+- Dev DB constraint updated via psycopg2 | `setup/22_blinkit_replenishment_tables.sql` updated
+
+**Before committing:** Review dashboard (Blinkit Deepdive tab) and replen Excel tomorrow (25-May). Confirm `ds_choked` appears in status chart, KPI row, Inventory Health table, and Overview sheets. Then commit all 5 files together.
 
 ### J — DB + Folder Cleanup (23-May-2026)
 

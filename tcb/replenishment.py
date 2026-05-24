@@ -200,13 +200,94 @@ def load_ds_locations() -> pd.DataFrame:
         columns=['location_id', 'name', 'code', 'parent_location_id', 'city'])
 
 
-def load_excluded_ds_skus() -> set[tuple]:
+def _load_elig_for_plan(ds_to_wh: dict) -> tuple[set, dict]:
     """
-    Return (location_id, sku_id) pairs that are explicitly excluded from replenishment.
-    Absence of an eligibility row = active (default). Only explicit non-active statuses exclude.
+    Load eligibility data for the replenishment plan.
+    Returns:
+      excluded: set of (location_id, sku_id) pairs that are not 'active' (all non-active statuses
+                including ds_choked are excluded from ADS computation)
+      choked:   dict of (wh_id, sku_id) -> count of ds_choked DS (for Overview reporting)
     """
     rows = _paginate('blinkit_ds_sku_eligibility', 'location_id,sku_id,status')
-    return {(r['location_id'], r['sku_id']) for r in rows if r.get('status') != 'active'}
+    excluded = {(r['location_id'], r['sku_id']) for r in rows if r.get('status') != 'active'}
+    choked: dict[tuple, int] = {}
+    for r in rows:
+        if r.get('status') == 'ds_choked':
+            wh_id = ds_to_wh.get(r['location_id'])
+            if wh_id:
+                key = (int(wh_id), r['sku_id'])
+                choked[key] = choked.get(key, 0) + 1
+    return excluded, choked
+
+
+def load_perf_ds_active_y(wh_df: pd.DataFrame,
+                           item_to_sku: dict[str, str]) -> dict[tuple, int]:
+    """
+    Scan the latest performance CSV (highest mtime) for Col R = Y rows.
+    Returns count of active DS per (wh_location_id, sku_id) from that file.
+    This is the independent CSV-based signal for the non-tautological check.
+    """
+    code_to_id = wh_df.set_index('code')['location_id'].to_dict()
+
+    all_files: list[Path] = []
+    for d in _PERF_DETAIL_DIRS:
+        if d.exists():
+            all_files.extend(d.glob('*.csv'))
+
+    valid: list[Path] = []
+    for fpath in all_files:
+        try:
+            hdr = pd.read_csv(fpath, nrows=0)
+            hdr.columns = [c.strip() for c in hdr.columns]
+            if _PERF_REQUIRED_COLS.issubset(set(hdr.columns)):
+                valid.append(fpath)
+        except Exception:
+            continue
+
+    if not valid:
+        return {}
+
+    latest_file = max(valid, key=lambda f: f.stat().st_mtime)
+
+    try:
+        df = pd.read_csv(
+            latest_file,
+            usecols=['Item ID', 'Darkstore name',
+                     'Considered for assessment (Y/N)',
+                     'Serving warehouse', 'Date'],
+            low_memory=False,
+        )
+        df.columns = [c.strip() for c in df.columns]
+    except Exception:
+        return {}
+
+    df['Date'] = pd.to_datetime(
+        df['Date'].str.replace(r'\s+\+\d{4}\s+UTC', '', regex=True),
+        utc=True, errors='coerce',
+    ).dt.date
+    df = df.dropna(subset=['Item ID', 'Darkstore name', 'Date'])
+
+    # Latest row per (Item ID, Darkstore name)
+    latest_per_pair = (
+        df.sort_values('Date', ascending=False)
+        .drop_duplicates(subset=['Item ID', 'Darkstore name'])
+    )
+
+    result: dict[tuple, int] = {}
+    for _, row in latest_per_pair.iterrows():
+        if str(row['Considered for assessment (Y/N)']).strip() != 'Y':
+            continue
+        sku_id  = item_to_sku.get(str(row['Item ID']).strip())
+        wh_code = _PERF_WH_TO_CODE.get(str(row['Serving warehouse']).strip())
+        if not sku_id or not wh_code:
+            continue
+        wh_id = code_to_id.get(wh_code)
+        if not wh_id:
+            continue
+        key = (int(wh_id), sku_id)
+        result[key] = result.get(key, 0) + 1
+
+    return result
 
 
 def load_performance_data(days_back: int = PERF_LOOKBACK) -> pd.DataFrame:
@@ -348,13 +429,17 @@ def compute_replenishment_plan(
     Rows with units_to_ship == 0 are included (for visibility) but should not be shipped.
     """
     print('Loading master data...')
-    wh_df      = load_wh_locations()
-    ds_df      = load_ds_locations()
-    excluded   = load_excluded_ds_skus()   # explicitly inactive DS-SKU pairs
-    sku_names  = load_sku_names()
-    sp_lookup  = load_sp_lookup()
+    wh_df     = load_wh_locations()
+    ds_df     = load_ds_locations()
+    sku_names = load_sku_names()
+    sp_lookup = load_sp_lookup()
 
-    print(f'  WHs: {len(wh_df)} | DS: {len(ds_df)} | Explicitly excluded DS-SKUs: {len(excluded)}')
+    # ds_to_wh needed before eligibility load (for choked count bucketing)
+    ds_to_wh_pre = ds_df.set_index('location_id')['parent_location_id'].to_dict()
+    excluded, choked_per_wh_sku = _load_elig_for_plan(ds_to_wh_pre)
+
+    print(f'  WHs: {len(wh_df)} | DS: {len(ds_df)} | Excluded DS-SKUs: {len(excluded)} '
+          f'| Choked WH-SKU buckets: {len(choked_per_wh_sku)}')
 
     print('Loading performance data...')
     perf_df = load_performance_data(days_back=PERF_LOOKBACK)
@@ -464,8 +549,10 @@ def compute_replenishment_plan(
             'sku_id':            sku_id,
             'sku_name':          sku_names.get(sku_id, sku_id),
             'active_ds_count':   active_ds_count,
+            'ds_choked_count':   choked_per_wh_sku.get((int(wh_id), sku_id), 0),
             'ds_with_data':      ds_with_data,
-            'avg_ads_per_ds':    round(avg_ads_per_ds, 2),
+            'ds_with_oos':       ds_with_oos,
+            'avg_ads_per_ds':    round(avg_ads_per_ds, 4),
             'total_ads':         round(total_ads, 2),
             'total_demand_30d':  round(total_demand),
             'transit_buffer_7d': round(transit_stock),
@@ -503,6 +590,7 @@ _STATUS_COLS = {
     'sku_city_exited':         'ds_exited',
     'sku_recalled':            'ds_recalled',
     'sku_moved_out_low_sales': 'ds_low_sales',
+    'ds_choked':               'ds_choked',
 }
 
 
@@ -513,6 +601,7 @@ def compute_overview(
     wh_df: pd.DataFrame,
     sku_names: dict,
     perf_universe: set[tuple] | None = None,
+    active_y_counts: dict | None = None,
 ) -> pd.DataFrame:
     """
     Build the overview table: one row per WH x SKU.
@@ -570,10 +659,19 @@ def compute_overview(
         ds_exited       = counts.get('ds_exited', 0)
         ds_recalled     = counts.get('ds_recalled', 0)
         ds_low_sales    = counts.get('ds_low_sales', 0)
-        ds_active_y     = active_elig.get(key, 0)
+        ds_choked       = counts.get('ds_choked', 0)
+        ds_active_db    = active_elig.get(key, 0)   # DB status='active' count
 
-        total_ds        = ds_active_y + ds_closed + ds_not_launched + ds_exited + ds_recalled + ds_low_sales
-        ds_active_check = total_ds - ds_closed - ds_not_launched - ds_exited - ds_recalled - ds_low_sales
+        # ds_active_y_flag: CSV-based Y-count (independent signal for non-tautological check).
+        # Falls back to DB active count if CSV scan not available.
+        ds_active_y_flag = (active_y_counts or {}).get(key, ds_active_db)
+
+        total_ds        = (ds_active_db + ds_choked + ds_closed +
+                           ds_not_launched + ds_exited + ds_recalled + ds_low_sales)
+        # ds_active_check is derived independently from total_ds — should equal ds_active_y_flag.
+        # Discrepancy signals vanished-Y DS (Trigger 1) or unclassified N-rows.
+        ds_active_check = (total_ds - ds_closed - ds_not_launched -
+                           ds_choked - ds_exited - ds_recalled - ds_low_sales)
 
         plan_r = plan_lookup.get((sku_id, wh_id))
         if plan_r is not None:
@@ -596,10 +694,11 @@ def compute_overview(
             'sku_id':            sku_id,
             'sku_name':          sku_names.get(sku_id, sku_id),
             'wh':                wh_name,
-            'ds_active_y_flag':  ds_active_y,
+            'ds_active_y_flag':  ds_active_y_flag,
             'total_ds':          total_ds,
             'ds_closed':         ds_closed,
             'ds_not_launched':   ds_not_launched,
+            'ds_choked':         ds_choked,
             'ds_exited':         ds_exited,
             'ds_recalled':       ds_recalled,
             'ds_low_sales':      ds_low_sales,
@@ -748,8 +847,8 @@ def write_excel(plan_df: pd.DataFrame, overview_df: pd.DataFrame,
         if not overview_df.empty:
             ov_wh = overview_df[['wh', 'sku_id', 'sku_name',
                                   'ds_active_y_flag', 'total_ds', 'ds_closed',
-                                  'ds_not_launched', 'ds_exited', 'ds_recalled',
-                                  'ds_low_sales', 'ds_active_check',
+                                  'ds_not_launched', 'ds_choked', 'ds_exited',
+                                  'ds_recalled', 'ds_low_sales', 'ds_active_check',
                                   'avg_ads_per_ds', 'total_ads',
                                   'total_demand_30d', 'transit_buffer_7d',
                                   'wh_soh', 'incoming', 'in_transit',
@@ -811,8 +910,11 @@ def main():
     sku_names      = load_sku_names()
     item_to_sku    = load_item_to_sku_lookup()
     perf_universe  = load_perf_wh_sku_universe(wh_df, item_to_sku)
+    active_y_counts = load_perf_ds_active_y(wh_df, item_to_sku)
     print(f'  Perf universe: {len(perf_universe)} WH-SKU pairs from CSVs')
-    overview_df    = compute_overview(plan_df, ds_df, eligibility_df, wh_df, sku_names, perf_universe)
+    print(f'  Active-Y DS counts from latest CSV: {sum(active_y_counts.values())} DS across {len(active_y_counts)} WH-SKU pairs')
+    overview_df    = compute_overview(plan_df, ds_df, eligibility_df, wh_df, sku_names,
+                                      perf_universe, active_y_counts)
     print(f'  Overview rows: {len(overview_df)}')
     geo_df         = compute_geo_summary(wh_df, eligibility_df)
     print(f'  Geo rows: {len(geo_df)}')
@@ -847,7 +949,7 @@ def main():
     if not overview_df.empty:
         print(f'\n── Overview ─────────────────────────────────────────────')
         ov_cols = ['sku_id', 'wh', 'ds_active_y_flag', 'total_ds',
-                   'ds_closed', 'ds_not_launched', 'ds_exited',
+                   'ds_closed', 'ds_not_launched', 'ds_choked', 'ds_exited',
                    'ds_recalled', 'ds_low_sales', 'ds_active_check',
                    'avg_ads_per_ds', 'total_ads', 'total_demand_30d', 'transit_buffer_7d',
                    'wh_soh', 'incoming', 'in_transit', 'ds_inventory',
@@ -860,6 +962,10 @@ def main():
 
     fpath = write_excel(plan_df, overview_df, geo_df)
     print(f'\nPlan written: {fpath}')
+
+    parquet_path = OUTPUT_DIR / 'replenishment_plan_latest.parquet'
+    plan_df.to_parquet(parquet_path, index=False)
+    print(f'Parquet cache written: {parquet_path}')
 
 
 if __name__ == '__main__':
