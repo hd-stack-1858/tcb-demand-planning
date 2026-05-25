@@ -2183,17 +2183,29 @@ def tab_blinkit_deepdive() -> None:
                     city_active_skus[city].add(e["sku_id"])
                 wh_active_skus.add(e["sku_id"])
 
-        # DS count per city (for the label)
+        # DS count per city (total and closed)
         city_ds_count: dict = defaultdict(int)
         for d in w_ds:
             city = ds_city_lkp.get(d["location_id"], "")
             if city:
                 city_ds_count[city] += 1
 
+        closed_ds_ids_wh = {
+            e["location_id"] for e in all_elig
+            if e["location_id"] in w_ids and e["status"] == "darkstore_closed"
+        }
+        city_closed_ds_count: dict = defaultdict(int)
+        for d in w_ds:
+            city = ds_city_lkp.get(d["location_id"], "")
+            if city and d["location_id"] in closed_ds_ids_wh:
+                city_closed_ds_count[city] += 1
+
         city_parts = []
         for city in all_wh_cities:
-            active_skus = len(city_active_skus.get(city, set()))
-            ds_count    = city_ds_count.get(city, 0)
+            active_skus    = len(city_active_skus.get(city, set()))
+            total_ds       = city_ds_count.get(city, 0)
+            closed_ds      = city_closed_ds_count.get(city, 0)
+            active_ds      = total_ds - closed_ds
             if active_skus == 0:
                 color = "#374151"  # black/dark — no SKUs launched in this city
             elif active_skus >= 10:
@@ -2203,7 +2215,7 @@ def tab_blinkit_deepdive() -> None:
             else:
                 color = "#EF4444"
             city_parts.append(
-                f'<span style="color:{color};font-weight:500">{city}&nbsp;({ds_count})</span>'
+                f'<span style="color:{color};font-weight:500">{city}&nbsp;({active_ds})</span>'
             )
 
         html_rows.append(
@@ -2223,7 +2235,7 @@ def tab_blinkit_deepdive() -> None:
         "<th style='padding:7px 14px;text-align:center'>Total DS</th>"
         "<th style='padding:7px 14px;text-align:center'>DS Closed</th>"
         "<th style='padding:7px 14px;text-align:center'>SKUs Launched</th>"
-        "<th style='padding:7px 14px;text-align:left'>Cities Served</th>"
+        "<th style='padding:7px 14px;text-align:left'>Cities Served (Active DS count)</th>"
         "</tr></thead>"
         f"<tbody>{''.join(html_rows)}</tbody></table>"
     )
