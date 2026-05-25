@@ -1349,8 +1349,7 @@ def tab_geography(fdf: pd.DataFrame, net_mode: bool) -> None:
     geo_rows   = len(geo)
     coverage   = pct(geo_rows, total_rows)
     st.info(
-        f"**{coverage:.0f}% of filtered orders ({geo_rows:,} of {total_rows:,}) "
-        f"have city/state data** and are included in the charts below.  "
+        f"All orders that have geo data (currently {coverage:.0f}%) are included in the charts below. "
         f"Cancelled orders are excluded from this tab."
     )
 
@@ -1542,79 +1541,68 @@ def tab_geography(fdf: pd.DataFrame, net_mode: bool) -> None:
         _bar_totals(fig_state, state_ch, "state")
         st.plotly_chart(fig_state, use_container_width=True)
 
-    # ── Blinkit — City Performance ────────────────────────────────────────────
-    blinkit_geo = geo[geo["channel_name"] == "Blinkit"]
-    if not blinkit_geo.empty:
-        st.markdown("---")
-        st.subheader("Blinkit — City Performance")
+    # ── City-wise Trend ────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("City-wise Trend")
 
-        col_left, col_right = st.columns([1, 2])
+    _TREND_GROUPS = {
+        "Bengaluru":          "Bengaluru",
+        "New Delhi":          "NCR",           "Gurgaon":        "NCR",
+        "Ghaziabad":          "NCR",           "Faridabad":      "NCR",
+        "Noida":              "NCR",           "Greater Noida":  "NCR",
+        "Hyderabad":          "Hyderabad",
+        "Mumbai":             "Greater Mumbai", "Navi Mumbai":   "Greater Mumbai",
+        "Thane":              "Greater Mumbai", "Kalyan":        "Greater Mumbai",
+        "Mira-Bhayandar":     "Greater Mumbai", "Mira Bhayandar":"Greater Mumbai",
+        "Vasai-Virar":        "Greater Mumbai", "Vasai Virar":   "Greater Mumbai",
+        "Vasai":              "Greater Mumbai", "Virar":         "Greater Mumbai",
+        "Panvel":             "Greater Mumbai", "Bhiwandi-Nizampur":"Greater Mumbai",
+        "Chennai":            "Chennai",
+        "Pune":               "Greater Pune",  "Pimpri Chinchwad":"Greater Pune",
+        "Ahmedabad":          "Ahmedabad",
+        "Kolkata":            "Kolkata",
+    }
+    _GROUP_ORDER = [
+        "Bengaluru", "NCR", "Hyderabad", "Greater Mumbai",
+        "Chennai", "Greater Pune", "Ahmedabad", "Kolkata", "All Others",
+    ]
 
-        with col_left:
-            bk_city = (
-                blinkit_geo.groupby("city")
-                .agg(
-                    Orders=("order_id", "count"),
-                    Units=("quantity", "sum"),
-                    Revenue=("gross_value", "sum"),
-                )
-                .reset_index()
-                .sort_values("Units", ascending=False)
-            )
-            bk_city["Revenue"] = bk_city["Revenue"].apply(fmt_inr)
-            total_row = pd.DataFrame([{
-                "city":    "TOTAL",
-                "Orders":  bk_city["Orders"].sum(),
-                "Units":   bk_city["Units"].sum(),
-                "Revenue": fmt_inr(blinkit_geo["gross_value"].sum()),
-            }])
-            bk_display = pd.concat([bk_city, total_row], ignore_index=True).rename(columns={"city": "City"})
+    _trend_metric = st.radio(
+        "Metric", ["Units", "Revenue"], horizontal=True, key="geo_city_trend_metric"
+    )
+    _trend_vcol = "quantity" if _trend_metric == "Units" else "gross_value"
 
-            def _bold_blinkit_total(styler):
-                n = len(styler.data)
-                return styler.set_properties(
-                    subset=pd.IndexSlice[n - 1, :],
-                    **{"font-weight": "bold", "border-top": "1px solid #ccc"},
-                )
+    _geo_tr = geo.copy()
+    _geo_tr["city_group"] = _geo_tr["city"].map(_TREND_GROUPS).fillna("All Others")
 
-            st.dataframe(
-                _bold_blinkit_total(bk_display.style),
-                use_container_width=True,
-                hide_index=True,
-            )
+    _trend_agg = (
+        _geo_tr.groupby(["month_dt", "city_group"])[_trend_vcol]
+        .sum()
+        .reset_index()
+    )
+    _trend_agg["Month"] = _trend_agg["month_dt"].dt.strftime("%b %Y")
+    _trend_agg = _project_col(_trend_agg, _trend_vcol, _cur_mult())
+    _month_order = _trend_agg.sort_values("month_dt")["Month"].unique().tolist()
 
-        with col_right:
-            bk_trend = (
-                blinkit_geo.groupby(["month_dt", "city"])["quantity"].sum()
-                .reset_index()
-            )
-            bk_trend["Month"] = bk_trend["month_dt"].dt.strftime("%b %Y")
-            bk_trend = _project_col(bk_trend, "quantity", _cur_mult())
-            month_order = bk_trend.sort_values("month_dt")["Month"].unique().tolist()
-
-            all_bk_cities = sorted(blinkit_geo["city"].unique().tolist())
-            sel_bk_cities = st.multiselect(
-                "Cities to show",
-                options=all_bk_cities,
-                default=all_bk_cities,
-                key="bk_city_sel",
-            )
-            bk_plot = bk_trend[bk_trend["city"].isin(sel_bk_cities)] if sel_bk_cities else bk_trend
-
-            fig_bk = px.line(
-                bk_plot,
-                x="Month", y="quantity", color="city",
-                markers=True,
-                labels={"quantity": "Units", "city": "City"},
-                category_orders={"Month": month_order},
-            )
-            fig_bk.update_layout(
-                xaxis_title=None, yaxis_title="Units",
-                margin=dict(t=10),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            )
-            st.caption("Monthly units — current month projected to full month")
-            st.plotly_chart(fig_bk, use_container_width=True)
+    if not _trend_agg.empty:
+        _fig_ct = px.line(
+            _trend_agg,
+            x="Month", y=_trend_vcol, color="city_group",
+            markers=True,
+            labels={_trend_vcol: _trend_metric, "city_group": "City"},
+            category_orders={"Month": _month_order, "city_group": _GROUP_ORDER},
+        )
+        _fig_ct.update_layout(
+            xaxis_title=None,
+            yaxis_title=_trend_metric,
+            margin=dict(t=10),
+            height=420,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        if _trend_metric == "Revenue":
+            _fig_ct.update_layout(yaxis=dict(tickformat=",.0f", tickprefix="₹"))
+        st.caption("Current month projected to full month")
+        st.plotly_chart(_fig_ct, use_container_width=True)
 
 
 # ── Auth gate ──────────────────────────────────────────────────────────────────
@@ -1675,7 +1663,7 @@ def main():
 
     t1, t2, t3, t4, t5, t6, t7 = st.tabs([
         "📊 Overview", "📈 Trends", "🏪 By Channel", "📦 By SKU",
-        "🔄 Returns", "🗺️ Geography", "🟡 Blinkit Deepdive",
+        "🔄 Returns", "🗺️ Geo", "🟡 Blinkit Deepdive",
     ])
     with t1:
         tab_overview(raw_df, fdf, filters["net_mode"], filters)
@@ -1690,7 +1678,7 @@ def main():
     with t6:
         tab_geography(fdf, filters["net_mode"])
     with t7:
-        tab_blinkit_deepdive()
+        tab_blinkit_deepdive(fdf, filters["net_mode"])
 
 
 # ── Blinkit Deepdive tab ───────────────────────────────────────────────────────
@@ -1804,7 +1792,7 @@ def _load_all_elig() -> list:
     return rows
 
 
-def tab_blinkit_deepdive() -> None:
+def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
     """Blinkit Deepdive — stacked horizontal bar of dark store status per city, per SKU."""
     st.markdown("#### Darkstore Launch Status")
 
@@ -2093,11 +2081,44 @@ def tab_blinkit_deepdive() -> None:
             "Total Inventory": int(pr["effective_stock"].iloc[0]) if not pr.empty else 0,
             "Target Stock":    int(pr["target_stock"].iloc[0]) if not pr.empty else 0,
             "To Ship":         int(pr["units_to_ship"].iloc[0]) if not pr.empty else 0,
-            "Invoice Value":   int(pr["invoice_value"].iloc[0]) if not pr.empty else 0,
+            "Invoice Value (₹)": int(pr["invoice_value"].iloc[0]) if not pr.empty else 0,
         })
 
     if wh_status_rows:
-        st.dataframe(pd.DataFrame(wh_status_rows), use_container_width=True, hide_index=True)
+        _wh_cols = ["SKU Code", "SKU Name", "Active", "Not Launched",
+                    "Total ADS", "Total Inventory", "Target Stock", "To Ship", "Invoice Value (₹)"]
+        _wh_df = pd.DataFrame(wh_status_rows)[_wh_cols].copy()
+
+        # Totals row
+        _totals = {
+            "SKU Code":          "",
+            "SKU Name":          "Total",
+            "Active":            _wh_df["Active"].sum(),
+            "Not Launched":      _wh_df["Not Launched"].sum(),
+            "Total ADS":         round(_wh_df["Total ADS"].sum(), 2),
+            "Total Inventory":   _wh_df["Total Inventory"].sum(),
+            "Target Stock":      _wh_df["Target Stock"].sum(),
+            "To Ship":           _wh_df["To Ship"].sum(),
+            "Invoice Value (₹)": _wh_df["Invoice Value (₹)"].sum(),
+        }
+        _wh_df = pd.concat([_wh_df, pd.DataFrame([_totals])], ignore_index=True)
+
+        _last = len(_wh_df) - 1
+        _styled = _wh_df.style.apply(
+            lambda row: ["font-weight: bold" if row.name == _last else "" for _ in row],
+            axis=1,
+        )
+        st.dataframe(
+            _styled,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Total ADS": st.column_config.NumberColumn("Total ADS", format="%.2f"),
+                "Invoice Value (₹)": st.column_config.NumberColumn(
+                    "Invoice Value (₹)", format="%,.0f"
+                ),
+            },
+        )
     else:
         st.info("No SKUs found for this WH / City selection.")
 
@@ -2248,6 +2269,88 @@ def tab_blinkit_deepdive() -> None:
         f"<tbody>{''.join(html_rows)}</tbody></table>"
     )
     st.markdown(mapping_html, unsafe_allow_html=True)
+
+    # ── City Performance ───────────────────────────────────────────────────────
+    _CITY_NORM_BK = {
+        "Delhi": "New Delhi", "Bangalore": "Bengaluru",
+        "Gurugram": "Gurgaon", "Bengalore": "Bengaluru", "Bangaluru": "Bengaluru",
+    }
+    _gdf_bk = active_df(fdf, net_mode).copy()
+    _gdf_bk["city"] = _gdf_bk["city"].str.strip().str.title().replace(_CITY_NORM_BK)
+    _geo_bk = _gdf_bk[_gdf_bk["city"].notna() & _gdf_bk["state"].notna()]
+    blinkit_geo = _geo_bk[_geo_bk["channel_name"] == "Blinkit"].copy()
+
+    if not blinkit_geo.empty:
+        st.markdown("---")
+        st.markdown("#### City Performance")
+
+        col_left, col_right = st.columns([1, 2])
+
+        with col_left:
+            bk_city = (
+                blinkit_geo.groupby("city")
+                .agg(
+                    Orders=("order_id", "count"),
+                    Units=("quantity", "sum"),
+                    Revenue=("gross_value", "sum"),
+                )
+                .reset_index()
+                .sort_values("Units", ascending=False)
+            )
+            bk_city["Revenue"] = bk_city["Revenue"].apply(fmt_inr)
+            total_row = pd.DataFrame([{
+                "city":    "TOTAL",
+                "Orders":  bk_city["Orders"].sum(),
+                "Units":   bk_city["Units"].sum(),
+                "Revenue": fmt_inr(blinkit_geo["gross_value"].sum()),
+            }])
+            bk_display = pd.concat([bk_city, total_row], ignore_index=True).rename(columns={"city": "City"})
+
+            def _bold_blinkit_total(styler):
+                n = len(styler.data)
+                return styler.set_properties(
+                    subset=pd.IndexSlice[n - 1, :],
+                    **{"font-weight": "bold", "border-top": "1px solid #ccc"},
+                )
+
+            st.dataframe(
+                _bold_blinkit_total(bk_display.style),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with col_right:
+            bk_trend = (
+                blinkit_geo.groupby(["month_dt", "city"])["quantity"].sum()
+                .reset_index()
+            )
+            bk_trend["Month"] = bk_trend["month_dt"].dt.strftime("%b %Y")
+            bk_trend = _project_col(bk_trend, "quantity", _cur_mult())
+            month_order = bk_trend.sort_values("month_dt")["Month"].unique().tolist()
+
+            all_bk_cities = sorted(blinkit_geo["city"].unique().tolist())
+            sel_bk_cities = st.multiselect(
+                "Cities to show",
+                options=all_bk_cities,
+                default=all_bk_cities,
+                key="bk_city_sel_dd",
+            )
+            bk_plot = bk_trend[bk_trend["city"].isin(sel_bk_cities)] if sel_bk_cities else bk_trend
+
+            fig_bk = px.line(
+                bk_plot,
+                x="Month", y="quantity", color="city",
+                markers=True,
+                labels={"quantity": "Units", "city": "City"},
+                category_orders={"Month": month_order},
+            )
+            fig_bk.update_layout(
+                xaxis_title=None, yaxis_title="Units",
+                margin=dict(t=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.caption("Monthly units — current month projected to full month")
+            st.plotly_chart(fig_bk, use_container_width=True)
 
 
 if __name__ == "__main__":

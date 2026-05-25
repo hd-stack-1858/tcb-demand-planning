@@ -1,6 +1,6 @@
 # Sales MIS + Demand Planning System — Build Plan
 
-*Last updated: 24-May-2026*
+*Last updated: 25-May-2026*
 
 ---
 
@@ -21,12 +21,12 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | `ui/tinysteps_app.py` | Warehouse app — Ship Out, Inward, Assembly, Write-off, Reorder, Geography |
 | `ui/growthspurt_app.py` | Sales MIS — Overview, Trends, By Channel, By SKU, Returns, Geography |
 | Return reason fields | `return_reason`, `return_responsible`, `return_customer_verbatim` — all channels |
-| COGS / lot system | FIFO lot consumption for Amazon FBA and Blinkit |
+| COGS / lot system | Full lot-based COGS for all 6 channels. Migration 014: `orders.lot_id` (FK → `sku_cogs_lots`) + `orders.supply_state`. Per-channel finalization functions (`finalize_az_cogs`, `finalize_blk_cogs`, `finalize_fnp_fc_cogs`) stamp lot_id + cogs + `lot_cogs_finalized=True`. Order rows split per lot for multi-lot dispatches. |
 | `mcp/server.py` | Vignesh — FastMCP server, 9 tools, connected to Claude.ai + Claude Desktop |
 | `automation/blinkit_scraper.py` + `blinkit_auth.py` | Playwright scraper — logs into Blinkit portal, downloads last-7d XLSX, ingests to DB. Headless timing fixed 17-May (sleep 8s, selector timeout 10s). |
 | `automation/whatsapp.py` | Meta Cloud API sender — daily briefing to Himanshu + Shubhra. Newline sanitization added (flattens `\n` → ` | ` before API call). Live tested 17-May-2026. |
 | `automation/daily_summary.py` | Queries yesterday's orders, formats WhatsApp message. PENDING orders included in unit count (matches MIS). |
-| `automation/daily_runner.py` | Orchestrator — G1 (Amazon) + G2 (Blinkit sales) + G3 (WhatsApp) + G4 (Blinkit performance scraper, runs last ~20 min). Logs to automation/logs/. HTTPError exception handler fixed. |
+| `automation/daily_runner.py` | Orchestrator — G1 (Amazon) + G1b (AZ COGS finalization) + G2 (Blinkit sales) + G2b (BLK COGS finalization) + G3 (WhatsApp) + G4 (SOH scraper) + G5 (performance scraper) + G6 (dev DB ping). Logs to automation/logs/. HTTPError exception handler fixed. |
 | Windows Task Scheduler — daily_runner | "Blinkit Sales_Daily Run" — triggers daily_runner.py at 12:01 IST. First run: 16-May-2026. |
 | `automation/fnp_scraper.py` | Playwright scraper — accepts FnP orders, downloads Branding Challan PDF, emails. Live tested 17-May-2026 (3 orders). Runs 11:00/14:00/16:00 IST ✅ Active. |
 | `automation/fc_scraper.py` + `fc_auth.py` | Playwright scraper — accepts FC orders, fills shipment dims, downloads Invoice+PackingSlip PDFs, emails. Multi-item order fix 21-May (row-by-row SKU+qty, all Status dropdowns). Runs 10:30/20:00 IST ✅ Active. |
@@ -71,6 +71,51 @@ Phase I           → Gets autonomy. Drafts POs, approves within guardrails, run
 - Daily/weekly briefings — WhatsApp to Himanshu + Shubhra
 - Invoicing — generates GST-compliant invoices for D2C + FnP
 - Amazon ads — pulls ACoS/ROAS from SP-API, flags underperforming campaigns
+
+---
+
+## COGS + Lot Traceability Architecture (25-May-2026)
+
+**Goal:** Every order row in the DB carries the exact lot it was fulfilled from — enabling SKU-level COGS accuracy and a full audit trail from sale back to procurement batch.
+
+### Migration 014
+
+```sql
+ALTER TABLE orders
+  ADD COLUMN lot_id        INT  REFERENCES sku_cogs_lots(lot_id),
+  ADD COLUMN supply_state  TEXT;
+```
+
+Applied to dev + prod. `lot_id` is the FK to `sku_cogs_lots` — the specific lot whose `qty_remaining` was decremented for this order.
+
+### `dispatch_sku()` — plan-return + row splitting
+
+`dispatch_sku(sku_id, qty, channel_id, ...)` now returns `(txn_type, unit_cogs, plan)` where `plan` is a list of dicts `[{lot_id, assembled_at, unit_cogs, qty}, ...]` — one entry per lot consumed. When a dispatch spans N lots, callers insert N order rows, each with its own `lot_id`, `qty`, `cogs`, `gross_value`.
+
+Row splitting applies to:
+- `record_dropship_sale()` — D2C, Peeko, Ozi, Kiddo (Tinysteps dispatch)
+- `record_outright_transfer()` — outright transfer channels
+- `finalize_fnp_fc_cogs()` — FnP/FC finalization (lot[0] updates existing row; lot[1+] inserts `"{order_id}-L{lot_id}"` rows)
+
+### Per-channel COGS finalization
+
+| Channel | Function | When called | Mechanism |
+|---------|----------|-------------|-----------|
+| Amazon FBA | `finalize_az_cogs()` | G1b in daily_runner (after SP-API pull) | `consume_sor_sale()` — tier-1: pools all lots for WHs in the order's customer state; tier-2: all channel lots fallback. No DISPATCH txn inserted. Stamps `lot_id + cogs + lot_cogs_finalized=True`. |
+| Amazon FBM | `finalize_az_cogs()` | G1b in daily_runner | `_consume_lots_fifo()` — all FBM lots FIFO. No DISPATCH txn. |
+| Blinkit | `finalize_blk_cogs()` | G2b in daily_runner (after sales scraper) | `consume_sor_sale()` using `supply_state` captured from payout sheet. No DISPATCH txn. |
+| FnP / FC | `finalize_fnp_fc_cogs()` | End of `load_fnp_sales.py` + `load_fc_sales.py`, after all upserts | `dispatch_sku()` for FULFILLED (creates DISPATCH txn, decrements OWN_WH, consumes lots FIFO). Static fallback COGS for SALE_RETURN (no dispatch, no inventory movement). |
+| D2C, Peeko, Ozi, Kiddo | inline at insert | Tinysteps Ship Out button | `dispatch_sku()` via `record_dropship_sale()` — full treatment: DISPATCH txn + OWN_WH decrement + lot consumption + row splitting. `lot_cogs_finalized=True` on insert. |
+
+### Loader conventions
+
+- **FnP/FC loaders** insert with `cogs=None, lot_cogs_finalized=False`. Update payload guards: `not (k == "cogs" and v is None)` + `not (k == "lot_id" and v is None)` — prevents re-runs from NULLing already-finalized values.
+- **Blinkit daily loader** inserts with `cogs=None, lot_cogs_finalized=False`; captures `supply_state` from Forward Orders sheet into `supply_state_map` for payout finalization.
+- **Historical orders** (`lot_cogs_finalized=True` already set): permanently skipped by all finalization functions.
+
+### `stamp_lot_id_from_dispatch()`
+
+Utility function kept for ad-hoc historical back-fill. Not called from any loader — finalization functions handle all current flows.
 
 ---
 
@@ -156,6 +201,10 @@ Phase I           → Gets autonomy. Drafts POs, approves within guardrails, run
   → python automation/amazon_sp_api.py finances  # settlement data
 ```
 
+### G1b — Amazon COGS finalization ✅ Done
+
+Runs immediately after G1 in `daily_runner.py`. Calls `finalize_az_cogs()` which stamps `lot_id + cogs + lot_cogs_finalized=True` on all pending Amazon orders using `consume_sor_sale()` (FBA, state-level FIFO) or `_consume_lots_fifo()` (FBM). No DISPATCH txns — pure lot consumption + column stamp.
+
 ### G2 — Blinkit daily scraper ✅ Done
 
 **File:** `automation/blinkit_scraper.py` + `automation/blinkit_auth.py`
@@ -165,6 +214,10 @@ Playwright-based. Loads saved session → navigates to Performance → clicks Re
 **Note:** Report is always named `sales-report-last-7d-{yesterday}.xlsx` — latest Blinkit date in DB is always yesterday, not today. This is expected.
 
 **Headless timing fix (17-May-2026):** In headless mode the SPA sidebar renders slower. Bumped post-load sleep 4s→8s and per-selector timeout 5s→10s. First clean headless run expected 18-May noon.
+
+### G2b — Blinkit COGS finalization ✅ Done
+
+Runs immediately after G2 in `daily_runner.py`. Calls `finalize_blk_cogs()` which stamps `cogs + lot_cogs_finalized=True` on pending Blinkit FULFILLED orders using `consume_sor_sale()` with `supply_state` tier-1 (from payout loader) and channel-wide tier-2 fallback. No DISPATCH txns.
 
 ### G3 — WhatsApp daily briefing ✅ Done
 
@@ -403,7 +456,7 @@ Items explicitly decided to skip for now but worth revisiting:
 
 | Item | Context | When to pick up |
 |------|---------|-----------------|
-| `sku_cogs_lot_txns` audit table | `sku_cogs_lots.qty_remaining` is mutated in-place by `_consume_lots_fifo()` and `refresh_blinkit_lots.py` with no log. Unlike inventory, there is no transaction trail — you can't tell which orders consumed a lot or whether a drop was a sale vs. a reconciliation. A log table (lot_id, event_type, qty_change, order_id, reference, txn_date) would close this gap. Code change: one extra insert inside `_consume_lots_fifo()` and `refresh_blinkit_lots.py`. | Before tax/accounting audit queries become needed — likely Phase D or E when COGS accuracy matters for forecasting |
+| `sku_cogs_lot_txns` audit table | `sku_cogs_lots.qty_remaining` is mutated in-place by `_consume_lots_fifo()` and `refresh_blinkit_lots.py` with no log. Unlike inventory, there is no transaction trail for lot consumption — you can reconstruct *which* lot an order used (via `orders.lot_id` added 25-May), but not the reverse (which orders consumed a given lot, or whether a qty drop was a sale vs. reconciliation). A log table (lot_id, event_type, qty_change, order_id, reference, txn_date) would close this gap. Code change: one extra insert inside `_consume_lots_fifo()` and `refresh_blinkit_lots.py`. | Before tax/accounting audit queries become needed — likely Phase D or E |
 
 ---
 
@@ -411,7 +464,8 @@ Items explicitly decided to skip for now but worth revisiting:
 
 | File | Status |
 |------|--------|
-| `tcb/inventory.py` | ✅ Complete |
+| `tcb/inventory.py` | ✅ Complete — `dispatch_sku()` returns plan list; `finalize_az_cogs()`, `finalize_blk_cogs()`, `finalize_fnp_fc_cogs()` (new 25-May); row splitting in `record_dropship_sale()` + `record_outright_transfer()` |
+| `setup/migrations/014_orders_lot_id_supply_state.sql` | ✅ Applied to dev + prod — `orders.lot_id` FK + `orders.supply_state` |
 | `ui/tinysteps_app.py` | ✅ Warehouse app complete |
 | `ui/growthspurt_app.py` | ✅ Sales MIS complete (6 tabs + City filter) |
 | `ingest/load_blinkit_sales.py` | ✅ Built |
