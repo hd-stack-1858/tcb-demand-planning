@@ -1790,10 +1790,17 @@ def _load_all_ds_raw() -> list:
 @st.cache_data(ttl=300)
 def _load_all_elig() -> list:
     db = get_client()
-    return (db.table("blinkit_ds_sku_eligibility")
-              .select("location_id,sku_id,status")
-              .limit(20000)
-              .execute().data)
+    rows, offset, page_size = [], 0, 1000
+    while True:
+        batch = (db.table("blinkit_ds_sku_eligibility")
+                   .select("location_id,sku_id,status")
+                   .range(offset, offset + page_size - 1)
+                   .execute().data)
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return rows
 
 
 def tab_blinkit_deepdive() -> None:
