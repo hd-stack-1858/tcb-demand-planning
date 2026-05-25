@@ -230,6 +230,21 @@ def run(dry_run: bool = False) -> int:
 
     # Run Amazon and Blinkit (sequentially for simplicity; both complete before WhatsApp)
     amazon_result  = _run_amazon()
+
+    # G1b: finalize COGS for AZ orders loaded above (consume AZ channel lots)
+    try:
+        from tcb.inventory import finalize_az_cogs
+        result = finalize_az_cogs()
+        logger.info(
+            "AZ COGS finalized: %d total | %d lot-traced | %d fallback | %d no-cogs",
+            result["total"], result["lot_finalized"],
+            result["fallback_cogs"], result["no_cogs"],
+        )
+        if result["no_cogs"]:
+            logger.warning("AZ COGS: %d order(s) could not get COGS — check sku_cogs_lots", result["no_cogs"])
+    except Exception as exc:
+        logger.error("AZ COGS finalization failed (non-fatal): %s", exc)
+
     blinkit_result = _run_blinkit()
 
     # Wait a moment to ensure DB writes are committed before querying for summary

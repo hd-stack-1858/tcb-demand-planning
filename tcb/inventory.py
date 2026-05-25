@@ -496,6 +496,130 @@ def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="ap
     return txn_type, unit_cogs
 
 
+def finalize_az_cogs(dry_run: bool = False) -> dict:
+    """
+    Stamp COGS on AZ/AZ_FBM FULFILLED orders that have lot_cogs_finalized=False.
+
+    Called daily after Amazon orders are loaded. For each order:
+      FBA (AZ channel)    — consumes from AZ channel sku_cogs_lots (mirrored at TRANSFER_OUT)
+      FBM (AZ_FBM channel) — consumes from OWN_WH sku_cogs_lots
+
+    Inserts sku_inventory_transactions DISPATCH rows (one per lot, with lot_id).
+    Falls back to _get_sku_cogs_fallback() when lots are exhausted or missing.
+    Does NOT touch sku_inventory.qty_on_hand (AZ FBA stock not tracked there).
+
+    Returns dict: {total, lot_finalized, fallback_cogs, no_cogs}.
+    """
+    db        = get_client()
+    own_wh_id = _own_wh_id()
+
+    ch_rows   = db.table("channels").select("code, channel_id").execute().data
+    ch        = {r["code"]: r["channel_id"] for r in ch_rows}
+    az_id     = ch["AZ"]
+    az_fbm_id = ch.get("AZ_FBM")
+    az_ids    = [az_id] + ([az_fbm_id] if az_fbm_id else [])
+
+    pending = (db.table("orders")
+                 .select("order_id, platform_order_id, sku_id, channel_id, order_date, quantity")
+                 .is_("cogs", "null")
+                 .eq("lot_cogs_finalized", False)
+                 .in_("status", ["FULFILLED", "REPLACEMENT"])
+                 .in_("channel_id", az_ids)
+                 .order("order_date")   # oldest first — FIFO alignment
+                 .execute().data)
+
+    # Pre-load AZ lot partner_location_ids per SKU.
+    # AZ FBA lots are tagged with the Amazon FC's partner_location_id (e.g. BLR8 = 22)
+    # because TRANSFER_OUT to Amazon specifies the destination WH.
+    # _consume_lots_fifo needs the correct partner_location_id to find these lots.
+    az_sku_locs: dict[str, list[int | None]] = {}
+    az_lot_rows = (db.table("sku_cogs_lots")
+                     .select("sku_id, partner_location_id")
+                     .eq("channel_id", az_id)
+                     .gt("qty_remaining", 0)
+                     .execute().data)
+    for r in az_lot_rows:
+        az_sku_locs.setdefault(r["sku_id"], set()).add(r["partner_location_id"])
+
+    lot_finalized = fallback_cogs = no_cogs = 0
+
+    for order in pending:
+        sku_id     = order["sku_id"]
+        qty        = int(order["quantity"])
+        channel_id = order["channel_id"]
+        lot_ch     = own_wh_id if channel_id == az_fbm_id else az_id
+
+        # For AZ FBA: pick the partner_location_id from available lots (if any).
+        # FBM ships from OWN_WH which has no partner_location_id (None = IS NULL filter).
+        if channel_id == az_fbm_id or lot_ch == own_wh_id:
+            partner_loc_id = None
+        else:
+            locs = az_sku_locs.get(sku_id, set())
+            partner_loc_id = next(iter(locs), None)  # first available FC; None → fallback
+
+        plan      = None
+        unit_cogs = None
+        try:
+            plan, unit_cogs = _consume_lots_fifo(
+                db, sku_id, lot_ch, qty,
+                partner_location_id=partner_loc_id,
+            )
+            # Update cached remaining count to reflect consumption
+            if plan and partner_loc_id is not None:
+                consumed = sum(p["qty"] for p in plan)
+                # Refresh loc cache if this lot is now exhausted
+                updated_remaining = (db.table("sku_cogs_lots")
+                                       .select("partner_location_id")
+                                       .eq("channel_id", az_id)
+                                       .eq("sku_id", sku_id)
+                                       .gt("qty_remaining", 0)
+                                       .execute().data)
+                az_sku_locs[sku_id] = set(r["partner_location_id"] for r in updated_remaining)
+        except ValueError:
+            unit_cogs = _get_sku_cogs_fallback(sku_id, db)
+
+        if dry_run:
+            src = f"lots={[p['lot_id'] for p in plan]}" if plan else "fallback"
+            print(f"  {order['platform_order_id']}  {sku_id}  qty={qty}"
+                  f"  date={order['order_date']}  cogs={unit_cogs}  src={src}")
+            if plan:          lot_finalized += 1
+            elif unit_cogs:   fallback_cogs += 1
+            else:             no_cogs       += 1
+            continue
+
+        if plan:
+            txn_rows = [{
+                "type":            "DISPATCH",
+                "sku_id":          sku_id,
+                "from_channel_id": lot_ch,
+                "to_channel_id":   None,
+                "quantity":        p["qty"],
+                "unit_cogs":       p["unit_cogs"],
+                "lot_id":          p["lot_id"],
+                "reference":       order["platform_order_id"],
+                "notes":           "AZ lot COGS finalization",
+                "created_by":      "az_cogs_finalize",
+            } for p in plan]
+            db.table("sku_inventory_transactions").insert(txn_rows).execute()
+            lot_finalized += 1
+        elif unit_cogs:
+            fallback_cogs += 1
+        else:
+            no_cogs += 1
+
+        db.table("orders").update({
+            "cogs":               unit_cogs,
+            "lot_cogs_finalized": True,
+        }).eq("order_id", order["order_id"]).execute()
+
+    return {
+        "total":         len(pending),
+        "lot_finalized": lot_finalized,
+        "fallback_cogs": fallback_cogs,
+        "no_cogs":       no_cogs,
+    }
+
+
 def record_dropship_sale(sku_id, qty, channel_id, selling_price,
                          order_date=None, platform_order_id=None,
                          city=None, state=None, notes="", created_by="app"):
