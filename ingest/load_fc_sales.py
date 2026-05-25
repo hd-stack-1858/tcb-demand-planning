@@ -134,6 +134,26 @@ def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int, int]
     if dry_run or not report_rows:
         return len(report_rows), 0, skipped
 
+    # Enrich rows with lot_ids from DISPATCH txns — dispatch happens before the monthly CSV.
+    order_ids_all = [r["platform_order_id"] for r in report_rows if r.get("platform_order_id")]
+    if order_ids_all:
+        txn_rows = (
+            db.table("sku_inventory_transactions")
+              .select("reference, sku_id, lot_id")
+              .eq("type", "DISPATCH")
+              .eq("to_channel_id", FC_CHANNEL_ID)
+              .in_("reference", order_ids_all)
+              .execute().data
+        ) or []
+        lot_map: dict[tuple[str, str], int] = {
+            (r["reference"], r["sku_id"]): r["lot_id"]
+            for r in txn_rows if r.get("lot_id") is not None
+        }
+        for row in report_rows:
+            lid = lot_map.get((row["platform_order_id"], row["sku_id"]))
+            if lid is not None:
+                row["lot_id"] = lid
+
     # Fetch all existing FC orders keyed by platform_order_id for fast lookup
     existing_raw = (
         db.table("orders")
@@ -169,6 +189,7 @@ def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int, int]
                 k: v for k, v in row.items()
                 if k not in ("order_id", "channel_id", "lot_cogs_finalized")
                 and not (k in ("city", "state") and v is None)
+                and not (k == "lot_id" and v is None)
             }
             # Canonicalise platform_order_id to the FC OrderID (not Shipping Ref)
             payload["platform_order_id"] = order_id_raw
@@ -188,13 +209,6 @@ def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int, int]
         res = db.table("orders").update(payload).eq("order_id", db_order_id).execute()
         if res.data:
             updated_count += 1
-
-    # Stamp lot_id from DISPATCH txn rows (reference=platform_order_id) for traceability.
-    from tcb.inventory import stamp_lot_id_from_dispatch
-    FC_CHANNEL_ID = 6
-    all_order_ids = [r["platform_order_id"] for r in to_insert + [p for _, p in to_update]
-                     if r.get("platform_order_id")]
-    stamp_lot_id_from_dispatch(db, FC_CHANNEL_ID, all_order_ids)
 
     return new_count, updated_count, skipped
 

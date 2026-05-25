@@ -264,6 +264,26 @@ def load_files(extracted_path: Path, report_path: Path,
             print(f"  {s}: {cnt}")
         return len(all_rows), 0, skipped
 
+    # Enrich rows with lot_ids from DISPATCH txns — dispatch happens before the monthly CSV.
+    order_nos = [r["platform_order_id"] for r in all_rows if r.get("platform_order_id")]
+    if order_nos:
+        txn_rows = (
+            db.table("sku_inventory_transactions")
+              .select("reference, sku_id, lot_id")
+              .eq("type", "DISPATCH")
+              .eq("to_channel_id", FNP_CHANNEL_ID)
+              .in_("reference", order_nos)
+              .execute().data
+        ) or []
+        lot_map: dict[tuple[str, str], int] = {
+            (r["reference"], r["sku_id"]): r["lot_id"]
+            for r in txn_rows if r.get("lot_id") is not None
+        }
+        for row in all_rows:
+            lid = lot_map.get((row["platform_order_id"], row["sku_id"]))
+            if lid is not None:
+                row["lot_id"] = lid
+
     # Fetch existing FnP orders keyed by (platform_order_id, sku_id).
     # Multi-SKU FnP orders share a platform_order_id — keying by sku_id too
     # ensures each SKU row is matched to the correct DB record.
@@ -292,7 +312,8 @@ def load_files(extracted_path: Path, report_path: Path,
             to_insert.append(row)
         else:
             payload = {k: v for k, v in row.items()
-                       if k not in ("order_id", "channel_id", "lot_cogs_finalized")}
+                       if k not in ("order_id", "channel_id", "lot_cogs_finalized")
+                       and not (k == "lot_id" and v is None)}
             payload["platform_order_id"] = order_no
             to_update.append((db_order_id, payload))
 
@@ -310,14 +331,6 @@ def load_files(extracted_path: Path, report_path: Path,
         res = db.table("orders").update(payload).eq("order_id", db_order_id).execute()
         if res.data:
             updated_count += 1
-
-    # Stamp lot_id from DISPATCH txn rows (reference=platform_order_id) for traceability.
-    # Works when dispatch happened before order load (the normal FnP flow).
-    from tcb.inventory import stamp_lot_id_from_dispatch
-    FNP_CHANNEL_ID = 5
-    all_order_ids = [r["platform_order_id"] for r in to_insert + [p for _, p in to_update]
-                     if r.get("platform_order_id")]
-    stamp_lot_id_from_dispatch(db, FNP_CHANNEL_ID, all_order_ids)
 
     return new_count, updated_count, skipped
 
