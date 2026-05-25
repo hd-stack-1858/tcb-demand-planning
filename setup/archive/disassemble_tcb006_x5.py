@@ -102,21 +102,35 @@ def run(dry_run: bool):
             # Shrink wrap: deduct 5 from item inventory (it was consumed in assembly,
             # now we confirm it's gone — quantity_on_hand is already 0 from assembly,
             # so we just log the write-off for audit trail without touching qty)
+            # No channel IDs — pure audit record. Item was already consumed in ASSEMBLY;
+            # destruction means it cannot return. No inventory movement implied.
             db.table("inventory_transactions").insert({
                 "type":          "DISASSEMBLY",
                 "item_id":       p["item_id"],
                 "sku_id":        SKU_ID,
                 "batch_id":      p["batch_id"],
-                "from_channel_id": own_wh,
+                "from_channel_id": None,
+                "to_channel_id": None,
                 "quantity":      p["qty_back"],
                 "reference":     NOTES,
-                "notes":         "destroyed during disassembly — not recoverable",
+                "notes":         "destroyed during disassembly -- not recoverable; no inventory movement",
                 "created_by":    CREATED_BY,
             }).execute()
-            print(f"  item_id={p['item_id']} ({p['name']}) — DAMAGE_WRITE_OFF txn logged")
+            print(f"  item_id={p['item_id']} ({p['name']}) -- DISASSEMBLY txn logged (destroyed)")
         else:
-            # Return item to inventory
-            new_qty = p["qty_cur"] + p["qty_back"]
+            # Skip if already processed (idempotency — script crashed mid-run)
+            already = (db.table("inventory_transactions")
+                         .select("txn_id").eq("item_id", p["item_id"])
+                         .eq("reference", NOTES).eq("type", "DISASSEMBLY")
+                         .execute().data)
+            if already:
+                print(f"  item_id={p['item_id']} ({p['name']}) -- already processed, skipping")
+                continue
+
+            # Return item to inventory — re-read current qty in case of partial run
+            cur_qty = (db.table("inventory").select("quantity_on_hand")
+                         .eq("inv_id", p["inv_id"]).single().execute().data["quantity_on_hand"])
+            new_qty = cur_qty + p["qty_back"]
             db.table("inventory").update({"quantity_on_hand": new_qty})\
               .eq("inv_id", p["inv_id"]).execute()
             db.table("inventory_transactions").insert({
@@ -130,15 +144,18 @@ def run(dry_run: bool):
                 "notes":       "returned to stock from disassembly",
                 "created_by":  CREATED_BY,
             }).execute()
-            print(f"  item_id={p['item_id']} ({p['name']}) — inventory {p['qty_cur']} → {new_qty}")
+            print(f"  item_id={p['item_id']} ({p['name']}) -- inventory {cur_qty} -> {new_qty}")
 
     # ── 2. Decrement sku_inventory ────────────────────────────────────────────
+    # Re-read in case of partial prior run
+    sku_inv = (db.table("sku_inventory").select("sku_inv_id, qty_on_hand")
+                 .eq("sku_id", SKU_ID).eq("channel_id", own_wh).single().execute().data)
     new_sku_qty = sku_inv["qty_on_hand"] - QTY
     db.table("sku_inventory").update({
         "qty_on_hand":  new_sku_qty,
         "last_updated": date.today().isoformat(),
     }).eq("sku_inv_id", sku_inv["sku_inv_id"]).execute()
-    print(f"  sku_inventory updated: qty_on_hand → {new_sku_qty}")
+    print(f"  sku_inventory updated: qty_on_hand -> {new_sku_qty}")
 
     # ── 3. Log sku_inventory_transactions ─────────────────────────────────────
     db.table("sku_inventory_transactions").insert({
@@ -156,7 +173,7 @@ def run(dry_run: bool):
         new_lot_qty = lot[0]["qty_remaining"] - QTY
         db.table("sku_cogs_lots").update({"qty_remaining": new_lot_qty})\
           .eq("lot_id", lot[0]["lot_id"]).execute()
-        print(f"  sku_cogs_lots lot_id={lot[0]['lot_id']} qty_remaining → {new_lot_qty}")
+        print(f"  sku_cogs_lots lot_id={lot[0]['lot_id']} qty_remaining -> {new_lot_qty}")
 
     # ── 5. Verify ─────────────────────────────────────────────────────────────
     final = (db.table("sku_inventory").select("qty_on_hand")
