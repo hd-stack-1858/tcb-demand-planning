@@ -1783,6 +1783,7 @@ def _load_all_ds_raw() -> list:
               .select("location_id,name,city,parent_location_id,is_active")
               .eq("channel_id", 4)
               .eq("location_type", "DARKSTORE")
+              .eq("is_active", True)
               .limit(2000)
               .execute().data)
 
