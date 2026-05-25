@@ -2096,10 +2096,13 @@ def tab_blinkit_deepdive() -> None:
     # ── Replen plan refresh + download ────────────────────────────────────────
     import glob as _glob, subprocess as _sp, datetime as _dt
 
+    _IST = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
     _plan_age = ""
     if _REPLEN_PARQUET.exists():
-        _mtime = _dt.datetime.fromtimestamp(_REPLEN_PARQUET.stat().st_mtime)
-        _plan_age = f"Plan last generated: {_mtime.strftime('%d-%b-%Y %H:%M')}"
+        _mtime = _dt.datetime.fromtimestamp(
+            _REPLEN_PARQUET.stat().st_mtime, tz=_dt.timezone.utc
+        ).astimezone(_IST)
+        _plan_age = f"Plan last generated: {_mtime.strftime('%d-%b-%Y %H:%M')} IST"
 
     _col_age, _col_btn = st.columns([3, 1])
     with _col_age:
