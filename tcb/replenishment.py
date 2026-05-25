@@ -967,6 +967,55 @@ def main():
     plan_df.to_parquet(parquet_path, index=False)
     print(f'Parquet cache written: {parquet_path}')
 
+    _write_plan_to_db(plan_df, date.today())
+
+
+def _write_plan_to_db(plan_df: pd.DataFrame, plan_date: date) -> None:
+    """Upsert the replenishment plan to blinkit_replen_plan for dashboard access."""
+    rows = []
+    for _, r in plan_df.iterrows():
+        a_start = r.get('assessment_start')
+        a_end   = r.get('assessment_end')
+        sp      = r.get('selling_price')
+        iv      = r.get('invoice_value')
+        rows.append({
+            'plan_date':         plan_date.isoformat(),
+            'wh_code':           r['wh_code'],
+            'wh_name':           r['wh_name'],
+            'wh_location_id':    int(r['wh_location_id']),
+            'sku_id':            r['sku_id'],
+            'sku_name':          r.get('sku_name', ''),
+            'active_ds_count':   int(r['active_ds_count']),
+            'ds_choked_count':   int(r.get('ds_choked_count', 0)),
+            'ds_with_data':      int(r['ds_with_data']),
+            'ds_with_oos':       int(r['ds_with_oos']),
+            'avg_ads_per_ds':    float(r['avg_ads_per_ds']),
+            'total_ads':         float(r['total_ads']),
+            'total_demand_30d':  float(r['total_demand_30d']),
+            'transit_buffer_7d': float(r['transit_buffer_7d']),
+            'target_stock':      float(r['target_stock']),
+            'units_wh':          int(r['units_wh']),
+            'units_incoming':    int(r['units_incoming']),
+            'units_transit':     int(r['units_transit']),
+            'units_ds':          int(r['units_ds']),
+            'effective_stock':   int(r['effective_stock']),
+            'units_to_ship':     int(r['units_to_ship']),
+            'selling_price':     float(sp) if pd.notna(sp) else None,
+            'invoice_value':     float(iv) if pd.notna(iv) else None,
+            'priority':          bool(r['priority']),
+            'assessment_start':  a_start.isoformat() if pd.notna(a_start) else None,
+            'assessment_end':    a_end.isoformat()   if pd.notna(a_end)   else None,
+            'notes':             str(r.get('notes', '')),
+        })
+
+    batch_size = 100
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+        _sb_execute(lambda b=batch: sb.table('blinkit_replen_plan')
+                    .upsert(b, on_conflict='plan_date,wh_code,sku_id')
+                    .execute())
+    print(f'DB write: {len(rows)} rows upserted to blinkit_replen_plan (plan_date={plan_date})')
+
 
 if __name__ == '__main__':
     main()

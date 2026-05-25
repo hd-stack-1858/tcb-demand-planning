@@ -25,7 +25,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from tcb.db import get_orders_raw, get_blinkit_city_ds, get_skus, get_client
+from tcb.db import get_orders_raw, get_blinkit_city_ds, get_skus, get_client, get_replen_plan
 
 st.set_page_config(
     page_title="TCB Sales MIS",
@@ -1728,9 +1728,20 @@ def _load_replen_plan(_mtime: float) -> "pd.DataFrame":
     return pd.DataFrame()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_replen_plan_from_db() -> "pd.DataFrame":
+    """Fallback: fetch latest replen plan from Supabase (used on Streamlit Cloud)."""
+    rows = get_replen_plan()
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
 def _get_replen_plan() -> "pd.DataFrame":
-    mtime = _REPLEN_PARQUET.stat().st_mtime if _REPLEN_PARQUET.exists() else 0.0
-    return _load_replen_plan(mtime)
+    if _REPLEN_PARQUET.exists():
+        mtime = _REPLEN_PARQUET.stat().st_mtime
+        return _load_replen_plan(mtime)
+    return _load_replen_plan_from_db()
 
 
 def _load_wh_summary(sku_id: str) -> list:
@@ -2102,7 +2113,7 @@ def tab_blinkit_deepdive() -> None:
     if _refresh:
         with st.spinner("Generating replenishment plan (~30s)…"):
             _result = _sp.run(
-                ["python", "tcb/replenishment.py"],
+                [sys.executable, "tcb/replenishment.py"],
                 capture_output=True, text=True, encoding="utf-8",
                 cwd=str(Path(".").resolve()),
             )

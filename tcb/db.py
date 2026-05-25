@@ -193,6 +193,31 @@ def get_blinkit_city_ds(sku_id: str) -> list[dict]:
     return ds_rows
 
 
+def get_replen_plan() -> list[dict]:
+    """Fetch the most recent replenishment plan from DB. Returns [] if none exists."""
+    db = get_client()
+    latest = (db.table("blinkit_replen_plan")
+                .select("plan_date")
+                .order("plan_date", desc=True)
+                .limit(1)
+                .execute().data)
+    if not latest:
+        return []
+    plan_date = latest[0]["plan_date"]
+    rows: list[dict] = []
+    page_size = 1000
+    offset = 0
+    while True:
+        batch = (db.table("blinkit_replen_plan")
+                   .select("*")
+                   .eq("plan_date", plan_date)
+                   .range(offset, offset + page_size - 1)
+                   .execute().data)
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return rows
 
 
 def record_transaction(txn: dict):
