@@ -43,7 +43,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ingest.utils import (
     get_channel_tp_at_date,
-    get_sku_cogs_at_date,
     get_sku_mrp_at_date,
     get_sku_sp_at_date,
     resolve_fc_sku,
@@ -87,7 +86,6 @@ def _build_row(r: dict, source_file: str) -> dict | None:
     sp    = get_sku_sp_at_date(sku_id, order_date)
     mrp   = get_sku_mrp_at_date(sku_id, order_date)
     tp    = get_channel_tp_at_date(sku_id, FC_CHANNEL_CODE, order_date)
-    cogs  = get_sku_cogs_at_date(sku_id, order_date)
 
     gross_value  = round(sp * qty, 2) if sp is not None else None
     discount_pct = None
@@ -104,7 +102,7 @@ def _build_row(r: dict, source_file: str) -> dict | None:
         "selling_price":      sp,
         "gross_value":        gross_value,
         "discount_pct":       discount_pct,
-        "cogs":               cogs,
+        "cogs":               None,
         "transfer_price":     tp,
         "city":               None,
         "state":              None,
@@ -112,7 +110,7 @@ def _build_row(r: dict, source_file: str) -> dict | None:
         "status":             status,
         "platform_order_id":  order_id_raw,
         "source_file":        source_file,
-        "lot_cogs_finalized": True,
+        "lot_cogs_finalized": False,
         "_shipping_ref":      shipping_ref,   # match-only, stripped before DB write
     }
 
@@ -133,26 +131,6 @@ def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int, int]
 
     if dry_run or not report_rows:
         return len(report_rows), 0, skipped
-
-    # Enrich rows with lot_ids from DISPATCH txns — dispatch happens before the monthly CSV.
-    order_ids_all = [r["platform_order_id"] for r in report_rows if r.get("platform_order_id")]
-    if order_ids_all:
-        txn_rows = (
-            db.table("sku_inventory_transactions")
-              .select("reference, sku_id, lot_id")
-              .eq("type", "DISPATCH")
-              .eq("to_channel_id", FC_CHANNEL_ID)
-              .in_("reference", order_ids_all)
-              .execute().data
-        ) or []
-        lot_map: dict[tuple[str, str], int] = {
-            (r["reference"], r["sku_id"]): r["lot_id"]
-            for r in txn_rows if r.get("lot_id") is not None
-        }
-        for row in report_rows:
-            lid = lot_map.get((row["platform_order_id"], row["sku_id"]))
-            if lid is not None:
-                row["lot_id"] = lid
 
     # Fetch all existing FC orders keyed by platform_order_id for fast lookup
     existing_raw = (
@@ -209,6 +187,14 @@ def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int, int]
         res = db.table("orders").update(payload).eq("order_id", db_order_id).execute()
         if res.data:
             updated_count += 1
+
+    from tcb.inventory import finalize_fnp_fc_cogs
+    result = finalize_fnp_fc_cogs()
+    logger.info(
+        "FC COGS finalized: %d total | %d dispatched | %d sale_returns | %d fallback | %d no-cogs",
+        result["total"], result["finalized"], result["sale_returns"],
+        result["fallback_cogs"], result["no_cogs"],
+    )
 
     return new_count, updated_count, skipped
 

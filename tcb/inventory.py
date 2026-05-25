@@ -645,6 +645,96 @@ def finalize_blk_cogs(dry_run: bool = False) -> dict:
     }
 
 
+def finalize_fnp_fc_cogs(dry_run: bool = False) -> dict:
+    """
+    Stamp COGS + lot_id on FnP/FC orders with lot_cogs_finalized=False.
+
+    Called after Vignesh's FnP/FC loader runs (2-3×/day).
+      FULFILLED   — dispatch_sku(): creates DISPATCH txn, decrements OWN_WH qty_on_hand,
+                    consumes sku_cogs_lots FIFO, stamps cogs + lot_id.
+      SALE_RETURN — static COGS fallback only; stock was returned so no dispatch txn.
+      PENDING     — skipped; re-run after next report resolves them to FULFILLED/SALE_RETURN.
+
+    Falls back to _get_sku_cogs_fallback() when OWN_WH lots are exhausted.
+    Returns dict: {total, finalized, sale_returns, fallback_cogs, no_cogs}.
+    """
+    db      = get_client()
+    ch_rows = db.table("channels").select("code, channel_id").execute().data
+    fnp_id  = next((r["channel_id"] for r in ch_rows if r["code"] == "FNP"), None)
+    fc_id   = next((r["channel_id"] for r in ch_rows if r["code"] == "FC"),  None)
+    ch_ids  = [c for c in [fnp_id, fc_id] if c is not None]
+    if not ch_ids:
+        return {"total": 0, "finalized": 0, "sale_returns": 0, "fallback_cogs": 0, "no_cogs": 0}
+
+    pending = (
+        db.table("orders")
+          .select("order_id, platform_order_id, sku_id, channel_id, quantity, status")
+          .eq("lot_cogs_finalized", False)
+          .in_("status", ["FULFILLED", "SALE_RETURN"])
+          .in_("channel_id", ch_ids)
+          .order("order_date")
+          .execute().data
+    ) or []
+
+    if dry_run:
+        fulfilled    = sum(1 for o in pending if o["status"] == "FULFILLED")
+        sale_returns = sum(1 for o in pending if o["status"] == "SALE_RETURN")
+        logger.info("[DRY RUN] FnP/FC finalization: %d FULFILLED + %d SALE_RETURN pending",
+                    fulfilled, sale_returns)
+        return {"total": len(pending), "finalized": 0, "sale_returns": 0,
+                "fallback_cogs": 0, "no_cogs": 0}
+
+    finalized = sale_returns = fallback_cogs = no_cogs = 0
+
+    for order in pending:
+        sku_id    = order["sku_id"]
+        qty       = int(order["quantity"])
+        channel_id = order["channel_id"]
+        order_id  = order["order_id"]
+        platform_order_id = order.get("platform_order_id") or ""
+
+        if order["status"] == "FULFILLED":
+            try:
+                _, unit_cogs, lot_id = dispatch_sku(
+                    sku_id, qty, channel_id,
+                    reference=platform_order_id,
+                    notes="auto-finalization", created_by="finalization",
+                )
+                update: dict = {
+                    "cogs":               round(unit_cogs * qty, 2),
+                    "lot_cogs_finalized": True,
+                }
+                if lot_id is not None:
+                    update["lot_id"] = lot_id
+                finalized += 1
+            except ValueError:
+                unit_cogs = _get_sku_cogs_fallback(sku_id, db)
+                if unit_cogs is not None:
+                    update = {"cogs": round(unit_cogs * qty, 2), "lot_cogs_finalized": True}
+                    fallback_cogs += 1
+                else:
+                    update = {"lot_cogs_finalized": True}
+                    no_cogs += 1
+        else:
+            # SALE_RETURN: stock was returned — no dispatch txn; static COGS for P&L accuracy
+            unit_cogs = _get_sku_cogs_fallback(sku_id, db)
+            if unit_cogs is not None:
+                update = {"cogs": round(unit_cogs * qty, 2), "lot_cogs_finalized": True}
+            else:
+                update = {"lot_cogs_finalized": True}
+            sale_returns += 1
+
+        db.table("orders").update(update).eq("order_id", order_id).execute()
+
+    return {
+        "total":         len(pending),
+        "finalized":     finalized,
+        "sale_returns":  sale_returns,
+        "fallback_cogs": fallback_cogs,
+        "no_cogs":       no_cogs,
+    }
+
+
 def stamp_lot_id_from_dispatch(db, channel_id: int, platform_order_ids: list[str]) -> int:
     """
     Back-fill lot_id on orders that were loaded separately from dispatch (FNP, FC).
