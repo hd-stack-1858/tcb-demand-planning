@@ -637,6 +637,35 @@ def upsert_ads(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict, wh_lookup: d
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+def propagate_darkstore_closed() -> int:
+    """
+    Physical store closure is permanent and affects all SKUs.
+    Any DS with darkstore_closed for at least one SKU gets it set for all its other SKU rows.
+    Returns the count of rows updated.
+    """
+    # Find all DS that have at least one darkstore_closed row
+    rows = sb.table('blinkit_ds_sku_eligibility') \
+             .select('location_id') \
+             .eq('status', 'darkstore_closed') \
+             .execute().data
+    closed_ds_ids = list({r['location_id'] for r in rows})
+    if not closed_ds_ids:
+        return 0
+
+    updated = 0
+    CHUNK = 100
+    for i in range(0, len(closed_ds_ids), CHUNK):
+        chunk = closed_ds_ids[i:i + CHUNK]
+        result = (sb.table('blinkit_ds_sku_eligibility')
+                    .update({'status': 'darkstore_closed',
+                             'last_remark': 'store has been closed (propagated from sibling SKU)'})
+                    .in_('location_id', chunk)
+                    .neq('status', 'darkstore_closed')
+                    .execute())
+        updated += len(result.data) if result.data else 0
+    return updated
+
+
 def process_file(filepath: Path, sku_lookup: dict, ds_lookup: dict,
                  wh_lookup: dict, ds_parent_lookup: dict):
     print(f'\n  Loading: {filepath.name}')
@@ -720,6 +749,11 @@ def main():
                 (df['Serving warehouse'].isin(our_whs))
             ]
             print(f'  {f.name}: {len(df):,} rows total, {len(y_rows):,} Y-rows for our WHs')
+
+    # Pass 1b: propagate darkstore_closed to all SKUs for physically closed DS
+    if not args.dry_run:
+        prop_count = propagate_darkstore_closed()
+        print(f'\nPass 1b (propagate closed): {prop_count} rows updated to darkstore_closed')
 
     # Pass 0a post-step: sync is_active for all Blinkit DS based on latest file
     if not args.dry_run and not args.file:

@@ -174,20 +174,21 @@ def get_blinkit_city_ds(sku_id: str) -> list[dict]:
         if not row.get("city"):
             row["city"] = row["name"].strip().split()[0]
 
-    # For no_data DS: if the store is darkstore_closed for any other SKU,
-    # the physical store is closed — promote to darkstore_closed.
-    no_data_ids = [r["location_id"] for r in ds_rows if r["status"] == "no_data"]
-    if no_data_ids:
+    # If a DS is darkstore_closed for ANY SKU, the physical store is permanently closed.
+    # Promote to darkstore_closed regardless of what this SKU's status says —
+    # stale statuses (e.g. sku_moved_out_low_sales) can survive after physical closure.
+    non_closed_ids = [r["location_id"] for r in ds_rows if r["status"] != "darkstore_closed"]
+    if non_closed_ids:
         cross_elig = (
             db.table("blinkit_ds_sku_eligibility")
-            .select("location_id, status")
-            .in_("location_id", no_data_ids)
+            .select("location_id")
+            .in_("location_id", non_closed_ids)
             .eq("status", "darkstore_closed")
             .execute().data
         )
-        closed_ids = {r["location_id"] for r in cross_elig}
+        physically_closed = {r["location_id"] for r in cross_elig}
         for row in ds_rows:
-            if row["status"] == "no_data" and row["location_id"] in closed_ids:
+            if row["location_id"] in physically_closed:
                 row["status"] = "darkstore_closed"
 
     return ds_rows
