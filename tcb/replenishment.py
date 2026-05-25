@@ -1003,8 +1003,8 @@ def _write_plan_to_db(plan_df: pd.DataFrame, plan_date: date) -> None:
             'selling_price':     float(sp) if pd.notna(sp) else None,
             'invoice_value':     float(iv) if pd.notna(iv) else None,
             'priority':          bool(r['priority']),
-            'assessment_start':  a_start.isoformat() if pd.notna(a_start) else None,
-            'assessment_end':    a_end.isoformat()   if pd.notna(a_end)   else None,
+            'assessment_start':  str(a_start) if pd.notna(a_start) else None,
+            'assessment_end':    str(a_end)   if pd.notna(a_end)   else None,
             'notes':             str(r.get('notes', '')),
         })
 
