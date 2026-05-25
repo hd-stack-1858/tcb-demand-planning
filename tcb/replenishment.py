@@ -351,11 +351,7 @@ def load_sp_lookup() -> dict:
     sku_id → median selling_price from recent Blinkit orders.
     Falls back to ₹0 if no orders (engine still outputs units_to_ship).
     """
-    rows = _sb_execute(lambda: sb.table('orders')
-                       .select('sku_id, selling_price')
-                       .eq('channel_id', BLINKIT_CHANNEL_ID)
-                       .order('order_date', desc=True)
-                       .limit(1000).execute().data)
+    rows = _paginate('orders', 'sku_id,selling_price', channel_id=BLINKIT_CHANNEL_ID)
     by_sku: dict[str, list[float]] = {}
     for r in rows:
         sp = r.get('selling_price')
