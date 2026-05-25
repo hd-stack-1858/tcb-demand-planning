@@ -198,6 +198,21 @@ See `docs/build_plan.md` for full detail and scope per phase. (`docs/build_plan_
 
 ---
 
+## DB State Verification Standard — MANDATORY
+
+When investigating data discrepancies or answering "why does X show Y?":
+
+1. **Query first, explain second.** Never state a specific count, status, or DB value as fact without running a query. Reasoning from code logic is a hypothesis.
+2. **Label every claim clearly:**
+   - `[QUERIED]` — I ran the query and confirmed this
+   - `[CODE REASONING]` — I'm inferring from code logic, not verified in DB
+   - `[HYPOTHESIS]` — I believe this is true but need a query to confirm
+3. **One query beats three rounds of reasoning.** If a discrepancy needs investigation, run a targeted query immediately rather than speculating across multiple turns.
+4. **When uncertain, say so.** "I believe X based on the code, but I need to query to confirm" is the correct form. Confidently wrong is worse than flagged uncertainty.
+5. **After being wrong once, always query before the next claim** — do not try to reason your way out of a wrong answer.
+
+---
+
 ## Skill routing
 
 When the user's request matches an available skill, invoke it via the Skill tool. When in doubt, invoke the skill.

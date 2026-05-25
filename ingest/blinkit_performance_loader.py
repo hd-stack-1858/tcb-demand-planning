@@ -637,12 +637,16 @@ def upsert_ads(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict, wh_lookup: d
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def propagate_darkstore_closed() -> int:
+def propagate_darkstore_closed() -> tuple[int, int]:
     """
     Physical store closure is permanent and affects all SKUs.
-    Any DS with darkstore_closed for at least one SKU gets it set for all its other SKU rows.
-    Returns the count of rows updated.
+    Pass A: update existing non-closed rows for closed DS → darkstore_closed.
+    Pass B: insert rows for SKUs that were never deployed to a now-closed DS
+            (these have no eligibility row at all, so Pass A misses them).
+    Returns (rows_updated, rows_inserted).
     """
+    CHUNK = 100
+
     # Find all DS that have at least one darkstore_closed row
     rows = sb.table('blinkit_ds_sku_eligibility') \
              .select('location_id') \
@@ -650,10 +654,10 @@ def propagate_darkstore_closed() -> int:
              .execute().data
     closed_ds_ids = list({r['location_id'] for r in rows})
     if not closed_ds_ids:
-        return 0
+        return 0, 0
 
+    # Pass A: update existing rows that are not yet darkstore_closed
     updated = 0
-    CHUNK = 100
     for i in range(0, len(closed_ds_ids), CHUNK):
         chunk = closed_ds_ids[i:i + CHUNK]
         result = (sb.table('blinkit_ds_sku_eligibility')
@@ -663,7 +667,43 @@ def propagate_darkstore_closed() -> int:
                     .neq('status', 'darkstore_closed')
                     .execute())
         updated += len(result.data) if result.data else 0
-    return updated
+
+    # Pass B: insert rows for SKUs with NO record at all for these closed DS
+    all_sku_ids = [r['sku_id'] for r in
+                   sb.table('skus').select('sku_id').eq('is_discontinued', False).execute().data]
+
+    # Collect all existing (location_id, sku_id) pairs for closed DS
+    existing: set[tuple] = set()
+    for i in range(0, len(closed_ds_ids), CHUNK):
+        chunk = closed_ds_ids[i:i + CHUNK]
+        ex = (sb.table('blinkit_ds_sku_eligibility')
+                .select('location_id,sku_id')
+                .in_('location_id', chunk)
+                .execute().data)
+        for r in ex:
+            existing.add((r['location_id'], r['sku_id']))
+
+    # Build missing pairs
+    today_str = date.today().isoformat()
+    to_insert = [
+        {'location_id': ds_id, 'sku_id': sku_id,
+         'status': 'darkstore_closed',
+         'last_remark': 'store has been closed (inserted — SKU never deployed here)',
+         'updated_date': today_str}
+        for ds_id in closed_ds_ids
+        for sku_id in all_sku_ids
+        if (ds_id, sku_id) not in existing
+    ]
+
+    inserted = 0
+    for i in range(0, len(to_insert), CHUNK):
+        result = (sb.table('blinkit_ds_sku_eligibility')
+                    .upsert(to_insert[i:i + CHUNK],
+                            on_conflict='location_id,sku_id')
+                    .execute())
+        inserted += len(result.data) if result.data else 0
+
+    return updated, inserted
 
 
 def process_file(filepath: Path, sku_lookup: dict, ds_lookup: dict,
@@ -752,8 +792,8 @@ def main():
 
     # Pass 1b: propagate darkstore_closed to all SKUs for physically closed DS
     if not args.dry_run:
-        prop_count = propagate_darkstore_closed()
-        print(f'\nPass 1b (propagate closed): {prop_count} rows updated to darkstore_closed')
+        prop_updated, prop_inserted = propagate_darkstore_closed()
+        print(f'\nPass 1b (propagate closed): {prop_updated} rows updated, {prop_inserted} rows inserted to darkstore_closed')
 
     # Pass 0a post-step: sync is_active for all Blinkit DS based on latest file
     if not args.dry_run and not args.file:
