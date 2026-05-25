@@ -163,7 +163,8 @@ def run(dry_run: bool):
         "sku_id":          SKU_ID,
         "from_channel_id": own_wh,
         "quantity":        QTY,
-        "notes":           NOTES + " — shrink wrap destroyed, all other items returned",
+        "lot_id":          lot[0]["lot_id"] if lot else None,
+        "notes":           NOTES + " -- shrink wrap destroyed, all other items returned",
         "created_by":      CREATED_BY,
     }).execute()
     print(f"  sku_inventory_transactions — ADJUSTMENT logged")

@@ -471,20 +471,22 @@ def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="ap
     db.table("sku_inventory").update({"qty_on_hand": available - qty, "last_updated": _now()})\
       .eq("sku_inv_id", inv[0]["sku_inv_id"]).execute()
 
-    txn = {
+    base_txn = {
         "type":            txn_type,
         "sku_id":          sku_id,
         "from_channel_id": own_wh_id,
         "to_channel_id":   channel_id,
-        "quantity":        qty,
-        "unit_cogs":       unit_cogs,
         "reference":       reference,
         "notes":           notes,
         "created_by":      created_by,
     }
     if partner_location_id is not None:
-        txn["partner_location_id"] = partner_location_id
-    db.table("sku_inventory_transactions").insert(txn).execute()
+        base_txn["partner_location_id"] = partner_location_id
+    txn_rows = [
+        {**base_txn, "quantity": p["qty"], "unit_cogs": p["unit_cogs"], "lot_id": p["lot_id"]}
+        for p in plan
+    ]
+    db.table("sku_inventory_transactions").insert(txn_rows).execute()
 
     if txn_type == "TRANSFER_OUT":
         for p in plan:
