@@ -444,7 +444,8 @@ def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="ap
     Dispatch assembled SKUs from OWN_WH. Consumes COGS lots FIFO.
     - DROP_SHIP / DIRECT channels → type = DISPATCH
     - FBA / SOR / OUTRIGHT channels → type = TRANSFER_OUT; mirrors lots to partner channel
-    Returns (txn_type, unit_cogs).
+    Returns (txn_type, unit_cogs, plan) where plan is a list of
+    {lot_id, assembled_at, unit_cogs, qty} dicts — one per lot consumed.
     Raises ValueError if SKU stock or COGS lots are insufficient.
     """
     db = get_client()
@@ -493,8 +494,7 @@ def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="ap
             _upsert_lot(db, sku_id, channel_id, partner_location_id,
                         p["assembled_at"], p["unit_cogs"], p["qty"])
 
-    primary_lot_id = plan[0]["lot_id"] if len(plan) == 1 else None
-    return txn_type, unit_cogs, primary_lot_id
+    return txn_type, unit_cogs, plan
 
 
 def finalize_az_cogs(dry_run: bool = False) -> dict:
@@ -695,36 +695,69 @@ def finalize_fnp_fc_cogs(dry_run: bool = False) -> dict:
 
         if order["status"] == "FULFILLED":
             try:
-                _, unit_cogs, lot_id = dispatch_sku(
+                _, unit_cogs, plan = dispatch_sku(
                     sku_id, qty, channel_id,
                     reference=platform_order_id,
                     notes="auto-finalization", created_by="finalization",
                 )
-                update: dict = {
-                    "cogs":               round(unit_cogs * qty, 2),
-                    "lot_cogs_finalized": True,
-                }
-                if lot_id is not None:
-                    update["lot_id"] = lot_id
+                if len(plan) == 1:
+                    db.table("orders").update({
+                        "cogs":               round(qty * plan[0]["unit_cogs"], 2),
+                        "lot_id":             plan[0]["lot_id"],
+                        "lot_cogs_finalized": True,
+                    }).eq("order_id", order_id).execute()
+                else:
+                    # Multi-lot: shrink existing row to first lot, insert rows for the rest
+                    orig = (db.table("orders")
+                              .select("channel_id, order_date, sku_id, selling_price, mrp, "
+                                      "discount_pct, transfer_price, city, state, "
+                                      "fulfillment_type, status, platform_order_id, "
+                                      "source_file, supply_state")
+                              .eq("order_id", order_id).single().execute().data)
+                    sp = float(orig.get("selling_price") or 0)
+                    p0 = plan[0]
+                    db.table("orders").update({
+                        "quantity":          p0["qty"],
+                        "cogs":              round(p0["qty"] * p0["unit_cogs"], 2),
+                        "gross_value":       round(p0["qty"] * sp, 2) if sp else None,
+                        "lot_id":            p0["lot_id"],
+                        "lot_cogs_finalized": True,
+                    }).eq("order_id", order_id).execute()
+                    for p in plan[1:]:
+                        db.table("orders").insert({
+                            **orig,
+                            "order_id":          f"{order_id}-L{p['lot_id']}",
+                            "quantity":          p["qty"],
+                            "cogs":              round(p["qty"] * p["unit_cogs"], 2),
+                            "gross_value":       round(p["qty"] * sp, 2) if sp else None,
+                            "lot_id":            p["lot_id"],
+                            "lot_cogs_finalized": True,
+                        }).execute()
                 finalized += 1
             except ValueError:
                 unit_cogs = _get_sku_cogs_fallback(sku_id, db)
                 if unit_cogs is not None:
-                    update = {"cogs": round(unit_cogs * qty, 2), "lot_cogs_finalized": True}
+                    db.table("orders").update({
+                        "cogs": round(unit_cogs * qty, 2), "lot_cogs_finalized": True,
+                    }).eq("order_id", order_id).execute()
                     fallback_cogs += 1
                 else:
-                    update = {"lot_cogs_finalized": True}
+                    db.table("orders").update({
+                        "lot_cogs_finalized": True,
+                    }).eq("order_id", order_id).execute()
                     no_cogs += 1
         else:
             # SALE_RETURN: stock was returned — no dispatch txn; static COGS for P&L accuracy
             unit_cogs = _get_sku_cogs_fallback(sku_id, db)
             if unit_cogs is not None:
-                update = {"cogs": round(unit_cogs * qty, 2), "lot_cogs_finalized": True}
+                db.table("orders").update({
+                    "cogs": round(unit_cogs * qty, 2), "lot_cogs_finalized": True,
+                }).eq("order_id", order_id).execute()
             else:
-                update = {"lot_cogs_finalized": True}
+                db.table("orders").update({
+                    "lot_cogs_finalized": True,
+                }).eq("order_id", order_id).execute()
             sale_returns += 1
-
-        db.table("orders").update(update).eq("order_id", order_id).execute()
 
     return {
         "total":         len(pending),
@@ -788,10 +821,10 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
         order_date = date.today()
     order_date_str = _date_str(order_date)
 
-    _, unit_cogs, lot_id = dispatch_sku(sku_id, qty, channel_id,
-                                        reference=platform_order_id or "",
-                                        notes=notes, created_by=created_by,
-                                        txn_type="DISPATCH")
+    _, unit_cogs, plan = dispatch_sku(sku_id, qty, channel_id,
+                                      reference=platform_order_id or "",
+                                      notes=notes, created_by=created_by,
+                                      txn_type="DISPATCH")
 
     mrp = _lookup_mrp(db, sku_id, order_date_str)
     discount_pct = (
@@ -800,16 +833,13 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
     )
     state = state or city_to_state(city)
 
-    row: dict = {
+    base: dict = {
         "channel_id":        channel_id,
         "order_date":        order_date_str,
         "sku_id":            sku_id,
-        "quantity":          qty,
         "mrp":               mrp,
         "selling_price":     selling_price,
-        "gross_value":       round(qty * selling_price, 2),
         "discount_pct":      discount_pct,
-        "cogs":              round(qty * unit_cogs, 2),
         "fulfillment_type":  "DROP_SHIP",
         "city":              city or None,
         "state":             state,
@@ -818,9 +848,14 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
         "source_file":       "warehouse_app",
         "lot_cogs_finalized": True,
     }
-    if lot_id is not None:
-        row["lot_id"] = lot_id
-    db.table("orders").insert(row).execute()
+    for p in plan:
+        db.table("orders").insert({
+            **base,
+            "quantity":    p["qty"],
+            "cogs":        round(p["qty"] * p["unit_cogs"], 2),
+            "gross_value": round(p["qty"] * selling_price, 2),
+            "lot_id":      p["lot_id"],
+        }).execute()
 
 
 def record_outright_transfer(sku_id, qty, channel_id, reference="",
@@ -868,21 +903,18 @@ def record_outright_transfer(sku_id, qty, channel_id, reference="",
                 .limit(1).execute().data)
     transfer_price = float(tp_row[0]["transfer_price"]) if tp_row else None
 
-    _, unit_cogs, lot_id = dispatch_sku(sku_id, qty, channel_id,
-                                        reference=reference,
-                                        notes=notes, created_by=created_by,
-                                        txn_type="TRANSFER_OUT")
+    _, unit_cogs, plan = dispatch_sku(sku_id, qty, channel_id,
+                                      reference=reference,
+                                      notes=notes, created_by=created_by,
+                                      txn_type="TRANSFER_OUT")
 
-    row: dict = {
+    base: dict = {
         "channel_id":        channel_id,
         "order_date":        order_date_str,
         "sku_id":            sku_id,
-        "quantity":          qty,
         "mrp":               mrp,
         "selling_price":     selling_price,
-        "gross_value":       round(qty * selling_price, 2),
         "discount_pct":      discount_pct,
-        "cogs":              round(qty * unit_cogs, 2),
         "transfer_price":    transfer_price,
         "fulfillment_type":  "OUTRIGHT",
         "platform_order_id": reference or None,
@@ -890,9 +922,14 @@ def record_outright_transfer(sku_id, qty, channel_id, reference="",
         "source_file":       "warehouse_app",
         "lot_cogs_finalized": True,
     }
-    if lot_id is not None:
-        row["lot_id"] = lot_id
-    db.table("orders").insert(row).execute()
+    for p in plan:
+        db.table("orders").insert({
+            **base,
+            "quantity":    p["qty"],
+            "cogs":        round(p["qty"] * p["unit_cogs"], 2),
+            "gross_value": round(p["qty"] * selling_price, 2),
+            "lot_id":      p["lot_id"],
+        }).execute()
 
 
 def return_sku(sku_id, qty, from_channel_id, partner_location_id=None,
