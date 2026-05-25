@@ -30,7 +30,7 @@ import openpyxl
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from ingest.utils import resolve_blinkit_sku, get_sku_cogs_at_date
+from ingest.utils import resolve_blinkit_sku
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -89,7 +89,8 @@ def _build_row(raw: tuple, source_file: str) -> dict | None:
         "selling_price":     sp,
         "gross_value":       gv,
         "discount_pct":      discount_pct,
-        "cogs":              get_sku_cogs_at_date(sku_id, order_date),
+        "cogs":              None,
+        "supply_state":      str(raw[11]).strip() if raw[11] else None,
         "city":              raw[13],
         "state":             raw[14],
         "fulfillment_type":  "SOR",

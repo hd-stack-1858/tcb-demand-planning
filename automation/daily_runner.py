@@ -247,6 +247,19 @@ def run(dry_run: bool = False) -> int:
 
     blinkit_result = _run_blinkit()
 
+    # G2b: finalize COGS for Blinkit FULFILLED orders (consume BLK channel lots FIFO)
+    try:
+        from tcb.inventory import finalize_blk_cogs
+        blk_result = finalize_blk_cogs()
+        logger.info(
+            "BLK COGS finalized: %d total | %d finalized | %d no-cogs",
+            blk_result["total"], blk_result["finalized"], blk_result["no_cogs"],
+        )
+        if blk_result["no_cogs"]:
+            logger.warning("BLK COGS: %d order(s) could not get COGS — check sku_cogs_lots", blk_result["no_cogs"])
+    except Exception as exc:
+        logger.error("BLK COGS finalization failed (non-fatal): %s", exc)
+
     # Wait a moment to ensure DB writes are committed before querying for summary
     time.sleep(5)
 

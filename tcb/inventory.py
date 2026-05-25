@@ -620,6 +620,66 @@ def finalize_az_cogs(dry_run: bool = False) -> dict:
     }
 
 
+def finalize_blk_cogs(dry_run: bool = False) -> dict:
+    """
+    Stamp lot-based COGS on BLK FULFILLED orders that have lot_cogs_finalized=False.
+
+    Called daily after Blinkit scraper (G2b). Consumes BLK channel sku_cogs_lots FIFO
+    using supply_state (tier-1) or full channel pool (tier-2 fallback).
+
+    Does NOT insert sku_inventory_transactions rows — TRANSFER_OUT at bulk ship time
+    already recorded the stock movement.
+
+    Returns dict: {total, finalized, fallback_used, no_cogs}.
+    """
+    db         = get_client()
+    ch_rows    = db.table("channels").select("code, channel_id").execute().data
+    blk_id     = next(r["channel_id"] for r in ch_rows if r["code"] == "BLK")
+
+    pending = (db.table("orders")
+                 .select("order_id, sku_id, quantity, supply_state, state")
+                 .eq("lot_cogs_finalized", False)
+                 .eq("status", "FULFILLED")
+                 .eq("channel_id", blk_id)
+                 .order("order_date")
+                 .execute().data)
+
+    finalized = fallback_used = no_cogs = 0
+
+    for order in pending:
+        # Use supply_state if captured; fall back to customer state as proxy
+        s_state = order["supply_state"] or order["state"]
+        result  = consume_sor_sale(
+            sku_id=order["sku_id"],
+            qty=order["quantity"],
+            channel_id=blk_id,
+            supply_state=s_state,
+        )
+
+        if result is None:
+            no_cogs += 1
+            update = {"lot_cogs_finalized": True}
+        else:
+            unit_cogs, lot_id = result
+            cogs = round(unit_cogs * int(order["quantity"]), 2)
+            update = {"cogs": cogs, "lot_cogs_finalized": True}
+            if lot_id is not None:
+                update["lot_id"] = lot_id
+            finalized += 1
+            if not order["supply_state"]:
+                fallback_used += 1
+
+        if not dry_run:
+            db.table("orders").update(update).eq("order_id", order["order_id"]).execute()
+
+    return {
+        "total":        len(pending),
+        "finalized":    finalized,
+        "fallback_used": fallback_used,
+        "no_cogs":      no_cogs,
+    }
+
+
 def record_dropship_sale(sku_id, qty, channel_id, selling_price,
                          order_date=None, platform_order_id=None,
                          city=None, state=None, notes="", created_by="app"):
@@ -1046,10 +1106,14 @@ def receive_item(item_id, qty, cost_per_unit, supplier_id=None,
 
 # ── SOR sell-out lot consumption ──────────────────────────────────────────────
 
-def _consume_from_lots(db, lots: list, qty: int) -> float:
-    """FIFO-consume qty units from an ordered lot list. Returns weighted avg unit_cogs."""
+def _consume_from_lots(db, lots: list, qty: int) -> tuple[float, int | None]:
+    """FIFO-consume qty units from an ordered lot list.
+    Returns (weighted_avg_unit_cogs, lot_id) where lot_id is set only when
+    the entire qty came from a single lot (unambiguous traceability); None otherwise.
+    """
     remaining = qty
     total_cost = 0.0
+    lots_used: list[int] = []
     for lot in lots:
         if remaining <= 0:
             break
@@ -1059,13 +1123,15 @@ def _consume_from_lots(db, lots: list, qty: int) -> float:
         ).eq("lot_id", lot["lot_id"]).execute()
         total_cost += take * float(lot["unit_cogs"])
         remaining -= take
-    return round(total_cost / qty, 4)
+        lots_used.append(lot["lot_id"])
+    primary_lot_id = lots_used[0] if len(lots_used) == 1 else None
+    return round(total_cost / qty, 4), primary_lot_id
 
 
 def consume_sor_sale(sku_id: str, qty: int, channel_id: int,
-                     supply_state: str | None = None) -> float | None:
+                     supply_state: str | None = None) -> tuple[float, int | None] | None:
     """
-    FIFO-consume sku_cogs_lots for a confirmed SOR sell-out (Blinkit, Amazon FBA).
+    FIFO-consume sku_cogs_lots for a confirmed SOR sell-out (Blinkit).
 
     Tier-1 (preferred): if supply_state given, pool all lots for partner locations
     in that state and consume FIFO. This gives state-level FIFO accuracy without
@@ -1074,8 +1140,8 @@ def consume_sor_sale(sku_id: str, qty: int, channel_id: int,
     Tier-2 (fallback): if tier-1 has insufficient qty, or no supply_state given,
     pool ALL lots for the channel and consume FIFO. Logs a warning when falling back.
 
-    Returns weighted avg unit_cogs of consumed lots, or None if even tier-2 is
-    insufficient (logs warning, does not raise — caller records the order regardless).
+    Returns (unit_cogs, lot_id) where lot_id is None when multiple lots were consumed.
+    Returns None if even tier-2 is insufficient (logs warning, does not raise).
     """
     db = get_client()
     qty = int(qty)

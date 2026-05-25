@@ -241,7 +241,7 @@ def _apply_lot_cogs(db, delivered_rows: list[dict],
             continue
 
         supply_state = supply_state_map.get(oid)
-        unit_cogs = consume_sor_sale(
+        result = consume_sor_sale(
             sku_id=row["sku_id"],
             qty=row["quantity"],
             channel_id=BLK_CHANNEL_ID,
@@ -249,8 +249,11 @@ def _apply_lot_cogs(db, delivered_rows: list[dict],
         )
 
         update: dict = {"lot_cogs_finalized": True}
-        if unit_cogs is not None:
+        if result is not None:
+            unit_cogs, lot_id = result
             update["cogs"] = round(unit_cogs * row["quantity"], 2)
+            if lot_id is not None:
+                update["lot_id"] = lot_id
 
         db.table("orders").update(update).eq("order_id", oid).eq("channel_id", BLK_CHANNEL_ID).execute()
         finalized += 1
