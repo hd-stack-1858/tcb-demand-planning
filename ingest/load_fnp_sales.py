@@ -311,6 +311,14 @@ def load_files(extracted_path: Path, report_path: Path,
         if res.data:
             updated_count += 1
 
+    # Stamp lot_id from DISPATCH txn rows (reference=platform_order_id) for traceability.
+    # Works when dispatch happened before order load (the normal FnP flow).
+    from tcb.inventory import stamp_lot_id_from_dispatch
+    FNP_CHANNEL_ID = 5
+    all_order_ids = [r["platform_order_id"] for r in to_insert + [p for _, p in to_update]
+                     if r.get("platform_order_id")]
+    stamp_lot_id_from_dispatch(db, FNP_CHANNEL_ID, all_order_ids)
+
     return new_count, updated_count, skipped
 
 

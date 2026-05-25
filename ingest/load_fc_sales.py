@@ -189,6 +189,13 @@ def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int, int]
         if res.data:
             updated_count += 1
 
+    # Stamp lot_id from DISPATCH txn rows (reference=platform_order_id) for traceability.
+    from tcb.inventory import stamp_lot_id_from_dispatch
+    FC_CHANNEL_ID = 6
+    all_order_ids = [r["platform_order_id"] for r in to_insert + [p for _, p in to_update]
+                     if r.get("platform_order_id")]
+    stamp_lot_id_from_dispatch(db, FC_CHANNEL_ID, all_order_ids)
+
     return new_count, updated_count, skipped
 
 
