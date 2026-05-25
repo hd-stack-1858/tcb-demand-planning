@@ -167,21 +167,22 @@ def _parse_fc_order_date(raw: str) -> date | None:
         return None
 
 
-def _parse_city_from_address(address: str) -> str | None:
+def _parse_pincode_from_address(address: str) -> str | None:
     """
-    Extract city from FC shipping address.
-    Format: '...street..., city, state, pincode'
-    Returns the third-from-last comma-separated segment.
+    Extract 6-digit pincode from FC shipping address.
+    Pincode is always the last numeric field — much more reliable than
+    position-based city extraction which breaks on varied address formats.
     """
-    parts = [p.strip() for p in address.split(",") if p.strip()]
-    return parts[-3] if len(parts) >= 3 else None
+    import re as _re
+    m = _re.search(r'\b(\d{6})\b', address)
+    return m.group(1) if m else None
 
 
 # ── DB recording ──────────────────────────────────────────────────────────────
 
 def _record_fc_order(order_id: str, sku_id: str, qty: int,
-                     city: str | None, order_date: date | None,
-                     dry_run: bool) -> str:
+                     city: str | None, state: str | None,
+                     order_date: date | None, dry_run: bool) -> str:
     """
     Write one FC order to the orders table + decrement OWN_WH inventory.
     Checks for duplicates first (safe to call on retry runs).
@@ -220,6 +221,7 @@ def _record_fc_order(order_id: str, sku_id: str, qty: int,
             order_date=order_date or date.today(),
             platform_order_id=order_id,
             city=city,
+            state=state,
             notes="fc_scraper",
             created_by="vignesh",
         )
@@ -731,10 +733,12 @@ def run(dry_run: bool = False, headed: bool = False, no_email: bool = False) -> 
                     logger.info("No more unprocessed orders found.")
                     break
 
-                city       = _parse_city_from_address(shipping_address)
+                from tcb.geo import pincode_to_city_state
+                pincode    = _parse_pincode_from_address(shipping_address)
+                city, state = pincode_to_city_state(pincode)
                 order_date = _parse_fc_order_date(order_date_raw)
-                logger.info("Processing order: %s (row %d) date=%s city=%s",
-                            order_id, row_index, order_date, city)
+                logger.info("Processing order: %s (row %d) date=%s pincode=%s city=%s state=%s",
+                            order_id, row_index, order_date, pincode, city, state)
 
                 try:
                     pdfs, order_items_list = _process_one_order(ctx, gear_icon, order_id)
@@ -745,7 +749,7 @@ def run(dry_run: bool = False, headed: bool = False, no_email: bool = False) -> 
                     for item in order_items_list:
                         db_status = _record_fc_order(
                             order_id, item["sku_id"], item["qty"],
-                            city, order_date, dry_run,
+                            city, state, order_date, dry_run,
                         )
                         result["order_details"].append({
                             "order_id":   order_id,

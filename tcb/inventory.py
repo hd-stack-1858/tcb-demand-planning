@@ -496,11 +496,11 @@ def dispatch_sku(sku_id, qty, channel_id, reference="", notes="", created_by="ap
 
 def record_dropship_sale(sku_id, qty, channel_id, selling_price,
                          order_date=None, platform_order_id=None,
-                         city=None, notes="", created_by="app"):
+                         city=None, state=None, notes="", created_by="app"):
     """
     Record a drop-ship / direct sale: dispatches inventory AND writes to orders.
     COGS from OWN_WH lots (FIFO). MRP auto-fetched from sku_pricing.
-    State auto-resolved from city via geo lookup.
+    Pass state explicitly (from pincode lookup) or it falls back to city_to_state().
     """
     db  = get_client()
     qty = int(qty)
@@ -520,7 +520,7 @@ def record_dropship_sale(sku_id, qty, channel_id, selling_price,
         round((mrp - selling_price) / mrp * 100, 2)
         if mrp and mrp > 0 else None
     )
-    state = city_to_state(city)
+    state = state or city_to_state(city)
 
     db.table("orders").insert({
         "channel_id":        channel_id,

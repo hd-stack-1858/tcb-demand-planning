@@ -606,13 +606,13 @@ def _parse_challan_pdf(pdf_path: Path) -> list[dict]:
     """
     Extract order details from a downloaded FnP branding challan PDF.
     Returns one dict per page (each page = one order):
-      {order_no, sku_raw, qty, order_date (date|None), city (str|None)}
+      {order_no, sku_raw, qty, order_date (date|None), pincode (str|None)}
 
     Patterns confirmed on real challans:
       Order No   : 7267211901            → 10-digit
       Order Date : 19-05-2026            → DD-MM-YYYY
       SKU        : GIFTS-TCB003_OP_NB25  → TCBxxx embedded
-      City       : last city-like word before 6-digit pincode in address
+      Pincode    : 6-digit number in address block (e.g. 332001)
     """
     import pdfplumber
     import re as _re
@@ -642,36 +642,25 @@ def _parse_challan_pdf(pdf_path: Path) -> list[dict]:
                 m = _re.search(r'\bTCB(\d{3})', text, _re.IGNORECASE)
                 sku_raw = f"TCB{m.group(1).upper()}" if m else None
 
-                # City: last city-like word before a 6-digit Indian pincode.
-                # Pattern 1: standard "City, - PINCODE" on same line.
-                city_raw = None
-                city_matches = _re.findall(
-                    r'([A-Za-z][A-Za-z\s]{1,25}),\s*[-–]?\s*\d{6}', text
-                )
-                if city_matches:
-                    city_raw = city_matches[-1].strip()
-                else:
-                    # Pattern 2 (PDF column-merge fallback): pincode starts a new line.
-                    # Scan backwards from that line start to find the last alpha-only token.
-                    pm = _re.search(r'(?:^|\n)(\d{6})\b', text)
-                    if pm:
-                        before = text[:pm.start()].strip()
-                        for token in reversed(_re.split(r'[,\n]+', before)):
-                            token = token.strip()
-                            if _re.match(r'^[A-Za-z][A-Za-z ]+$', token) and 3 <= len(token) <= 30:
-                                city_raw = token
-                                break
+                # Pincode: first 6-digit number in the address block (after "To :").
+                # Much more reliable than city-name extraction from PDF text.
+                pincode_raw = None
+                to_match = _re.search(r'To\s*:', text)
+                address_text = text[to_match.start():] if to_match else text
+                pm = _re.search(r'\b(\d{6})\b', address_text)
+                if pm:
+                    pincode_raw = pm.group(1)
 
                 logger.info(
-                    "PDF page %d: order_no=%s sku=%s date=%s city=%s",
-                    page_num, order_no, sku_raw, order_date, city_raw,
+                    "PDF page %d: order_no=%s sku=%s date=%s pincode=%s",
+                    page_num, order_no, sku_raw, order_date, pincode_raw,
                 )
                 results.append({
                     "order_no":   order_no,
                     "sku_raw":    sku_raw,
                     "qty":        1,
                     "order_date": order_date,
-                    "city":       city_raw,
+                    "pincode":    pincode_raw,
                 })
     except Exception as exc:
         logger.error("_parse_challan_pdf failed on %s: %s", pdf_path.name, exc)
@@ -679,7 +668,8 @@ def _parse_challan_pdf(pdf_path: Path) -> list[dict]:
 
 
 def _record_fnp_order(order_no: str, sku_id: str, qty: int,
-                      city: str | None, order_date: date, dry_run: bool) -> str:
+                      city: str | None, state: str | None,
+                      order_date: date, dry_run: bool) -> str:
     """
     Write one FnP order to the orders table + decrement OWN_WH inventory.
     Checks for duplicates first (safe to call on retry runs).
@@ -718,11 +708,12 @@ def _record_fnp_order(order_no: str, sku_id: str, qty: int,
             order_date=order_date,
             platform_order_id=order_no,
             city=city,
+            state=state,
             notes="fnp_scraper",
             created_by="vignesh",
         )
-        logger.info("FnP %s/%s recorded to DB (date=%s city=%s SP=%.0f).",
-                    order_no, sku_id, order_date, city, sp)
+        logger.info("FnP %s/%s recorded to DB (date=%s city=%s state=%s SP=%.0f).",
+                    order_no, sku_id, order_date, city, state, sp)
         return "recorded"
     except Exception as exc:
         logger.error("Failed to record FnP %s/%s: %s", order_no, sku_id, exc)
@@ -896,16 +887,17 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
         browser.close()
 
     # ── Step 4: Record orders to DB ───────────────────────────────────────────
-    # raw_order_rows now comes from _parse_challan_pdf() — order_date is already
-    # a date object (or None), city is a raw string ready for normalise_city().
-    from ingest.utils import normalise_city
+    # raw_order_rows now comes from _parse_challan_pdf() — order_date is a date
+    # object (or None), pincode is a 6-digit string used to resolve city+state.
+    from tcb.geo import pincode_to_city_state
 
     order_details: list[dict] = []
     for row in raw_order_rows:
         order_no   = row.get("order_no", "")
         sku_raw    = row.get("sku_raw")
         qty        = row.get("qty", 1)
-        city       = normalise_city(row.get("city"))
+        pincode    = row.get("pincode")
+        city, state = pincode_to_city_state(pincode)
         order_date = row.get("order_date") or date.today()
 
         if row.get("order_date") is None:
@@ -913,7 +905,7 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
 
         sku_id = _parse_sku(sku_raw)
         if sku_id:
-            db_status = _record_fnp_order(order_no, sku_id, qty, city, order_date, dry_run)
+            db_status = _record_fnp_order(order_no, sku_id, qty, city, state, order_date, dry_run)
         else:
             logger.warning("Could not resolve SKU for FnP order %s (raw=%r) — DB write skipped.",
                            order_no, sku_raw)
