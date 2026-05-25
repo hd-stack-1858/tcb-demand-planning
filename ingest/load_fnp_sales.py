@@ -290,7 +290,8 @@ def load_files(extracted_path: Path, report_path: Path,
         else:
             payload = {k: v for k, v in row.items()
                        if k not in ("order_id", "channel_id", "lot_cogs_finalized")
-                       and not (k == "lot_id" and v is None)}
+                       and not (k == "lot_id" and v is None)
+                       and not (k == "cogs"   and v is None)}
             payload["platform_order_id"] = order_no
             to_update.append((db_order_id, payload))
 

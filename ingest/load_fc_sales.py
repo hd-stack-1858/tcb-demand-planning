@@ -168,6 +168,7 @@ def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int, int]
                 if k not in ("order_id", "channel_id", "lot_cogs_finalized")
                 and not (k in ("city", "state") and v is None)
                 and not (k == "lot_id" and v is None)
+                and not (k == "cogs"   and v is None)
             }
             # Canonicalise platform_order_id to the FC OrderID (not Shipping Ref)
             payload["platform_order_id"] = order_id_raw
