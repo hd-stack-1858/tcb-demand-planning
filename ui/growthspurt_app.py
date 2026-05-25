@@ -1976,7 +1976,7 @@ def tab_blinkit_deepdive() -> None:
             int(plan_df[plan_df["sku_id"] == selected_sku]["active_ds_count"].sum())
             if not plan_df.empty else 0
         )
-        if db_active_count > plan_active_count:
+        if not plan_df.empty and db_active_count > plan_active_count:
             discrepancy = db_active_count - plan_active_count
             st.warning(
                 f"**Trigger 1 — Vanished-Y DS:** {db_active_count} DS marked `active` in DB "
