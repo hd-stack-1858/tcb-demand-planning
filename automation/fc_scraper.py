@@ -235,11 +235,44 @@ def _record_fc_order(order_id: str, sku_id: str, qty: int,
 
 # ── Per-order processing ───────────────────────────────────────────────────────
 
+def _dismiss_blocking_modals(tab, label: str = "") -> None:
+    """
+    Wait for any active loading overlay to clear, then dismiss any residual
+    dialog modals that would intercept pointer events.  Call this before
+    clicking any element that may be blocked by FC portal overlays.
+    """
+    # 1. Wait for loading overlay to finish (FC shows a spinner after Save/OK clicks)
+    try:
+        tab.wait_for_selector(".loading-overlay.is-active", state="hidden", timeout=15_000)
+    except Exception:
+        pass  # If selector never appears, nothing to wait for
+
+    # 2. Dismiss any residual dialog modal
+    for _ in range(4):
+        try:
+            modal = tab.locator(".dialog.modal.is-active")
+            if not modal.count():
+                break
+            ok_btn = modal.locator("button").filter(has_text="OK").first
+            if ok_btn.count():
+                logger.warning("%s: blocking dialog modal found — clicking OK to clear.", label)
+                ok_btn.click()
+                time.sleep(1.5)
+            else:
+                logger.warning("%s: blocking modal has no OK button — continuing anyway.", label)
+                break
+        except Exception:
+            break
+
+
 def _download_pdf_link(tab, link_text: str, dest: Path) -> Path:
     """
     Click a PDF link (e.g. "Print Invoice") and save the result to dest.
     Handles both direct-download and new-tab-opens cases.
     """
+    # Clear any loading overlay or blocking modal before attempting the click
+    _dismiss_blocking_modals(tab, label=f"'{link_text}' download")
+
     link = tab.get_by_text(link_text, exact=True).first
     if not link.count():
         link = tab.locator(f"a:has-text('{link_text}')").first
@@ -584,15 +617,18 @@ def _process_one_order(context, gear_icon, order_id: str) -> tuple[list[Path], d
         time.sleep(3)
         logger.info("Order %s: Save clicked.", order_id)
 
-        # ── Step 7: Handle "No Records Found" popup (appears on last order) ───
-        try:
-            ok_btn = tab.get_by_role("button", name="OK")
-            ok_btn.wait_for(timeout=5_000)
-            logger.info("Order %s: 'No Records Found' popup detected — clicking OK.", order_id)
-            ok_btn.click()
-            time.sleep(1)
-        except PWTimeout:
-            pass  # popup doesn't appear for non-last orders
+        # ── Step 7: Dismiss ALL modal dialogs (loop — FC can show multiple sequentially) ───
+        # "No Records Found" appears on the last order; additional dialogs can follow.
+        for _popup_n in range(6):
+            try:
+                ok_btn = tab.get_by_role("button", name="OK")
+                ok_btn.wait_for(timeout=5_000)
+                logger.info("Order %s: modal/popup detected (attempt %d) — clicking OK.",
+                            order_id, _popup_n + 1)
+                ok_btn.click()
+                time.sleep(1.5)
+            except PWTimeout:
+                break  # no more popups
 
         # ── Step 8: Download PDFs ─────────────────────────────────────────────
         # Wait for "Print Invoice" and "Print Address" links to appear
