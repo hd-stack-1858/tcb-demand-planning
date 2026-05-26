@@ -26,6 +26,15 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from tcb.db import get_orders_raw, get_blinkit_city_ds, get_skus, get_client, get_replen_plan
+from tcb.forecasting import (
+    get_forecast_display as _fc_get_display,
+    get_forecast_channel_breakdown as _fc_get_channels,
+    lock_sku_month as _fc_lock,
+    reset_sku_month as _fc_reset,
+    get_last_run_date as _fc_last_run,
+    FORECAST_MONTHS as _FC_MONTHS,
+    _next_n_month_starts as _fc_months,
+)
 
 st.set_page_config(
     page_title="TCB Sales MIS",
@@ -1685,9 +1694,9 @@ def main():
         st.info("No data for the selected filters.")
         return
 
-    t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
         "📊 Overview", "📈 Trends", "🏪 By Channel", "📦 By SKU",
-        "🔄 Returns", "🗺️ Geo", "🟡 Blinkit Deepdive",
+        "🔄 Returns", "🗺️ Geo", "🟡 Blinkit Deepdive", "🔮 Forecast",
     ])
     with t1:
         tab_overview(raw_df, fdf, filters["net_mode"], filters)
@@ -1703,6 +1712,8 @@ def main():
         tab_geography(fdf, filters["net_mode"])
     with t7:
         tab_blinkit_deepdive(fdf, filters["net_mode"])
+    with t8:
+        tab_forecast()
 
 
 # ── Blinkit Deepdive tab ───────────────────────────────────────────────────────
@@ -2375,6 +2386,326 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
             )
             st.caption("Monthly units — current month projected to full month")
             st.plotly_chart(fig_bk, use_container_width=True)
+
+
+# ── Forecast tab ──────────────────────────────────────────────────────────────
+
+_FC_CHANNEL_NAMES = {
+    2: "Amazon", 3: "Amazon FBM", 4: "Blinkit", 5: "FnP",
+    6: "First Cry", 7: "Peeko", 8: "Ozi", 9: "Kiddo", 10: "D2C",
+}
+
+
+@st.cache_data(ttl=60)
+def _fc_load_display():
+    return _fc_get_display()
+
+
+@st.cache_data(ttl=60)
+def _fc_load_channels(sku_id: str):
+    return _fc_get_channels(sku_id)
+
+
+def _fc_build_excel(display_df: pd.DataFrame) -> bytes:
+    """Build 3-sheet forecast Excel."""
+    from io import BytesIO
+    import openpyxl
+    from openpyxl.styles import PatternFill, Font
+
+    wb = openpyxl.Workbook()
+
+    skus = get_skus()
+    sku_names = {s["sku_id"]: s.get("sku_name", s["sku_id"]) for s in skus}
+
+    forecast_dates = _fc_months(_FC_MONTHS)
+    month_labels = [fm.strftime("%b %Y") for fm in forecast_dates]
+    date_to_label = {fm: fm.strftime("%b %Y") for fm in forecast_dates}
+
+    if display_df.empty:
+        ws = wb.active
+        ws.title = "Summary"
+        ws["A1"] = "No forecast data"
+        bio = BytesIO()
+        wb.save(bio)
+        return bio.getvalue()
+
+    pivot = (
+        display_df.pivot(index="sku_id", columns="forecast_month", values="forecast_units")
+        .fillna(0).astype(int)
+        .rename(columns=date_to_label)
+    )
+    locked_pivot = (
+        display_df.pivot(index="sku_id", columns="forecast_month", values="is_user_locked")
+        .fillna(False)
+        .rename(columns=date_to_label)
+    )
+
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    hdr_font = Font(bold=True)
+
+    # ── Sheet 1: Summary ───────────────────────────────────────────────────────
+    ws = wb.active
+    ws.title = "Summary"
+    headers = ["SKU", "Name"] + month_labels + ["6M Total"]
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=c, value=h)
+        cell.font = hdr_font
+
+    for r_idx, (sku_id, row) in enumerate(pivot.iterrows(), 2):
+        ws.cell(row=r_idx, column=1, value=sku_id)
+        ws.cell(row=r_idx, column=2, value=sku_names.get(sku_id, sku_id))
+        total = 0
+        for c_idx, m_label in enumerate(month_labels, 3):
+            val = int(row.get(m_label, 0))
+            total += val
+            cell = ws.cell(row=r_idx, column=c_idx, value=val)
+            is_locked = locked_pivot.loc[sku_id, m_label] if (sku_id in locked_pivot.index and m_label in locked_pivot.columns) else False
+            if is_locked:
+                cell.fill = green_fill
+        ws.cell(row=r_idx, column=len(headers), value=total)
+
+    ws.column_dimensions["A"].width = 10
+    ws.column_dimensions["B"].width = 30
+    for c_idx in range(3, len(headers) + 1):
+        col_letter = ws.cell(row=1, column=c_idx).column_letter
+        ws.column_dimensions[col_letter].width = 12
+
+    # ── Sheet 2: Channel Breakdown ─────────────────────────────────────────────
+    ws2 = wb.create_sheet("Channel Breakdown")
+    ws2.append(["SKU", "Channel", "Month", "Base Units", "Forecast Units", "Locked"])
+    for cell in ws2[1]:
+        cell.font = hdr_font
+
+    for sku_id in sorted(display_df["sku_id"].unique()):
+        ch_df = _fc_get_channels(sku_id)
+        if ch_df.empty:
+            continue
+        for _, row in ch_df.iterrows():
+            ws2.append([
+                sku_id,
+                _FC_CHANNEL_NAMES.get(int(row["channel_id"]), str(row["channel_id"])),
+                str(row["forecast_month"]),
+                int(row["base_units"]),
+                int(row["forecast_units"]),
+                "Yes" if row["is_user_locked"] else "No",
+            ])
+
+    for col in ("A", "B", "C"):
+        ws2.column_dimensions[col].width = 14
+    ws2.column_dimensions["D"].width = 12
+    ws2.column_dimensions["E"].width = 16
+
+    # ── Sheet 3: Assumptions ──────────────────────────────────────────────────
+    ws3 = wb.create_sheet("Assumptions")
+    ws3["A1"] = "Blinkit model: P75 of mean ADS across non-zero active DSes × planned DS count × 30 days"
+    ws3["A2"] = "Growth model: P75 of MoM growth rates (capped at 35%) applied forward from last actuals"
+    ws3["A3"] = "D2C: Manual input only — no engine-generated forecast"
+    ws3["A4"] = "Locked cells (green) use USER_FINAL; unlocked cells use VELOCITY_BASE"
+    ws3["A6"] = f"Generated: {date.today().isoformat()}"
+    ws3.column_dimensions["A"].width = 90
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def tab_forecast():
+    """Forecast tab: 6-month demand projection engine."""
+    import subprocess
+
+    # ── Top controls ──────────────────────────────────────────────────────────
+    col_btn, col_status = st.columns([2, 4])
+    with col_btn:
+        regen = st.button("▶ Regenerate Base Forecast", key="fc_regen")
+    with col_status:
+        last_run = _fc_last_run()
+        st.caption(f"Last run: {last_run}" if last_run else "No forecast generated yet — click Regenerate to start.")
+
+    if regen:
+        with st.spinner("Running forecast engine (~20s)..."):
+            _r = subprocess.run(
+                [sys.executable, "tcb/forecasting.py"],
+                capture_output=True, text=True, encoding="utf-8",
+                cwd=str(Path(".").resolve()),
+            )
+        if _r.returncode == 0:
+            st.success("Forecast regenerated successfully!")
+            st.cache_data.clear()
+        else:
+            st.error(f"Forecast failed:\n{_r.stderr[-800:]}")
+        st.rerun()
+        return
+
+    # ── Load data ─────────────────────────────────────────────────────────────
+    display_df = _fc_load_display()
+    if display_df.empty:
+        st.info("No forecast data found. Click ▶ Regenerate to generate the base forecast.")
+        return
+
+    skus = get_skus()
+    sku_names = {s["sku_id"]: s.get("sku_name", s["sku_id"]) for s in skus}
+
+    forecast_dates = _fc_months(_FC_MONTHS)
+    month_labels = [fm.strftime("%b %Y") for fm in forecast_dates]
+    date_to_label = {fm: fm.strftime("%b %Y") for fm in forecast_dates}
+    label_to_date = {v: k for k, v in date_to_label.items()}
+
+    # ── Build pivot ────────────────────────────────────────────────────────────
+    pivot = (
+        display_df.pivot(index="sku_id", columns="forecast_month", values="forecast_units")
+        .fillna(0).astype(int)
+        .rename(columns=date_to_label)
+    )
+    pivot_base = (
+        display_df.pivot(index="sku_id", columns="forecast_month", values="base_units")
+        .fillna(0).astype(int)
+        .rename(columns=date_to_label)
+    )
+    pivot_locked = (
+        display_df.pivot(index="sku_id", columns="forecast_month", values="is_user_locked")
+        .fillna(False)
+        .rename(columns=date_to_label)
+    )
+
+    avail_months = [m for m in month_labels if m in pivot.columns]
+    for pv in (pivot, pivot_base, pivot_locked):
+        for m in avail_months:
+            if m not in pv.columns:
+                pv[m] = 0
+
+    # ── Editable forecast grid ─────────────────────────────────────────────────
+    grid_df = pivot[avail_months].reset_index().rename(columns={"sku_id": "SKU"})
+    grid_df.insert(1, "Name", grid_df["SKU"].map(sku_names).fillna(""))
+
+    def _locked_summary(sku_id: str) -> str:
+        if sku_id not in pivot_locked.index:
+            return ""
+        row = pivot_locked.loc[sku_id]
+        return ", ".join(m[:3] for m in avail_months if row.get(m, False)) or ""
+
+    grid_df["Locked"] = grid_df["SKU"].apply(_locked_summary)
+
+    st.markdown("**Forecast — SKU × Month**")
+    st.caption("Edit cells to override a projection, then click **Lock Edited Cells** to save. Green = USER_FINAL locked.")
+
+    col_config = {
+        "SKU":    st.column_config.TextColumn("SKU", disabled=True, width="small"),
+        "Name":   st.column_config.TextColumn("Name", disabled=True),
+        "Locked": st.column_config.TextColumn("Locked Months", disabled=True, width="small"),
+        **{m: st.column_config.NumberColumn(m, format="%d", step=1, min_value=0)
+           for m in avail_months},
+    }
+
+    edited_df = st.data_editor(
+        grid_df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        column_config=col_config,
+        key="fc_editor",
+    )
+
+    # Base reference (collapsible)
+    with st.expander("Base forecast (VELOCITY_BASE) — engine output before any user override"):
+        base_view = pivot_base[avail_months].reset_index().rename(columns={"sku_id": "SKU"})
+        base_view.insert(1, "Name", base_view["SKU"].map(sku_names).fillna(""))
+        st.dataframe(base_view, use_container_width=True, hide_index=True)
+
+    # ── Lock / Reset ───────────────────────────────────────────────────────────
+    st.markdown("---")
+    col_lock, col_reset = st.columns(2)
+
+    with col_lock:
+        st.markdown("**Lock Edited Cells**")
+        st.caption("Saves any edited value as USER_FINAL — distributed proportionally across channels.")
+        if st.button("🔒 Lock Edited Cells", key="fc_lock"):
+            changes: list[tuple] = []
+            for _, row in edited_df.iterrows():
+                sku = row["SKU"]
+                orig_row = grid_df[grid_df["SKU"] == sku]
+                if orig_row.empty:
+                    continue
+                for m_label in avail_months:
+                    orig_val = int(orig_row[m_label].values[0])
+                    new_val  = int(row.get(m_label, orig_val) or 0)
+                    if new_val != orig_val:
+                        changes.append((sku, label_to_date[m_label], new_val))
+
+            if changes:
+                for sku, fm, val in changes:
+                    _fc_lock(sku, fm, val)
+                st.success(f"Locked {len(changes)} cell(s).")
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.info("No changes detected — edit values in the grid above first.")
+
+    with col_reset:
+        st.markdown("**Reset to Base**")
+        st.caption("Removes USER_FINAL — engine base forecast shows through on next load.")
+        reset_sku = st.selectbox(
+            "SKU to reset",
+            options=["— select —"] + sorted(display_df["sku_id"].unique().tolist()),
+            key="fc_reset_sku",
+        )
+        reset_months = st.multiselect(
+            "Months (blank = all locked months)",
+            options=avail_months,
+            key="fc_reset_months",
+        )
+        if st.button("↩ Reset", key="fc_reset_btn") and reset_sku != "— select —":
+            months_to_reset = [label_to_date[m] for m in (reset_months or avail_months)]
+            for fm in months_to_reset:
+                _fc_reset(reset_sku, fm)
+            st.success(f"Reset {reset_sku} for {len(months_to_reset)} month(s).")
+            st.cache_data.clear()
+            st.rerun()
+
+    # ── Channel breakdown ──────────────────────────────────────────────────────
+    st.markdown("---")
+    with st.expander("Channel Breakdown — per SKU"):
+        bd_sku = st.selectbox(
+            "Select SKU",
+            options=sorted(display_df["sku_id"].unique().tolist()),
+            key="fc_bd_sku",
+        )
+        if bd_sku:
+            ch_df = _fc_load_channels(bd_sku)
+            if not ch_df.empty:
+                ch_df = ch_df.copy()
+                ch_df["Channel"] = ch_df["channel_id"].apply(
+                    lambda cid: _FC_CHANNEL_NAMES.get(int(cid), str(cid))
+                )
+                ch_df["Month"] = ch_df["forecast_month"].apply(
+                    lambda d: date_to_label.get(d, str(d))
+                )
+                ch_pivot = ch_df.pivot_table(
+                    index="Channel", columns="Month",
+                    values="forecast_units", aggfunc="sum", fill_value=0,
+                )
+                ch_pivot = ch_pivot[[m for m in avail_months if m in ch_pivot.columns]]
+                st.dataframe(ch_pivot, use_container_width=True)
+            else:
+                st.info("No channel breakdown available for this SKU.")
+
+    # ── Excel download ─────────────────────────────────────────────────────────
+    st.markdown("---")
+    if st.button("⬇ Prepare Forecast Excel", key="fc_excel_prep"):
+        with st.spinner("Building Excel workbook..."):
+            xl_bytes = _fc_build_excel(display_df)
+        st.session_state["_fc_xl_bytes"] = xl_bytes
+        st.session_state["_fc_xl_fname"] = f"tcb_forecast_{date.today().isoformat()}.xlsx"
+
+    xl_bytes = st.session_state.get("_fc_xl_bytes")
+    xl_fname = st.session_state.get("_fc_xl_fname", "tcb_forecast.xlsx")
+    if xl_bytes:
+        st.download_button(
+            "⬇ Download Forecast Excel",
+            data=xl_bytes,
+            file_name=xl_fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="fc_dl_excel",
+        )
 
 
 if __name__ == "__main__":

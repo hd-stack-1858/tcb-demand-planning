@@ -34,6 +34,7 @@ from pathlib import Path
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client
@@ -63,8 +64,9 @@ def _sb_execute(query, retries: int = 2):
             else:
                 raise
 
-COVERAGE_DAYS    = 30
-TRANSIT_BUFFER   = 7
+COVERAGE_DAYS     = 30
+TRANSIT_BUFFER    = 7
+MIN_AVAILABLE_DAYS = 5   # min Q=Y days to compute reliable raw ADS for a DS
 MIN_INVOICE_VALUE = 150_000  # ₹1.5L gate per WH
 PERF_LOOKBACK    = 60        # days of performance data to load
 OUTPUT_DIR       = Path('data/blinkit/auto/replenishment')
@@ -291,19 +293,18 @@ def load_perf_ds_active_y(wh_df: pd.DataFrame,
 
 
 def load_performance_data(days_back: int = PERF_LOOKBACK) -> pd.DataFrame:
+    """Load day-level rows from blinkit_performance_detail (rolling window source)."""
     cutoff = (date.today() - timedelta(days=days_back)).isoformat()
-    cols   = ('data_date,location_id,sku_id,total_orders,'
-              'wh_oos_flag,assessment_start,assessment_end,download_date')
-    rows   = _paginate('blinkit_performance_ads', cols)
+    cols   = 'data_date,location_id,sku_id,city,inventory_available,total_orders,download_date'
+    rows   = _paginate('blinkit_performance_detail', cols)
     rows   = [r for r in rows if r.get('data_date', '') >= cutoff]
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    for col in ('data_date', 'assessment_start', 'assessment_end'):
-        df[col] = pd.to_datetime(df[col]).dt.date
-    df['total_orders']  = pd.to_numeric(df['total_orders'], errors='coerce').fillna(0).astype(int)
-    df['wh_oos_flag']   = df['wh_oos_flag'].fillna(False).astype(bool)
-    df['download_date'] = pd.to_datetime(df['download_date']).dt.date
+    df['data_date']          = pd.to_datetime(df['data_date']).dt.date
+    df['total_orders']       = pd.to_numeric(df['total_orders'], errors='coerce').fillna(0).astype(int)
+    df['inventory_available'] = df['inventory_available'].fillna(True).astype(bool)
+    df['download_date']      = pd.to_datetime(df['download_date']).dt.date
     return df
 
 
@@ -368,49 +369,87 @@ def load_sp_lookup() -> dict:
 
 def compute_ads(perf_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute ADS per (sku_id, location_id) using the latest assessment period for each SKU.
+    Compute ADS per (sku_id, location_id) using a rolling 30-day window.
 
-    ADS = SUM(total_orders WHERE NOT wh_oos_flag) / COUNT(days WHERE NOT wh_oos_flag)
+    raw_ADS     = SUM(total_orders WHERE inventory_available) / COUNT(inventory_available days)
+    imputed_ADS = (orders on available days + city_P75_ADS × oos_days) / 30
+
+    ads column = imputed_ADS (used for target stock in replenishment plan).
 
     Returns DataFrame with columns:
         sku_id, location_id, ads, had_oos_days, period_days,
-        non_oos_days, assessment_start, assessment_end
+        non_oos_days, raw_ads, imputed_ads, city, assessment_start, assessment_end
     """
     if perf_df.empty:
         return pd.DataFrame()
 
-    # Latest assessment period per SKU (each SKU has its own cycle)
-    latest_end = (
-        perf_df.groupby('sku_id')['assessment_end']
-        .max()
-        .rename('latest_end')
+    # Rolling 30-day window per SKU
+    max_date_per_sku = perf_df.groupby('sku_id')['data_date'].max().to_dict()
+    perf_df = perf_df.copy()
+    perf_df['_cutoff'] = perf_df['sku_id'].map(
+        lambda s: max_date_per_sku[s] - timedelta(days=29)
     )
-    perf = perf_df.join(latest_end, on='sku_id')
-    # Keep rows that belong to the latest period for that SKU
-    perf = perf[perf['assessment_end'] == perf['latest_end']].copy()
+    perf = perf_df[perf_df['data_date'] >= perf_df['_cutoff']].copy()
 
+    # DS-level raw ADS
     results = []
     for (sku_id, loc_id), grp in perf.groupby(['sku_id', 'location_id']):
-        non_oos   = grp[~grp['wh_oos_flag']]
-        oos_count = int(grp['wh_oos_flag'].sum())
-        if len(non_oos) == 0:
-            ads = 0.0  # WH was fully OOS during period — no velocity signal
-        else:
-            ads = non_oos['total_orders'].sum() / len(non_oos)
-
-        row = grp.iloc[0]
+        avail      = grp[grp['inventory_available']]
+        avail_days = len(avail)
+        oos_days   = len(grp) - avail_days
+        raw_ads    = float(avail['total_orders'].sum()) / avail_days if avail_days > 0 else 0.0
+        city_vals  = grp['city'].dropna()
+        city       = str(city_vals.iloc[0]).strip() if len(city_vals) > 0 else None
         results.append({
-            'sku_id':           sku_id,
-            'location_id':      loc_id,
-            'ads':              round(float(ads), 3),
-            'had_oos_days':     oos_count > 0,
-            'period_days':      len(grp),
-            'non_oos_days':     len(non_oos),
-            'assessment_start': str(row['latest_end'] - timedelta(days=29)),
-            'assessment_end':   str(row['latest_end']),
+            'sku_id':      sku_id,
+            'location_id': loc_id,
+            'raw_ads':     round(raw_ads, 4),
+            'avail_days':  avail_days,
+            'oos_days':    oos_days,
+            'total_days':  len(grp),
+            'city':        city,
         })
 
-    return pd.DataFrame(results)
+    if not results:
+        return pd.DataFrame()
+
+    ads_df = pd.DataFrame(results)
+
+    # City-level P75 ADS (imputation value for Q=0 days)
+    # Only include DSes with enough available days for a reliable signal
+    reliable = ads_df[ads_df['avail_days'] >= MIN_AVAILABLE_DAYS]
+    city_p75: dict[tuple, float] = {}
+    if not reliable.empty:
+        for (s_id, city), grp in reliable[reliable['city'].notna()].groupby(['sku_id', 'city']):
+            city_p75[(s_id, city)] = float(np.percentile(grp['raw_ads'].values, 75))
+
+    sku_p75_fallback: dict[str, float] = {}
+    if not reliable.empty:
+        for s_id, grp in reliable.groupby('sku_id'):
+            sku_p75_fallback[s_id] = float(np.percentile(grp['raw_ads'].values, 75))
+
+    def _imputed_ads(row) -> float:
+        ds_city = row['city']
+        p75 = city_p75.get((row['sku_id'], ds_city), 0.0) if ds_city else 0.0
+        if p75 == 0.0:
+            p75 = sku_p75_fallback.get(row['sku_id'], 0.0)
+        return round((row['raw_ads'] * row['avail_days'] + p75 * row['oos_days']) / 30, 4)
+
+    ads_df['imputed_ads'] = ads_df.apply(_imputed_ads, axis=1)
+    ads_df['ads']         = ads_df['imputed_ads']
+    ads_df['had_oos_days'] = ads_df['oos_days'] > 0
+    ads_df['period_days']  = ads_df['total_days']
+    ads_df['non_oos_days'] = ads_df['avail_days']
+
+    max_dt_map = perf.groupby('sku_id')['data_date'].max().to_dict()
+    ads_df['assessment_start'] = ads_df['sku_id'].apply(
+        lambda s: str(max_dt_map.get(s, date.today()) - timedelta(days=29))
+    )
+    ads_df['assessment_end'] = ads_df['sku_id'].apply(
+        lambda s: str(max_dt_map.get(s, date.today()))
+    )
+
+    return ads_df
 
 
 # ── Replenishment plan computation ─────────────────────────────────────────────
@@ -536,7 +575,7 @@ def compute_replenishment_plan(
         if ds_with_data < active_ds_count:
             notes.append(f'{active_ds_count - ds_with_data} DS missing performance data')
         if ds_with_oos > 0:
-            notes.append(f'{ds_with_oos} DS had WH-OOS days (priority)')
+            notes.append(f'{ds_with_oos} DS had stock-out days (inventory_available=False)')
 
         plan_rows.append({
             'wh_name':           wh_row['name'],

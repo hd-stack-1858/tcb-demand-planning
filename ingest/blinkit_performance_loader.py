@@ -8,13 +8,16 @@ Usage:
     python ingest/blinkit_performance_loader.py                 # load all CSVs in detail/
     python ingest/blinkit_performance_loader.py --file path.csv # load single file
 
-Two-pass logic per file:
-    Pass 1 (all rows): update DS-SKU eligibility status from darkstore_remark
-    Pass 2 (Y-rows only): upsert ADS data into blinkit_performance_ads
+Multi-pass logic per file:
+    Pass 0a: seed missing dark stores into partner_locations
+    Pass 0:  refresh WH→DS parent mapping
+    Pass 1:  update DS-SKU eligibility status from darkstore_remark
+    Pass 2:  upsert into blinkit_performance_ads (legacy — kept during validation)
+    Pass 2b: upsert into blinkit_performance_detail (new — Column Q as OOS signal)
 
-ADS formula for replenishment engine:
-    SUM(total_orders WHERE NOT wh_oos_flag) / COUNT(rows WHERE NOT wh_oos_flag)
-    per (sku_id, location_id) within latest assessment period
+New ADS formula (blinkit_performance_detail):
+    SUM(total_orders WHERE inventory_available=True) / COUNT(inventory_available=True days)
+    per (sku_id, location_id) over rolling 30-day window
 """
 
 import os
@@ -183,6 +186,29 @@ def load_file(filepath: Path) -> pd.DataFrame | None:
         df['Assessment Period End Date'].str.replace(r'\s+\+\d{4}\s+UTC', '', regex=True),
         utc=True, errors='coerce'
     ).dt.date
+
+    # Column Q — inventory_available: DS-level stock flag (Y = in stock at dark store)
+    inv_col = next((c for c in df.columns if 'inventory available' in c.lower()), None)
+    if inv_col:
+        df['inv_available'] = df[inv_col].astype(str).str.strip().str.upper() == 'Y'
+    else:
+        df['inv_available'] = True   # default: assume available if column absent
+
+    # Column Y — orders with complaint attributed to seller
+    complaint_col = next(
+        (c for c in df.columns
+         if 'complaint' in c.lower() and 'seller' in c.lower()), None
+    )
+    if complaint_col:
+        df['complaint_orders'] = pd.to_numeric(df[complaint_col], errors='coerce').fillna(0).astype(int)
+    else:
+        df['complaint_orders'] = 0
+
+    # Column J — city (may appear as "City" or "Delivery City")
+    city_col = next(
+        (c for c in df.columns if c.strip().lower() in ('city', 'delivery city')), None
+    )
+    df['city_val'] = df[city_col].fillna('').str.strip() if city_col else ''
 
     # Infer download_date from filename (first 10-digit numeric prefix)
     fname = filepath.name
@@ -635,6 +661,82 @@ def upsert_ads(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict, wh_lookup: d
     return inserted, skipped
 
 
+# ── Pass 2b: upsert into blinkit_performance_detail ───────────────────────────
+
+def upsert_detail(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict):
+    """
+    Load Y-rows into blinkit_performance_detail.
+    Uses inventory_available (Column Q) as the DS-level OOS signal.
+    Runs in parallel with upsert_ads() during migration period.
+    """
+    our_whs = set(WH_PERF_TO_CODE.keys())
+    y_rows  = df[
+        (df['Considered for assessment (Y/N)'] == 'Y') &
+        (df['Serving warehouse'].isin(our_whs))
+    ].copy()
+
+    if y_rows.empty:
+        return 0, 0
+
+    inserted  = 0
+    skipped   = 0
+    unknown_ds = set()
+    batch     = []
+
+    for _, row in y_rows.iterrows():
+        sku_id = sku_lookup.get(str(row['Item ID']))
+        if not sku_id:
+            skipped += 1
+            continue
+
+        raw_ds = str(row['Darkstore name']).strip()
+        ds_id  = ds_lookup.get(raw_ds.lower()) or ds_lookup.get(_bare_name(raw_ds))
+        if not ds_id:
+            unknown_ds.add(raw_ds)
+            skipped += 1
+            continue
+
+        if not row['data_date']:
+            skipped += 1
+            continue
+
+        city = str(row.get('city_val', '') or '').strip() or None
+
+        batch.append({
+            'data_date':             str(row['data_date']),
+            'location_id':           ds_id,
+            'sku_id':                sku_id,
+            'ds_name':               raw_ds,
+            'city':                  city,
+            'serving_wh':            str(row.get('Serving warehouse', '') or '').strip() or None,
+            'inventory_available':   bool(row.get('inv_available', True)),
+            'total_orders':          int(row['orders_n']),
+            'orders_with_complaint': int(row.get('complaint_orders', 0)),
+            'download_date':         str(row['download_date']),
+        })
+
+        if len(batch) >= BATCH_SIZE:
+            sb.table('blinkit_performance_detail').upsert(
+                batch,
+                on_conflict='data_date,location_id,sku_id'
+            ).execute()
+            inserted += len(batch)
+            batch = []
+
+    if batch:
+        sb.table('blinkit_performance_detail').upsert(
+            batch,
+            on_conflict='data_date,location_id,sku_id'
+        ).execute()
+        inserted += len(batch)
+
+    if unknown_ds:
+        print(f'  [WARN] Pass 2b: {len(unknown_ds)} DS not in partner_locations — '
+              f'{len(unknown_ds)} unique stores skipped')
+
+    return inserted, skipped
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def propagate_darkstore_closed() -> tuple[int, int]:
@@ -722,9 +824,13 @@ def process_file(filepath: Path, sku_lookup: dict, ds_lookup: dict,
     elig_count = update_eligibility(df, sku_lookup, ds_lookup)
     print(f'    Pass 1 (eligibility): {elig_count} status rows upserted')
 
-    # Pass 2: ADS
+    # Pass 2: ADS (legacy table — kept during validation period)
     ins, skip = upsert_ads(df, sku_lookup, ds_lookup, wh_lookup)
     print(f'    Pass 2 (ADS):         {ins} rows upserted, {skip} skipped')
+
+    # Pass 2b: detail table (new — column Q as OOS signal)
+    ins2, skip2 = upsert_detail(df, sku_lookup, ds_lookup)
+    print(f'    Pass 2b (detail):     {ins2} rows upserted, {skip2} skipped')
 
 
 def main():
