@@ -333,20 +333,27 @@ def forecast_blinkit(forecast_dates: list[date]) -> pd.DataFrame:
     # All SKUs to forecast
     all_sku_ids = (set(launch_plan.keys()) | set(active_cities_per_sku.keys())) - BLK_EXCLUDE_SKUS
 
-    # Per-SKU P25/P75/P90 signals (from compute_ds_ads — all DSes including zeros)
-    sku_signals_all = (
-        ads_df.groupby("sku_id")[["sku_p25_ads", "sku_p75_ads", "sku_p90_ads"]]
-        .first()
-        .to_dict("index")
-    )
+    # Per-SKU signals: mean_all (central) + p90 (hi bound)
+    # mean_all = average ADS across ALL DSes including zero-sellers
+    #            = penetration_rate × ADS_of_selling_DSes — the expected value per new DS
+    sku_mean_map = ads_df.groupby("sku_id")["mean_ads"].mean().to_dict()
+    sku_p90_map  = ads_df.groupby("sku_id")["sku_p90_ads"].first().to_dict()
+
+    sku_signals_all: dict[str, dict] = {}
+    for sku_id_k in sku_mean_map:
+        sku_signals_all[sku_id_k] = {
+            "sku_mean_ads": sku_mean_map[sku_id_k],
+            "sku_p90_ads":  sku_p90_map.get(sku_id_k, 0.0),
+        }
+
     # Apply alias mapping (e.g. "TCB009" plan SKU → look up "TCB009_1" ADS signal)
     for plan_sku, ads_sku in BLK_SKU_ALIAS.items():
         if plan_sku not in sku_signals_all and ads_sku in sku_signals_all:
             sku_signals_all[plan_sku] = sku_signals_all[ads_sku]
 
-    # Global fallback for SKUs with no ADS data at all
-    all_p75s = [s["sku_p75_ads"] for s in sku_signals_all.values() if s.get("sku_p75_ads", 0) > 0]
-    global_fallback_p75 = float(np.median(all_p75s)) if all_p75s else 0.01
+    # Global fallback: median mean_all across SKUs — only used when a SKU has NO data at all
+    all_means = [v["sku_mean_ads"] for v in sku_signals_all.values() if v.get("sku_mean_ads", 0) > 0]
+    global_fallback_ads = float(np.median(all_means)) if all_means else 0.01
 
     rows_out = []
     for sku_id in sorted(all_sku_ids):
@@ -360,15 +367,20 @@ def forecast_blinkit(forecast_dates: list[date]) -> pd.DataFrame:
         )
 
         sig = sku_signals_all.get(sku_id, {})
-        p75 = sig.get("sku_p75_ads") or global_fallback_p75
-        p25 = sig.get("sku_p25_ads") or p75 * 0.6
-        p90 = sig.get("sku_p90_ads") or p75 * 1.3
+        _mean = sig.get("sku_mean_ads") if sig else None
+        _p90  = (sig.get("sku_p90_ads") or 0.0) if sig else 0.0
+
+        # Central estimate: mean_all (expected orders/DS/day including zero-sellers)
+        # Fallback only when SKU has NO data at all in blinkit_performance_detail
+        p_central = _mean if (_mean is not None and _mean > 0) else global_fallback_ads
+        p_hi  = _p90 if _p90 > 0 else p_central * 1.3   # hi = P90 (top-10% DS performance)
+        p_lo  = p_central * 0.5                           # lo = half of central (downside)
 
         # Churn rate: use alias SKU if direct lookup not found
         churn_rate = churn_rates.get(sku_alias_id, churn_rates.get(sku_id, 0.0))
 
         if not sig:
-            print(f"  [Blinkit] INFO: No ADS signal for {sku_id} — fallback {global_fallback_p75:.4f}")
+            print(f"  [Blinkit] INFO: No ADS signal for {sku_id} — fallback {global_fallback_ads:.4f}")
 
         for fm in forecast_dates:
             month_str = fm.strftime("%Y-%m")
@@ -399,9 +411,9 @@ def forecast_blinkit(forecast_dates: list[date]) -> pd.DataFrame:
                 "sku_id":         sku_id,
                 "channel_id":     BLINKIT_CHANNEL_ID,
                 "forecast_month": fm.isoformat(),
-                "units":          max(0, round(p75 * ds_count * 30)),
-                "lo":             max(0, round(p25 * ds_count * 30)),
-                "hi":             max(0, round(p90 * ds_count * 30)),
+                "units":          max(0, round(p_central * ds_count * 30)),
+                "lo":             max(0, round(p_lo * ds_count * 30)),
+                "hi":             max(0, round(p_hi * ds_count * 30)),
             })
 
     print(f"  [Blinkit] Generated {len(rows_out)} SKU-month rows")

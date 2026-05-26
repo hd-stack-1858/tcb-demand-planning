@@ -187,10 +187,16 @@ def load_file(filepath: Path) -> pd.DataFrame | None:
         utc=True, errors='coerce'
     ).dt.date
 
-    # Column Q — inventory_available: DS-level stock flag (Y = in stock at dark store)
-    inv_col = next((c for c in df.columns if 'inventory available' in c.lower()), None)
+    # Column Q — inventory_available: DS-level stock flag
+    # Column header is "Available (Yes/No)" with values 0/1 (may also appear as Y/N or Yes/No)
+    _INV_PATTERNS = ['available (yes/no)', 'inventory available', 'available (y/n)']
+    inv_col = next(
+        (c for c in df.columns if any(p in c.strip().lower() for p in _INV_PATTERNS)),
+        None,
+    )
     if inv_col:
-        df['inv_available'] = df[inv_col].astype(str).str.strip().str.upper() == 'Y'
+        raw_av = df[inv_col].astype(str).str.strip().str.upper()
+        df['inv_available'] = raw_av.isin(['1', 'Y', 'YES', 'TRUE'])
     else:
         df['inv_available'] = True   # default: assume available if column absent
 
