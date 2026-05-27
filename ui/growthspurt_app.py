@@ -2613,10 +2613,19 @@ def tab_forecast():
     # ── Editable forecast grid ─────────────────────────────────────────────────
     grid_df = pivot[avail_months].reset_index().rename(columns={"sku_id": "SKU"})
 
+    # Current month: pro-rate actuals to full-month projection
+    days_elapsed   = today_d.day
+    days_in_cur_m  = calendar.monthrange(today_d.year, today_d.month)[1]
+    proj_factor    = days_in_cur_m / max(days_elapsed, 1)
+
     for lbl, mstart in zip(hist_labels, hist_starts):
+        is_cur_month = (mstart == cur_m)
         pos = grid_df.columns.get_loc(avail_months[0])
         grid_df.insert(pos, lbl, grid_df["SKU"].apply(
-            lambda s, ms=mstart: int(act_dict.get((s, ms), 0))
+            lambda s, ms=mstart, cur=is_cur_month: (
+                round(act_dict.get((s, ms), 0) * proj_factor)
+                if cur else int(act_dict.get((s, ms), 0))
+            )
         ))
 
     def _locked_summary(sku_id: str) -> str:
@@ -2626,6 +2635,11 @@ def tab_forecast():
         return ", ".join(m[:3] for m in avail_months if row.get(m, False)) or ""
 
     grid_df["Locked"] = grid_df["SKU"].apply(_locked_summary)
+
+    # Append TOTAL row inside the same table
+    num_cols  = hist_labels + avail_months
+    total_row = {"SKU": "── TOTAL", **{c: int(grid_df[c].sum()) for c in num_cols}, "Locked": ""}
+    grid_df   = pd.concat([grid_df, pd.DataFrame([total_row])], ignore_index=True)
 
     st.markdown("**Forecast — SKU × Month**")
     st.caption(
@@ -2652,21 +2666,6 @@ def tab_forecast():
         key="fc_editor",
     )
 
-    # ── Bold totals row ───────────────────────────────────────────────────────
-    num_cols  = hist_labels + avail_months
-    total_row = {"SKU": "TOTAL", **{c: int(grid_df[c].sum()) for c in num_cols}, "Locked": ""}
-    total_df  = pd.DataFrame([total_row])
-    st.dataframe(
-        total_df.style.set_properties(**{"font-weight": "bold", "background-color": "#f0f2f6"}),
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "SKU": st.column_config.TextColumn("SKU", width="small"),
-            **{c: st.column_config.NumberColumn(c, format="%d", width="small") for c in num_cols},
-            "Locked": st.column_config.TextColumn("Locked", width="small"),
-        },
-    )
-
     # Base reference (collapsible)
     with st.expander("Base forecast (VELOCITY_BASE) — engine output before any user override"):
         base_view = pivot_base[avail_months].reset_index().rename(columns={"sku_id": "SKU"})
@@ -2683,6 +2682,8 @@ def tab_forecast():
             changes: list[tuple] = []
             for _, row in edited_df.iterrows():
                 sku = row["SKU"]
+                if sku not in active_sku_ids or sku in _FC_EXCLUDE:
+                    continue
                 orig_row = grid_df[grid_df["SKU"] == sku]
                 if orig_row.empty:
                     continue
