@@ -315,8 +315,23 @@ def run(dry_run: bool = False) -> int:
             )
 
         soh_status = soh_result.get("status")
+        blinkit_sales_expired = blinkit_result.get("status") == "session_expired"
         if soh_status == "session_expired":
-            logger.warning("SOH scraper: same session expiry as sales scraper.")
+            if not blinkit_sales_expired:
+                # Sales scraper succeeded but SOH still expired — need a dedicated alert
+                send_alert(
+                    subject=f"⚠️ Blinkit SOH Scraper — Session Expired ({today})",
+                    body=(
+                        f"Blinkit SOH scraper (G4) session expired.\n"
+                        f"Note: Sales scraper (G2) succeeded — session expired between G2 and G4.\n\n"
+                        f"Action required:\n"
+                        f"  python automation/blinkit_auth.py\n"
+                        f"  python automation/blinkit_soh_scraper.py\n\n"
+                        f"Log: {log}"
+                    ),
+                )
+            else:
+                logger.warning("SOH scraper: same session expiry as sales scraper.")
         elif soh_status != "ok":
             send_alert(
                 subject=f"⚠️ Blinkit SOH Scraper — Failed ({today})",
@@ -329,8 +344,22 @@ def run(dry_run: bool = False) -> int:
 
         perf_status = perf_result.get("status")
         if perf_status == "session_expired":
-            # Session already alerted above for sales scraper; just log
-            logger.warning("Performance scraper: same session expiry as sales scraper.")
+            if not blinkit_sales_expired:
+                # Sales scraper succeeded but performance still expired — need a dedicated alert
+                send_alert(
+                    subject=f"⚠️ Blinkit Performance Scraper — Session Expired ({today})",
+                    body=(
+                        f"Blinkit performance scraper (G5) session expired.\n"
+                        f"Note: Sales scraper (G2) succeeded — session expired between G2 and G5.\n\n"
+                        f"Today's ADS data will be permanently lost if not recovered now.\n\n"
+                        f"Action required:\n"
+                        f"  python automation/blinkit_auth.py\n"
+                        f"  python automation/blinkit_performance_scraper.py\n\n"
+                        f"Log: {log}"
+                    ),
+                )
+            else:
+                logger.warning("Performance scraper: same session expiry as sales scraper.")
         elif perf_status != "ok":
             send_alert(
                 subject=f"⚠️ Blinkit Performance Scraper — Failed ({today})",

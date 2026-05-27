@@ -42,7 +42,7 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | A | Drop-ship sale capture | ✅ Done |
 | B | Partner ingestion scripts (all channels) | ✅ Done |
 | C | Sales MIS Dashboard | ✅ Done |
-| D | Demand Forecasting Engine | 🔲 Pending |
+| D | Demand Forecasting Engine | ✅ Done |
 | E | Reorder Integration | 🔲 Pending |
 | F | Vignesh — MCP tool server (9 tools) | ✅ Done |
 | G | Daily Automation — data pipeline + WhatsApp briefing | ✅ Done |
@@ -119,23 +119,55 @@ Utility function kept for ad-hoc historical back-fill. Not called from any loade
 
 ---
 
-## Phase D — Demand Forecasting Engine
+## Phase D — Demand Forecasting Engine ✅ Done
 
-**New file:** `tcb/forecasting.py`
+**File:** `tcb/forecasting.py` | **Streamlit tab:** `🔮 Forecast` (8th tab in `growthspurt_app.py`) | **Migration:** `015_demand_forecasts_unique_model.sql`
 
-**Key functions:**
-- `get_velocity(sku_id, channel_id=None, lookback_weeks=8)` → avg weekly units from `orders`
-- `generate_forecast(lookback_weeks=8, horizon_months=3)` → extrapolate velocity × weeks → write to `demand_forecasts` with model='VELOCITY_AVG'
+### Two models
 
-**New tab in growthspurt_app.py — 🔮 Forecast:**
-- Button: "Generate Forecast (last 8 weeks velocity)"
-- Editable table: SKU × Month1 / Month2 / Month3 (pre-filled, overridable)
-- Button: "Lock Final Demand" → upserts to `demand_forecasts` with model='USER_FINAL'
-- Only USER_FINAL rows drive reorder calculations
+| Model | Who writes | Protected? |
+|-------|-----------|-----------|
+| `VELOCITY_BASE` | Engine (`generate_base_forecast()`) | Overwritten on every run |
+| `USER_FINAL` | Himanshu via Streamlit Forecast tab | Never overwritten by engine |
 
-**Vignesh tool to add:** `forecast_demand` — returns locked USER_FINAL forecast so Himanshu can ask *"What are we expecting to sell next month?"*
+Upsert conflict key: `(sku_id, channel_id, forecast_month, model)`. Last run date stored in `company_config` key `forecast_velocity_base_last_run`.
 
-**Status: 🔲 Pending** — blocked on nothing, can start anytime.
+### Blinkit model
+
+Uses `blinkit_performance_detail` (last 30-day rolling window). OOS signal = `inventory_available` (Column Q).
+
+```
+ADS per DS = SUM(orders WHERE inventory_available) / COUNT(inventory_available days)
+```
+DSes with < 5 available days filled with SKU-median ADS from reliable DSes.
+Central = `mean_all` (avg ADS across ALL DSes including zero-sellers). Hi = P90 × DS count × 30. Lo = central × 0.5.
+
+DS count per (SKU × Month):
+```
+ds_count = floor_ds_count (already active in eligibility)
+         + new plan cities DS count × (1 - churn_rate)
+churn_rate = sku_moved_out_low_sales / (active + moved_out)
+```
+City expansion read from `data/blinkit/manual/City Launch Plan_Blinkit.xlsx`.
+`BLK_EXCLUDE_SKUS = {TCB007, TCB010}` | `BLK_SKU_ALIAS = {TCB009 → TCB009_1}`.
+
+### Growth model (Amazon, FnP, FC, Peeko, Ozi)
+
+Last 4 months of orders (FULFILLED + PENDING). Amazon FBM rolled into Amazon. D2C excluded (manual only).
+Falls back to 15% default if < 2 MoM observations OR < 10 total units. P75 → central; P25 → lo; P90 → hi. P75/P90 capped at 35%/40%.
+Compounds forward from last observed month's units.
+
+### Constants
+`FORECAST_MONTHS=6` | `LOOKBACK_MONTHS=4` | `DEFAULT_GROWTH_RATE=15%` | `MAX_MONTHLY_GROWTH=35%` | `MIN_RELIABLE_VOLUME=10` | `MIN_NON_OOS_DAYS=5`
+
+### Streamlit Forecast tab
+- **▶ Regenerate** — runs `tcb/forecasting.py` as subprocess
+- **Editable grid** — SKU × 6 months; edit then Lock to save as USER_FINAL
+- **Lock Edited Cells** — `lock_sku_month()` distributes total proportionally across channels via VELOCITY_BASE mix
+- **Reset to Base** — deletes USER_FINAL rows for chosen SKU + months
+- **Channel Breakdown expander** | **Excel Download** (3 sheets: Summary, Channel Breakdown, Assumptions)
+
+**Vignesh tool to add (Phase H):** `forecast_demand` — returns locked USER_FINAL forecast.
 
 ---
 
@@ -439,11 +471,11 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 ## Build Order Going Forward
 
 ```
-Track 1 — Forecasting + Reorder (no blockers):
-  D. Demand Forecasting Engine (tcb/forecasting.py + Forecast tab in sales_app)
-  E. Reorder Integration + Vignesh tool (tcb/reorder.py + Reorder Plan tab)
+Track 1 — Forecasting + Reorder:
+  D. Demand Forecasting Engine ✅ Done
+  E. Reorder Integration + Vignesh tool (tcb/reorder.py + Reorder Plan tab) ← next
 
-Track 2 — Vignesh agent layer (can start now that G is live):
+Track 2 — Vignesh agent layer (can start in parallel):
   H. Memory + decision playbooks + enhanced WhatsApp alerts
   I. Approval gates + invoice/PO automation
 ```
@@ -494,5 +526,5 @@ Items explicitly decided to skip for now but worth revisiting:
 | `automation/blinkit_performance_scraper.py` | ✅ Phase J G5 — daily perf CSV download. Navigation: Product Expansion tab → header checkbox → Reports → Detailed Report. 10-min download timeout. |
 | `setup/22_blinkit_replenishment_tables.sql` | ✅ Phase J — applied to prod |
 | `automation/vignesh_monitor.py` | 🔲 Phase H2 |
-| `tcb/forecasting.py` | 🔲 Phase D |
+| `tcb/forecasting.py` | ✅ Phase D — Blinkit ADS model + growth model; VELOCITY_BASE + USER_FINAL; Forecast tab in growthspurt_app.py |
 | `tcb/reorder.py` | 🔲 Phase E |

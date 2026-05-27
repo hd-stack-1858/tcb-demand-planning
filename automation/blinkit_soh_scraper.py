@@ -335,6 +335,8 @@ def scrape(headed: bool = False) -> Path:
         download.save_as(str(dest_path))
         logger.info('Saved: %s', dest_path)
 
+        ctx.storage_state(path=str(SESSION_FILE))
+        logger.info('Session refreshed: %s', SESSION_FILE)
         browser.close()
 
     return dest_path
