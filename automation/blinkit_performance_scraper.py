@@ -403,7 +403,8 @@ def ingest(csv_path: Path, dry_run: bool = False):
     """Run blinkit_performance_loader on the downloaded file."""
     from ingest.blinkit_performance_loader import (
         build_sku_lookup, build_ds_location_lookup, build_wh_location_lookup,
-        build_ds_parent_lookup, process_file
+        build_ds_parent_lookup, process_file,
+        scan_ds_from_files, refresh_ds_master, update_ds_cities,
     )
     print(f'\nIngesting: {csv_path.name}')
     sku_lookup       = build_sku_lookup()
@@ -411,6 +412,16 @@ def ingest(csv_path: Path, dry_run: bool = False):
     wh_lookup        = build_wh_location_lookup()
     ds_parent_lookup = build_ds_parent_lookup()
     if not dry_run:
+        # Pass 0a: seed any DS that are new in this file before processing
+        ds_to_wh_name, ds_to_city, _ = scan_ds_from_files([csv_path])
+        new_ds = refresh_ds_master(ds_to_wh_name, wh_lookup, ds_lookup, ds_to_city=ds_to_city)
+        if new_ds:
+            print(f'  Pass 0a: inserted {new_ds} new DS into partner_locations')
+            ds_lookup        = build_ds_location_lookup()
+            ds_parent_lookup = build_ds_parent_lookup()
+        city_updated = update_ds_cities(ds_to_city, ds_lookup)
+        if city_updated:
+            print(f'  Pass 0a: {city_updated} DS city values updated')
         process_file(csv_path, sku_lookup, ds_lookup, wh_lookup, ds_parent_lookup)
     else:
         print('  DRY RUN — no DB writes')

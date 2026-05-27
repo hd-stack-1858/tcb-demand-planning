@@ -160,7 +160,7 @@ effective_stock = wh_soh + units_incoming + units_in_transit
 
 ### Performance Data Rules
 
-- **Daily download is mandatory** — Blinkit does not allow retroactive access to past performance data. Missing a day means losing that day's ADS signal permanently.
+- **Daily download is important** — Blinkit does not expose arbitrary historical data. A missed day is recoverable as long as the SKU's current assessment window still includes that date. It becomes permanently unrecoverable only if that SKU's assessment period ends before you re-run. Run daily; a missed run can usually be recovered same-day or next morning.
 - Performance CSV lives in `data/blinkit/manual/product_performance/` (downloaded manually or via `automation/blinkit_performance_scraper.py`)
 - DS master is auto-refreshed from CSVs on every loader run (Pass 0a) — new DS are seeded, `is_active` is synced from latest file
 - **ES numbers are NOT globally unique across cities** — e.g. ES7 exists in both Faridabad and Kochi. DS unique codes use MD5 hash of full name, not ES number alone.

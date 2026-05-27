@@ -2027,24 +2027,25 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
                 f"(went Y → absent without going through N). Raise with Blinkit."
             )
 
-        # Trigger 2: Y-row with available_hours=0 but wh_oos_flag=False
-        # DS-level OOS not captured by WH remark — should never fire under current Blinkit logic
+        # Trigger 2: Column Q data integrity guard
+        # inventory_available=False but total_orders>0 should never happen — if it does,
+        # Blinkit's Column Q has a data quality issue.
         t2_rows = (
-            db.table("blinkit_performance_ads")
+            db.table("blinkit_performance_detail")
             .select("data_date, location_id")
             .eq("sku_id", selected_sku)
-            .eq("wh_oos_flag", False)
-            .eq("available_hours", 0)
+            .eq("inventory_available", False)
+            .gt("total_orders", 0)
             .limit(50)
             .execute()
             .data
         )
         if t2_rows:
             st.warning(
-                f"**Trigger 2 — DS-level OOS:** {len(t2_rows)} performance row(s) found where "
-                f"`available_hours=0` but `wh_oos_flag=False`. The WH had stock but the DS "
-                f"showed 0 available hours — possible DS-level OOS not captured by WH remark. "
-                f"Review wh_oos detection logic."
+                f"**Trigger 2 — Column Q integrity:** {len(t2_rows)} row(s) found where "
+                f"`inventory_available=False` but `total_orders>0`. Orders were placed despite "
+                f"Column Q flagging inventory as unavailable — possible Column Q data quality issue. "
+                f"Raise with Blinkit."
             )
 
     except Exception as exc:

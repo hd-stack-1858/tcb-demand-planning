@@ -12,8 +12,7 @@ Multi-pass logic per file:
     Pass 0a: seed missing dark stores into partner_locations
     Pass 0:  refresh WH→DS parent mapping
     Pass 1:  update DS-SKU eligibility status from darkstore_remark
-    Pass 2:  upsert into blinkit_performance_ads (legacy — kept during validation)
-    Pass 2b: upsert into blinkit_performance_detail (new — Column Q as OOS signal)
+    Pass 2b: upsert into blinkit_performance_detail (Column Q as OOS signal)
 
 New ADS formula (blinkit_performance_detail):
     SUM(total_orders WHERE inventory_available=True) / COUNT(inventory_available=True days)
@@ -574,99 +573,6 @@ def update_eligibility(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict):
     return len(records)
 
 
-# ── Pass 2: upsert ADS rows ────────────────────────────────────────────────────
-
-def upsert_ads(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict, wh_lookup: dict):
-    """
-    Load Y-rows with ADS data into blinkit_performance_ads.
-    Only loads rows where: Considered for assessment = Y AND Serving warehouse is ours.
-    """
-    our_whs = set(WH_PERF_TO_CODE.keys())
-    y_rows  = df[
-        (df['Considered for assessment (Y/N)'] == 'Y') &
-        (df['Serving warehouse'].isin(our_whs))
-    ].copy()
-
-    if y_rows.empty:
-        return 0, 0
-
-    inserted = 0
-    skipped  = 0
-    unknown_ds = set()
-    batch = []
-
-    for _, row in y_rows.iterrows():
-        sku_id = sku_lookup.get(str(row['Item ID']))
-        if not sku_id:
-            skipped += 1
-            continue
-
-        raw_ds = str(row['Darkstore name']).strip()
-        ds_id  = ds_lookup.get(raw_ds.lower()) or ds_lookup.get(_bare_name(raw_ds))
-        if not ds_id:
-            unknown_ds.add(raw_ds)
-            skipped += 1
-            continue
-
-        if not row['data_date']:
-            skipped += 1
-            continue
-
-        remarks_raw = str(row.get('Remarks', '') or '')
-        wh_oos = INSUFFICIENT_INV in remarks_raw or ITEM_NOT_RESTOCKED in remarks_raw
-
-        batch.append({
-            'data_date':       str(row['data_date']),
-            'location_id':     ds_id,
-            'sku_id':          sku_id,
-            'assessment_start': str(row['a_start']) if row['a_start'] else None,
-            'assessment_end':   str(row['a_end'])   if row['a_end']   else None,
-            'ads_units':        float(row['ads_n'])  if pd.notna(row['ads_n'])   else None,
-            'total_orders':     int(row['orders_n']),
-            'available_hours':  float(row['avail_h']) if pd.notna(row['avail_h']) else None,
-            'operation_hours':  float(row['op_h'])    if pd.notna(row['op_h'])    else None,
-            'wh_oos_flag':      wh_oos,
-            'present_level':    str(row.get('Present Level', '') or '') or None,
-            'download_date':    str(row['download_date']),
-        })
-
-        if len(batch) >= BATCH_SIZE:
-            sb.table('blinkit_performance_ads').upsert(
-                batch,
-                on_conflict='data_date,location_id,sku_id'
-            ).execute()
-            inserted += len(batch)
-            batch = []
-
-    if batch:
-        sb.table('blinkit_performance_ads').upsert(
-            batch,
-            on_conflict='data_date,location_id,sku_id'
-        ).execute()
-        inserted += len(batch)
-
-    if unknown_ds:
-        print(f'  [WARN] DS not in partner_locations — skipped {len(unknown_ds)} unique DS '
-              f'(run seed_blinkit_ds_master.sql first): {len(unknown_ds)} stores')
-
-    # Trigger 2: Y-rows where available_hours=0 but wh_oos_flag=False
-    # This should never fire — all Available=0 rows have wh_oos_flag=True by design.
-    # If it does fire, Blinkit changed their remark logic and our wh_oos_flag is wrong.
-    t2_rows = y_rows[
-        (y_rows['avail_h'].notna()) &
-        (y_rows['avail_h'] == 0) &
-        ~y_rows['Remarks'].fillna('').str.contains(INSUFFICIENT_INV, case=False) &
-        ~y_rows['Remarks'].fillna('').str.contains(ITEM_NOT_RESTOCKED, case=False)
-    ]
-    if not t2_rows.empty:
-        print(f'\n[ALERT] Trigger 2: {len(t2_rows)} Y-row(s) have available_hours=0 '
-              f'but wh_oos_flag=False (DS-level OOS not captured by WH remark).')
-        print('  These DS may have been out of stock at the darkstore level independently.')
-        print('  Check these rows and review the wh_oos detection logic.')
-
-    return inserted, skipped
-
-
 # ── Pass 2b: upsert into blinkit_performance_detail ───────────────────────────
 
 def upsert_detail(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict):
@@ -739,6 +645,15 @@ def upsert_detail(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict):
     if unknown_ds:
         print(f'  [WARN] Pass 2b: {len(unknown_ds)} DS not in partner_locations — '
               f'{len(unknown_ds)} unique stores skipped')
+
+    # Trigger 2: Column Q data integrity guard
+    # inventory_available=False but total_orders>0 should never happen — orders cannot
+    # be placed if Column Q flags inventory as unavailable. Fires if Column Q has bad data.
+    t2_check = y_rows[~y_rows['inv_available'] & (y_rows['orders_n'] > 0)]
+    if not t2_check.empty:
+        print(f'\n[ALERT] Trigger 2: {len(t2_check)} Y-row(s) have inventory_available=False '
+              f'but total_orders>0. Orders placed despite Column Q flagging inventory unavailable '
+              f'— Column Q may have a data quality issue. Check these rows.')
 
     return inserted, skipped
 
@@ -830,11 +745,7 @@ def process_file(filepath: Path, sku_lookup: dict, ds_lookup: dict,
     elig_count = update_eligibility(df, sku_lookup, ds_lookup)
     print(f'    Pass 1 (eligibility): {elig_count} status rows upserted')
 
-    # Pass 2: ADS (legacy table — kept during validation period)
-    ins, skip = upsert_ads(df, sku_lookup, ds_lookup, wh_lookup)
-    print(f'    Pass 2 (ADS):         {ins} rows upserted, {skip} skipped')
-
-    # Pass 2b: detail table (new — column Q as OOS signal)
+    # Pass 2b: detail table (Column Q as OOS signal)
     ins2, skip2 = upsert_detail(df, sku_lookup, ds_lookup)
     print(f'    Pass 2b (detail):     {ins2} rows upserted, {skip2} skipped')
 

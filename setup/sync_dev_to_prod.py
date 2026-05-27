@@ -77,28 +77,6 @@ CREATE TABLE IF NOT EXISTS blinkit_ds_sku_eligibility (
 );
 """
 
-_BLINKIT_PERF_ADS = """
-CREATE TABLE IF NOT EXISTS blinkit_performance_ads (
-    id               SERIAL  PRIMARY KEY,
-    data_date        DATE    NOT NULL,
-    location_id      INTEGER NOT NULL REFERENCES partner_locations(location_id),
-    sku_id           TEXT    NOT NULL REFERENCES skus(sku_id),
-    assessment_start DATE    NOT NULL,
-    assessment_end   DATE    NOT NULL,
-    ads_units        NUMERIC,
-    total_orders     INTEGER,
-    available_hours  NUMERIC,
-    operation_hours  NUMERIC,
-    wh_oos_flag      BOOLEAN NOT NULL DEFAULT FALSE,
-    present_level    TEXT,
-    download_date    DATE    NOT NULL,
-    UNIQUE (data_date, location_id, sku_id)
-);
-CREATE INDEX IF NOT EXISTS idx_perf_ads_sku_loc_date
-    ON blinkit_performance_ads (sku_id, location_id, data_date DESC);
-CREATE INDEX IF NOT EXISTS idx_perf_ads_assessment
-    ON blinkit_performance_ads (sku_id, assessment_start, assessment_end);
-"""
 
 _BLINKIT_INV_SNAPSHOTS = """
 CREATE TABLE IF NOT EXISTS blinkit_inventory_snapshots (
@@ -220,7 +198,6 @@ def phase1_schema():
 
     print("\n=== Phase 2: Create missing tables ===")
     _sql(cur, _BLINKIT_DS_ELIGIBILITY, "CREATE blinkit_ds_sku_eligibility")
-    _sql(cur, _BLINKIT_PERF_ADS,       "CREATE blinkit_performance_ads + indexes")
     _sql(cur, _BLINKIT_INV_SNAPSHOTS,  "CREATE blinkit_inventory_snapshots")
 
     print("\n=== Phase 3: Create missing views ===")
@@ -236,7 +213,6 @@ def phase4_clear_data():
     # Leaf-first order avoids FK violations without CASCADE.
     # Tables that may not exist in dev (e.g. already dropped stale ones) are skipped.
     clear_order = [
-        "blinkit_performance_ads",
         "blinkit_ds_sku_eligibility",
         "blinkit_inventory_snapshots",
         "orders",
@@ -367,7 +343,7 @@ def phase6_verify():
     required_tables = {
         "channels","suppliers","items","bom","skus","sku_channel_ids",
         "inventory","inventory_transactions","orders","partner_locations",
-        "blinkit_ds_sku_eligibility","blinkit_performance_ads",
+        "blinkit_ds_sku_eligibility",
         "blinkit_inventory_snapshots","company_config","item_batches",
     }
     required_views = {
