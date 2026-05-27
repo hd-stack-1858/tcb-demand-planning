@@ -2537,19 +2537,27 @@ def tab_forecast():
         st.rerun()
         return
 
+    _FC_EXCLUDE = {"TCB007", "TCB009", "TCB009_2"}
+
     # ── Load data ─────────────────────────────────────────────────────────────
     display_df = _fc_load_display()
     if display_df.empty:
         st.info("No forecast data found. Click ▶ Regenerate to generate the base forecast.")
         return
 
-    skus = get_skus()
-    sku_names = {s["sku_id"]: s.get("sku_name", s["sku_id"]) for s in skus}
+    active_sku_ids = {s["sku_id"] for s in get_skus()}
+    display_df = display_df[
+        display_df["sku_id"].isin(active_sku_ids) &
+        ~display_df["sku_id"].isin(_FC_EXCLUDE)
+    ]
+    if display_df.empty:
+        st.info("No active SKUs in forecast.")
+        return
 
     forecast_dates = _fc_months(_FC_MONTHS)
-    month_labels = [fm.strftime("%b %Y") for fm in forecast_dates]
-    date_to_label = {fm: fm.strftime("%b %Y") for fm in forecast_dates}
-    label_to_date = {v: k for k, v in date_to_label.items()}
+    date_to_label  = {fm: fm.strftime("%b '%y") for fm in forecast_dates}
+    month_labels   = [date_to_label[fm] for fm in forecast_dates]
+    label_to_date  = {v: k for k, v in date_to_label.items()}
 
     # ── Build pivot ────────────────────────────────────────────────────────────
     pivot = (
@@ -2574,9 +2582,42 @@ def tab_forecast():
             if m not in pv.columns:
                 pv[m] = 0
 
+    # ── Last 3 months actuals ─────────────────────────────────────────────────
+    today_d = date.today()
+    cur_m   = date(today_d.year, today_d.month, 1)
+
+    def _prev_month(d, n):
+        month, year = d.month - n, d.year
+        while month <= 0:
+            month += 12
+            year  -= 1
+        return date(year, month, 1)
+
+    hist_starts = [_prev_month(cur_m, 2), _prev_month(cur_m, 1), cur_m]
+    hist_labels = [m.strftime("%b '%y") for m in hist_starts]
+
+    raw_df = load_data()
+    if not raw_df.empty:
+        act_dict = (
+            raw_df[
+                (raw_df["order_date"].dt.date >= hist_starts[0]) &
+                (raw_df["status"].isin(NET_STATUSES))
+            ]
+            .assign(mth=lambda x: x["order_date"].dt.to_period("M").dt.start_time.dt.date)
+            .groupby(["sku_id", "mth"])["quantity"].sum()
+            .to_dict()
+        )
+    else:
+        act_dict = {}
+
     # ── Editable forecast grid ─────────────────────────────────────────────────
     grid_df = pivot[avail_months].reset_index().rename(columns={"sku_id": "SKU"})
-    grid_df.insert(1, "Name", grid_df["SKU"].map(sku_names).fillna(""))
+
+    for lbl, mstart in zip(hist_labels, hist_starts):
+        pos = grid_df.columns.get_loc(avail_months[0])
+        grid_df.insert(pos, lbl, grid_df["SKU"].apply(
+            lambda s, ms=mstart: int(act_dict.get((s, ms), 0))
+        ))
 
     def _locked_summary(sku_id: str) -> str:
         if sku_id not in pivot_locked.index:
@@ -2587,14 +2628,19 @@ def tab_forecast():
     grid_df["Locked"] = grid_df["SKU"].apply(_locked_summary)
 
     st.markdown("**Forecast — SKU × Month**")
-    st.caption("Edit cells to override a projection, then click **Lock Edited Cells** to save. Green = USER_FINAL locked.")
+    st.caption(
+        f"Edit forecast cells to override, then click **Lock Edited Cells** to save. "
+        f"Green = USER_FINAL locked. "
+        f"*{hist_labels[0]}–{hist_labels[2]} = actual sales (read-only)*"
+    )
 
     col_config = {
-        "SKU":    st.column_config.TextColumn("SKU", disabled=True, width="small"),
-        "Name":   st.column_config.TextColumn("Name", disabled=True),
-        "Locked": st.column_config.TextColumn("Locked Months", disabled=True, width="small"),
-        **{m: st.column_config.NumberColumn(m, format="%d", step=1, min_value=0)
+        "SKU": st.column_config.TextColumn("SKU", disabled=True, width="small"),
+        **{lbl: st.column_config.NumberColumn(lbl, format="%d", disabled=True, width="small")
+           for lbl in hist_labels},
+        **{m: st.column_config.NumberColumn(m, format="%d", step=1, min_value=0, width="small")
            for m in avail_months},
+        "Locked": st.column_config.TextColumn("Locked", disabled=True, width="small"),
     }
 
     edited_df = st.data_editor(
@@ -2606,10 +2652,24 @@ def tab_forecast():
         key="fc_editor",
     )
 
+    # ── Bold totals row ───────────────────────────────────────────────────────
+    num_cols  = hist_labels + avail_months
+    total_row = {"SKU": "TOTAL", **{c: int(grid_df[c].sum()) for c in num_cols}, "Locked": ""}
+    total_df  = pd.DataFrame([total_row])
+    st.dataframe(
+        total_df.style.set_properties(**{"font-weight": "bold", "background-color": "#f0f2f6"}),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "SKU": st.column_config.TextColumn("SKU", width="small"),
+            **{c: st.column_config.NumberColumn(c, format="%d", width="small") for c in num_cols},
+            "Locked": st.column_config.TextColumn("Locked", width="small"),
+        },
+    )
+
     # Base reference (collapsible)
     with st.expander("Base forecast (VELOCITY_BASE) — engine output before any user override"):
         base_view = pivot_base[avail_months].reset_index().rename(columns={"sku_id": "SKU"})
-        base_view.insert(1, "Name", base_view["SKU"].map(sku_names).fillna(""))
         st.dataframe(base_view, use_container_width=True, hide_index=True)
 
     # ── Lock / Reset ───────────────────────────────────────────────────────────
