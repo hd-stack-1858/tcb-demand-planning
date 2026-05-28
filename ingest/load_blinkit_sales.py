@@ -89,7 +89,6 @@ def _build_row(raw: tuple, source_file: str) -> dict | None:
         "selling_price":     sp,
         "gross_value":       gv,
         "discount_pct":      discount_pct,
-        "cogs":              None,
         "supply_state":      str(raw[11]).strip() if raw[11] else None,
         "city":              raw[13],
         "state":             raw[14],
