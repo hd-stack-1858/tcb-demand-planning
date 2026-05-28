@@ -784,6 +784,7 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
     result: dict = {
         "allocated_accepted": 0,
         "ship_count": 0,
+        "challan_gap": 0,     # orders accepted but no challan this run (e.g. FUTURE bucket lag)
         "challan_downloaded": False,
         "emailed": False,
         "skipped": False,
@@ -827,6 +828,38 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
             # ── Step 3: Orders to be shipped — ALL non-zero columns ────────────
             ship_cols = _scan_section(page, "Orders to be shipped")
             logger.info("Orders to be shipped: %d non-zero column(s) found.", len(ship_cols))
+
+            # If accepted orders outnumber what appeared in ship queue, some columns
+            # (typically FUTURE) may not have populated yet — wait and re-scan once.
+            ship_total = sum(c for _, c in ship_cols)
+            if result["allocated_accepted"] > ship_total:
+                logger.info(
+                    "Accepted %d but ship queue shows %d — waiting 20s for late-populating "
+                    "columns (FUTURE orders can take a moment after Accept)...",
+                    result["allocated_accepted"], ship_total,
+                )
+                time.sleep(20)
+                page.reload(wait_until="load", timeout=60_000)
+                time.sleep(3)
+                ship_cols_retry = _scan_section(page, "Orders to be shipped")
+                if len(ship_cols_retry) > len(ship_cols):
+                    logger.info("Re-scan found more columns: %s → using updated list.", ship_cols_retry)
+                    ship_cols = ship_cols_retry
+                else:
+                    logger.info(
+                        "Re-scan still shows %d column(s) — likely genuinely future orders "
+                        "that FnP will move to ship queue tomorrow.", len(ship_cols_retry),
+                    )
+
+            # Compute gap after retry — orders accepted but still not in ship queue
+            final_ship_total = sum(c for _, c in ship_cols)
+            result["challan_gap"] = max(0, result["allocated_accepted"] - final_ship_total)
+            if result["challan_gap"] > 0:
+                logger.warning(
+                    "CHALLAN GAP: %d order(s) accepted but not yet in ship queue after retry. "
+                    "Will appear in a future run (likely next scheduled check).",
+                    result["challan_gap"],
+                )
 
             if not ship_cols and result["allocated_accepted"] == 0:
                 logger.info("No orders anywhere — nothing to process.")
@@ -937,9 +970,14 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
     if not recipients:
         logger.warning("No email recipients set. Add EMAIL_HIMANSHU / EMAIL_DILWAR to .env")
     else:
+        gap   = result.get("challan_gap", 0)
         n     = result["ship_count"] if result["ship_count"] > 0 else result["allocated_accepted"]
         today = date.today().strftime("%d-%b-%Y")
-        subject = f"FnP Branding Challan — {today} ({n} order(s))"
+        subject = (
+            f"⚠️ FnP Challan — {today} ({n} challan, {gap} pending) [ACTION NEEDED]"
+            if gap > 0
+            else f"FnP Branding Challan — {today} ({n} order(s))"
+        )
 
         if order_details:
             header  = f"  {'Order No':<14} {'SKU':<8} {'Qty':<5} {'Date':<12} {'City':<18} DB Status"
@@ -953,8 +991,24 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
         else:
             db_block = "  (Order details could not be parsed from portal — check log)"
 
+        gap_block = ""
+        if gap > 0:
+            gap_block = (
+                f"*** ACTION NEEDED ***\n"
+                f"{result['allocated_accepted']} order(s) were ACCEPTED on FnP but only "
+                f"{result['ship_count']} challan(s) were downloaded and {len(order_details)} "
+                f"order(s) recorded to DB.\n"
+                f"{gap} order(s) did not appear in 'Orders to be shipped' before this run ended.\n"
+                f"This usually means a FUTURE-dated order whose challan will populate next run.\n"
+                f"CHECK: Log in to partner.fnp.com and confirm the pending order is in\n"
+                f"'Orders to be shipped' FUTURE bucket. It will be picked up automatically.\n"
+                f"If it is not there, contact FnP support.\n"
+                f"*********************\n\n"
+            )
+
         body = (
             f"Hi,\n\n"
+            f"{gap_block}"
             f"FnP order(s) processed on {today}.\n\n"
             f"Orders recorded to DB:\n"
             f"{db_block}\n\n"

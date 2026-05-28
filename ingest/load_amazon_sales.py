@@ -216,11 +216,12 @@ def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int]:
     """Load one Amazon sales TSV. Returns (upserted, skipped).
 
     Uses ignore_duplicates=False so status changes (e.g. PENDING→FULFILLED)
-    are applied on re-load. NOTE: this overwrites lot_cogs_finalized — safe as
-    long as the payout loader has not yet finalized COGS for the period being
-    loaded. If a payout has already run, re-running this file would reset
-    lot_cogs_finalized to False for those orders; add a DB trigger to guard if
-    needed.
+    are applied on re-load.
+
+    Already-finalized orders (lot_cogs_finalized=True) are skipped entirely —
+    their cogs, lot_id, and lot_cogs_finalized must never be overwritten.
+    The SP-API 10-day rolling window would otherwise silently reset finalized
+    COGS on every daily run, replacing accurate lot-traced values with fallback.
     """
     to_upsert: list[dict] = []
     skipped = 0
@@ -236,6 +237,25 @@ def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int]:
 
     if dry_run or not to_upsert:
         return len(to_upsert), skipped
+
+    # Fetch already-finalized order_ids and exclude them from the upsert.
+    order_ids = [r["order_id"] for r in to_upsert]
+    finalized_ids: set[str] = set()
+    for i in range(0, len(order_ids), _UPSERT_BATCH):
+        rows = (db.table("orders")
+                  .select("order_id")
+                  .in_("order_id", order_ids[i:i + _UPSERT_BATCH])
+                  .eq("lot_cogs_finalized", True)
+                  .execute().data)
+        finalized_ids.update(r["order_id"] for r in rows)
+
+    if finalized_ids:
+        logger.info("Skipping %d already-finalized orders (COGS locked)", len(finalized_ids))
+    to_upsert = [r for r in to_upsert if r["order_id"] not in finalized_ids]
+    skipped += len(finalized_ids)
+
+    if not to_upsert:
+        return 0, skipped
 
     upserted = 0
     for i in range(0, len(to_upsert), _UPSERT_BATCH):
