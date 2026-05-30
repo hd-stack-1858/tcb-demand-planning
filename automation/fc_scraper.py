@@ -856,7 +856,8 @@ def run(dry_run: bool = False, headed: bool = False, no_email: bool = False) -> 
     else:
         n     = result["orders_processed"]
         today = date.today().strftime("%d-%b-%Y")
-        subject = f"First Cry Orders — {today} ({n} order(s), {len(all_pdfs)} PDFs)"
+        run_time = datetime.now().strftime("%H:%M")
+        subject = f"First Cry Orders — {today} {run_time} ({n} order(s), {len(all_pdfs)} PDFs)"
 
         od_list = result.get("order_details", [])
         if od_list:

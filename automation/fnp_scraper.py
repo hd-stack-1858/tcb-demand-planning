@@ -40,7 +40,7 @@ import os
 import re
 import sys
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -973,10 +973,11 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
         gap   = result.get("challan_gap", 0)
         n     = result["ship_count"] if result["ship_count"] > 0 else result["allocated_accepted"]
         today = date.today().strftime("%d-%b-%Y")
+        run_time = datetime.now().strftime("%H:%M")
         subject = (
-            f"⚠️ FnP Challan — {today} ({n} challan, {gap} pending) [ACTION NEEDED]"
+            f"⚠️ FnP Challan — {today} {run_time} ({n} challan, {gap} pending) [ACTION NEEDED]"
             if gap > 0
-            else f"FnP Branding Challan — {today} ({n} order(s))"
+            else f"FnP Branding Challan — {today} {run_time} ({n} order(s))"
         )
 
         if order_details:
