@@ -834,7 +834,28 @@ def run(dry_run: bool = False, headed: bool = False, no_email: bool = False) -> 
 
     # ── Email all PDFs ─────────────────────────────────────────────────────────
     if not all_pdfs:
-        logger.warning("No PDFs downloaded despite pending orders — check logs.")
+        failed_orders = [od for od in result.get("order_details", []) if str(od.get("db_status", "")).startswith("FAILED")]
+        if failed_orders:
+            logger.warning("No PDFs downloaded — %d order(s) failed. Sending alert.", len(failed_orders))
+            try:
+                from automation.email_sender import send_alert
+                rows_txt = "\n".join(
+                    f"  {od['order_id']}  {od.get('db_status', '')}"
+                    for od in failed_orders
+                )
+                send_alert(
+                    subject=f"⚠️ FC Scraper — {len(failed_orders)} order(s) failed ({date.today().strftime('%d-%b')})",
+                    body=(
+                        f"{len(failed_orders)} First Cry order(s) failed to process:\n\n"
+                        f"{rows_txt}\n\n"
+                        f"The order(s) are still pending on the FC portal — re-run the scraper or process manually.\n\n"
+                        f"Log: automation/logs/fc_{date.today().strftime('%Y%m%d')}.log"
+                    ),
+                )
+            except Exception as alert_exc:
+                logger.error("Could not send failure alert: %s", alert_exc)
+        else:
+            logger.warning("No PDFs downloaded despite pending orders — check logs.")
         return result
 
     if no_email:
