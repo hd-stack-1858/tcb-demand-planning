@@ -6,6 +6,35 @@ from pathlib import Path
 
 _PINCODE_CACHE_PATH = Path(__file__).parent.parent / "data" / "reference" / "pincode_cache.json"
 
+# District names returned by India Post API that are not recognisable as city names.
+# Applied after every lookup (cache or API) so existing cached entries need no fix.
+_DISTRICT_TO_CITY: dict[str, str] = {
+    # Hyderabad metro — API returns the revenue district, not the city
+    "k.v.rangareddy":        "Hyderabad",
+    "k.v rangareddy":        "Hyderabad",
+    "k v rangareddy":        "Hyderabad",
+    "ranga reddy":           "Hyderabad",
+    "rangareddy":            "Hyderabad",
+    "medchal-malkajgiri":    "Hyderabad",
+    "medchal malkajgiri":    "Hyderabad",
+    # Delhi NCR
+    "gautam buddha nagar":   "Noida",
+    "gautam buddh nagar":    "Noida",
+    "ghaziabad":             "Ghaziabad",
+    # Bengaluru
+    "bangalore urban":       "Bengaluru",
+    "bangalore rural":       "Bengaluru",
+    "bengaluru urban":       "Bengaluru",
+    "bengaluru rural":       "Bengaluru",
+}
+
+
+def _normalize_city(city: str | None) -> str | None:
+    if not city:
+        return city
+    return _DISTRICT_TO_CITY.get(city.strip().lower(), city)
+
+
 _CITY_STATE: dict[str, str] = {
     # Karnataka
     "bengaluru": "Karnataka", "bangalore": "Karnataka",
@@ -79,7 +108,7 @@ def pincode_to_city_state(pincode: str | None) -> tuple[str | None, str | None]:
 
     if pincode in cache:
         entry = cache[pincode]
-        return entry.get("city"), entry.get("state")
+        return _normalize_city(entry.get("city")), entry.get("state")
 
     # Call India Post API
     # verify=False: their SSL cert has expired but the API is live and data is non-sensitive
@@ -106,7 +135,7 @@ def pincode_to_city_state(pincode: str | None) -> tuple[str | None, str | None]:
                 )
             except Exception:
                 pass
-            return city, state
+            return _normalize_city(city), state
     except Exception:
         pass
 
