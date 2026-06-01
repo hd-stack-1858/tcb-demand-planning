@@ -9,7 +9,7 @@ _PINCODE_CACHE_PATH = Path(__file__).parent.parent / "data" / "reference" / "pin
 # District names returned by India Post API that are not recognisable as city names.
 # Applied after every lookup (cache or API) so existing cached entries need no fix.
 _DISTRICT_TO_CITY: dict[str, str] = {
-    # Hyderabad metro — API returns the revenue district, not the city
+    # Hyderabad metro — API returns revenue district, not the city
     "k.v.rangareddy":        "Hyderabad",
     "k.v rangareddy":        "Hyderabad",
     "k v rangareddy":        "Hyderabad",
@@ -17,11 +17,23 @@ _DISTRICT_TO_CITY: dict[str, str] = {
     "rangareddy":            "Hyderabad",
     "medchal-malkajgiri":    "Hyderabad",
     "medchal malkajgiri":    "Hyderabad",
-    # Delhi NCR
+    # Delhi — API returns sub-district names, not "Delhi"
+    "central delhi":         "Delhi",
+    "east delhi":            "Delhi",
+    "new delhi":             "Delhi",
+    "north delhi":           "Delhi",
+    "north east delhi":      "Delhi",
+    "north west delhi":      "Delhi",
+    "shahdara":              "Delhi",
+    "south delhi":           "Delhi",
+    "south east delhi":      "Delhi",
+    "south west delhi":      "Delhi",
+    "west delhi":            "Delhi",
+    # Noida — API returns the district name, not the city
     "gautam buddha nagar":   "Noida",
     "gautam buddh nagar":    "Noida",
-    "ghaziabad":             "Ghaziabad",
-    # Bengaluru
+    # Bengaluru — API returns "Bangalore" (old name); normalise to current official spelling
+    "bangalore":             "Bengaluru",
     "bangalore urban":       "Bengaluru",
     "bangalore rural":       "Bengaluru",
     "bengaluru urban":       "Bengaluru",
