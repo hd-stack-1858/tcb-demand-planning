@@ -108,6 +108,15 @@ def load_sor_whs(channel_id: int):
              .eq("is_active", True)\
              .order("name").execute().data
 
+@st.cache_data(ttl=300)
+def load_bom():
+    """Returns {item_id: [sku_id, ...]} — which SKUs use each item."""
+    rows = db.table("bom").select("sku_id, item_id").execute().data
+    mapping = {}
+    for r in rows:
+        mapping.setdefault(r["item_id"], []).append(r["sku_id"])
+    return mapping
+
 @st.cache_data(ttl=60)
 def load_reorder_alerts():
     own_wh = db.table("channels").select("channel_id").eq("code", "OWN_WH").single().execute().data
@@ -191,8 +200,27 @@ with tab_stock:
 
     st.subheader("Loose Item Stock")
     if item_stock:
+        bom_map   = load_bom()        # item_id → [sku_id, ...]
+        sku_labels = {s["sku_id"]: f"{s['sku_id']} — {s['name']}" for s in skus}
+
+        sku_filter = st.multiselect(
+            "Filter by SKU",
+            options=sorted(sku_labels.keys()),
+            format_func=lambda sid: sku_labels.get(sid, sid),
+            placeholder="Show all items (select a SKU to filter)",
+            key="loose_item_sku_filter",
+        )
+
+        if sku_filter:
+            filtered_items = [
+                s for iid, s in item_stock.items()
+                if any(sid in sku_filter for sid in bom_map.get(iid, []))
+            ]
+        else:
+            filtered_items = list(item_stock.values())
+
         rows = []
-        for s in sorted(item_stock.values(), key=lambda x: x["name"]):
+        for s in sorted(filtered_items, key=lambda x: x["name"]):
             status = (
                 "🔴 OUT" if s["qty"] == 0 else
                 "🟡 LOW" if s["qty"] <= s["reorder_point"] and s["reorder_point"] > 0 else
@@ -205,7 +233,10 @@ with tab_stock:
                 "ROP":    s["reorder_point"] if s["reorder_point"] > 0 else "—",
                 "Status": status,
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        elif sku_filter:
+            st.info("No items found for the selected SKU(s).")
     else:
         st.info("No item stock found.")
 
