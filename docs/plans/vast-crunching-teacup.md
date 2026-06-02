@@ -1,5 +1,15 @@
 # Plan: Blinkit Shipment Tab — Invoice Generator + E-way Bill
 
+## Status
+
+| Phase | Description | Status |
+|---|---|---|
+| Phase 1 | Invoice Generator (Blinkit Shipments tab in TinySteps WMS) | ✅ Done — committed 3a693b5 |
+| Phase 2 | E-way Bill — Playwright automation on ewaybillgst.gov.in | 🔲 Pending |
+| Bonus | Thermal label printing from Delhivery LR PDF directly | 🔲 Pending |
+
+---
+
 ## Context
 
 Every Blinkit replenishment shipment requires two painful manual steps before the boxes leave the warehouse:
@@ -17,17 +27,28 @@ The downstream steps (Delhivery order creation, label printing) stay manual for 
 
 ## What We're Building
 
-### Phase 1 (Now): Invoice Generator
-- Upload Blinkit RO Excel → auto-parse line items → generate filled invoice Excel
-- Handles two tax formats: **IGST** (non-Karnataka WHs) and **CGST+SGST** (Karnataka WHs)
-- Box count and Units in Box left blank — Himanshu fills manually before signing
+### Phase 1 ✅ Done: Invoice Generator
+- Upload RO Excel (line items) + RO PDF (consignee address/GSTIN)
+- Auto-detects destination WH name and tax type (IGST/CGST+SGST) from PDF GSTIN state code
+- Generates formatted Excel invoice: outer-bordered section blocks, dark blue column headers,
+  2-row merged in-words cells, Authorised Signatory signature box
+- Shows deviation alerts for MRP/landing price vs DB
+- Saves invoice + RO files to `data/blinkit/auto/shipments/YYYYMM_<RO#>_<WH name>/`
+- Files: `tcb/blinkit_invoice.py` (core logic) + `ui/tinysteps_app.py` (tab 7)
 
-### Phase 2 (After NIC credentials): E-way Bill
-- NIC e-way bill API wrapper → submit invoice data → get EWB number + PDF
-- Note: NIC API credentials are obtained by registering on ewaybillgst.gov.in (1–3 days). Not a hard blocker — Himanshu should register now so credentials are ready when Phase 2 starts.
+### Phase 2 🔲 Pending: E-way Bill (Playwright Portal Automation)
+- **Why not NIC direct API:** requires 25,000+ invoices/month — TCB doesn't qualify
+- **Approach:** Playwright automation on ewaybillgst.gov.in (same pattern as blinkit_scraper, fnp_scraper)
+- New file: `automation/ewaybill_scraper.py`
+- Flow: login with saved session → fill form from invoice data → capture EWB number → download PDF
+- Additional UI inputs needed: LR number (from Delhivery), number of boxes, total weight
+- Transporter GSTIN: Delhivery = `06AAPCS9575E1ZR` (already in `DELIVERY_PARTNER_GSTIN` dict)
 
-### Bonus (Optional): Thermal Label Printing
-- Print Delhivery LR PDF directly to 6×4 inch thermal printer via `win32print`
+### Bonus 🔲 Pending: Thermal Label Printing
+- **Problem:** Delhivery LR PDF has labels that Himanshu copies one-by-one into BarTender (.btw) to print
+- **Solution:** Upload LR PDF in app → split pages → send each page scaled to 6×4 inches via `win32print`
+- No new packages needed (Windows-only, uses existing pdfplumber + win32print)
+- Add "🖨️ Print Labels" section to Blinkit Shipments tab after Phase 1 is stable in production
 - Eliminates the BarTender (.btw) copy-paste step entirely
 - Scope: one button in the tab after LR PDF upload
 
