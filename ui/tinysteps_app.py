@@ -151,8 +151,8 @@ def load_reorder_alerts():
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 
-tab_stock, tab_reorder, tab_assemble, tab_ship, tab_receive, tab_returns = st.tabs(
-    ["📊 Stock", "🔔 Reorder", "🔧 Assemble", "🚚 Ship Out", "📥 Receive Stock", "↩️ Returns"]
+tab_stock, tab_reorder, tab_assemble, tab_ship, tab_receive, tab_returns, tab_shipments = st.tabs(
+    ["📊 Stock", "🔔 Reorder", "🔧 Assemble", "🚚 Ship Out", "📥 Receive Stock", "↩️ Returns", "📦 Blinkit Shipments"]
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -979,3 +979,230 @@ with tab_returns:
                                           for _, r in to_ret.iterrows()],
                 }
                 st.rerun()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — BLINKIT SHIPMENTS (Invoice Generator)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_shipments:
+    from datetime import timedelta
+    import os
+    from tcb.blinkit_invoice import (
+        parse_ro_excel, parse_ro_pdf,
+        check_deviations, check_wh_address,
+        generate_invoice_excel,
+        DELIVERY_PARTNER_GSTIN,
+    )
+
+    st.subheader("Blinkit Invoice Generator")
+
+    col_xl, col_pdf = st.columns(2)
+    with col_xl:
+        ro_excel_file = st.file_uploader(
+            "Upload RO Excel (.xlsx) — line items",
+            type=["xlsx"], key="ro_excel_upload"
+        )
+    with col_pdf:
+        ro_pdf_file = st.file_uploader(
+            "Upload RO PDF (.pdf) — Bill To / Ship To address",
+            type=["pdf"], key="ro_pdf_upload"
+        )
+
+    if ro_excel_file:
+        try:
+            ro_data   = parse_ro_excel(ro_excel_file.getvalue())
+        except Exception as e:
+            st.error(f"Failed to parse RO Excel: {e}")
+            st.stop()
+
+        line_items = ro_data["line_items"]
+        if not line_items:
+            try:
+                import io as _io
+                _df = pd.read_excel(_io.BytesIO(ro_excel_file.getvalue()), header=0, dtype=str)
+                st.error(
+                    f"No line items found in the RO Excel. "
+                    f"Columns detected: {list(_df.columns[:10])}. "
+                    f"First row: {_df.iloc[0].tolist()[:6] if len(_df) > 0 else '(empty)'}"
+                )
+            except Exception as _e:
+                st.error(f"No line items found — also failed to read columns: {_e}")
+            st.stop()
+
+        # RO number from filename
+        ro_number = os.path.splitext(ro_excel_file.name)[0]
+
+        # ── Parse PDF — drives WH name, consignee, tax type ───────────────────
+        consignee = {"name": "", "address": "", "gstin": "", "wh_name": "", "tax_type": ""}
+        if ro_pdf_file:
+            try:
+                pdf_data = parse_ro_pdf(ro_pdf_file.getvalue())
+                consignee = pdf_data
+                if pdf_data.get("ro_number") and pdf_data["ro_number"] != ro_number:
+                    st.warning(f"RO number in PDF ({pdf_data['ro_number']}) differs from Excel filename ({ro_number}) — using filename.")
+            except Exception as e:
+                st.warning(f"Could not parse PDF ({e}) — enter consignee details manually below.")
+
+        if not consignee.get("name"):
+            consignee["name"] = "BLINK COMMERCE PRIVATE LIMITED"
+            if ro_pdf_file:
+                st.warning("Could not extract consignee details from PDF — please enter address and GSTIN below.")
+
+        # Directly write parsed values to session state when files change.
+        # This is reliable: st.text_input reads from session_state[key] when key exists,
+        # so writing here BEFORE widgets render guarantees the correct value is shown.
+        _file_sig = f"{ro_excel_file.name}|{ro_pdf_file.name if ro_pdf_file else ''}"
+        if st.session_state.get("_inv_file_sig") != _file_sig:
+            st.session_state["_inv_file_sig"] = _file_sig
+            st.session_state["inv_cname"]  = consignee.get("name", "")
+            st.session_state["inv_caddr"]  = consignee.get("address", "")
+            st.session_state["inv_cgstin"] = consignee.get("gstin", "")
+
+        st.divider()
+
+        # WH name info (from PDF, not a dropdown)
+        wh_label = consignee.get("wh_name") or "Unknown (not found in PDF)"
+        st.caption(f"Destination WH: **{wh_label}**")
+
+        # ── Inputs ─────────────────────────────────────────────────────────────
+        c1, c2 = st.columns(2)
+        with c1:
+            delivery_partner = st.selectbox(
+                "Delivery Partner", list(DELIVERY_PARTNER_GSTIN.keys()), key="inv_dp"
+            )
+        with c2:
+            invoice_no = st.text_input("Invoice Number", placeholder="e.g. GT/26-27/015", key="inv_no")
+
+        c3, c4 = st.columns(2)
+        with c3:
+            invoice_date = st.date_input("Invoice Date", value=date.today(), key="inv_date")
+        with c4:
+            delivery_date = st.date_input(
+                "Delivery Date", value=date.today() + timedelta(days=8), key="inv_del_date"
+            )
+
+        # Tax type — auto from GSTIN, fallback selector if GSTIN not parsed
+        if consignee.get("tax_type"):
+            tax_type  = consignee["tax_type"]
+            tax_label = "CGST 2.5% + SGST 2.5% (Karnataka — intra-state)" if tax_type == "CGST_SGST" \
+                        else "IGST 5% (inter-state)"
+            st.caption(f"Tax type: **{tax_label}** (from GSTIN {consignee.get('gstin', '')})")
+        else:
+            tax_choice = st.radio(
+                "Tax type (could not auto-detect — GSTIN missing)",
+                ["IGST 5% — Inter-state", "CGST 2.5% + SGST 2.5% — Karnataka (intra-state)"],
+                key="inv_tax_manual"
+            )
+            tax_type = "CGST_SGST" if "Karnataka" in tax_choice else "IGST"
+
+        # Consignee fields — values come from session_state (set above on file change)
+        pdf_parsed_ok = bool(st.session_state.get("inv_cgstin", ""))
+        with st.expander("Consignee Details (from PDF — edit if needed)", expanded=not pdf_parsed_ok):
+            consignee_name    = st.text_input("Consignee Name",    key="inv_cname")
+            consignee_address = st.text_area ("Consignee Address", key="inv_caddr", height=80)
+            consignee_gstin   = st.text_input("Consignee GSTIN",   key="inv_cgstin")
+
+        # ── Parsed Line Items Preview ──────────────────────────────────────────
+        st.subheader("Parsed Line Items")
+        preview_rows = []
+        for li in line_items:
+            preview_rows.append({
+                "Item ID":     li["item_code"],
+                "Description": li["description"],
+                "Qty":         li["quantity"],
+                "MRP":         li["mrp"],
+                "Landing Rate": li["landing_rate"],
+                "Total (₹)":   li["total_amount"],
+            })
+        preview_df = pd.DataFrame(preview_rows)
+        # Totals row
+        totals = pd.DataFrame([{
+            "Item ID": "TOTAL", "Description": "",
+            "Qty": ro_data["total_qty"], "MRP": "",
+            "Landing Rate": "", "Total (₹)": ro_data["net_amount"],
+        }])
+        st.dataframe(pd.concat([preview_df, totals], ignore_index=True),
+                     use_container_width=True, hide_index=True)
+
+        # ── Deviation Alerts ───────────────────────────────────────────────────
+        try:
+            deviations = check_deviations(db, line_items)
+            for d in deviations:
+                msgs = []
+                if d["db_mrp"] and abs(d["ro_mrp"] - d["db_mrp"]) > 0.01:
+                    msgs.append(f"MRP: RO=₹{d['ro_mrp']:,.0f} vs DB=₹{d['db_mrp']:,.0f}")
+                if d["db_landing"] and abs(d["ro_landing"] - d["db_landing"]) > 0.01:
+                    msgs.append(f"Landing: RO=₹{d['ro_landing']:,.0f} vs DB=₹{d['db_landing']:,.0f}")
+                if msgs:
+                    st.warning(f"⚠️ {d['item_code']} ({d['description'][:30]}): {' | '.join(msgs)} — verify before generating")
+
+            addr_warn = check_wh_address(db, wh_label, consignee_address)
+            if addr_warn:
+                st.warning(f"⚠️ {addr_warn}")
+        except Exception:
+            pass   # deviation check is advisory — never block invoice generation
+
+        # ── Generate Invoice ───────────────────────────────────────────────────
+        st.divider()
+        if st.button("Generate Invoice", type="primary", key="gen_invoice"):
+            if not invoice_no.strip():
+                st.error("Please enter an Invoice Number before generating.")
+            elif not consignee_name.strip():
+                st.error("Consignee name is required — upload PDF or type manually.")
+            else:
+                try:
+                    xlsx_bytes = generate_invoice_excel(
+                        line_items       = line_items,
+                        ro_number        = ro_number,
+                        invoice_no       = invoice_no.strip(),
+                        invoice_date     = invoice_date,
+                        delivery_date    = delivery_date,
+                        delivery_partner = delivery_partner,
+                        consignee_name   = consignee_name.strip(),
+                        consignee_address= consignee_address.strip(),
+                        consignee_gstin  = consignee_gstin.strip(),
+                        total_qty        = ro_data["total_qty"],
+                        item_count       = ro_data["item_count"],
+                        tax_type         = tax_type,
+                    )
+
+                    # Build folder name: YYYYMM_RO#_WH Name
+                    month_tag  = invoice_date.strftime("%Y%m")
+                    wh_suffix  = wh_label.replace(" - ", " ").replace("/", "-") \
+                                         .replace("\\", "-").strip()
+                    folder_name = f"{month_tag}_{ro_number}_{wh_suffix}"
+                    folder = os.path.join(
+                        os.path.dirname(__file__), "..", "data", "blinkit",
+                        "auto", "shipments", folder_name
+                    )
+                    os.makedirs(folder, exist_ok=True)
+
+                    # Invoice filename: "Blinkit Invoice GT_26-27_017 (RO 43886110036715).xlsx"
+                    safe_inv   = invoice_no.strip().replace("/", "_")
+                    inv_fname  = f"Blinkit Invoice {safe_inv} (RO {ro_number}).xlsx"
+                    save_path  = os.path.join(folder, inv_fname)
+                    with open(save_path, "wb") as f:
+                        f.write(xlsx_bytes)
+
+                    # Save RO Excel
+                    with open(os.path.join(folder, f"{ro_number}.xlsx"), "wb") as f:
+                        f.write(ro_excel_file.getvalue())
+
+                    # Save RO PDF if uploaded
+                    if ro_pdf_file:
+                        with open(os.path.join(folder, f"{ro_number}.pdf"), "wb") as f:
+                            f.write(ro_pdf_file.getvalue())
+
+                    st.success(f"Invoice generated — {invoice_no}")
+                    st.caption(f"Saved to: data/blinkit/auto/shipments/{folder_name}/")
+
+                    st.download_button(
+                        label    = f"⬇ Download Invoice Excel — {invoice_no}",
+                        data     = xlsx_bytes,
+                        file_name= inv_fname,
+                        mime     = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key      = "dl_invoice",
+                    )
+                except Exception as e:
+                    st.error(f"Invoice generation failed: {e}")
+    else:
+        st.info("Upload a Blinkit RO Excel file to get started.")
