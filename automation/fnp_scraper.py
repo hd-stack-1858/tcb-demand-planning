@@ -605,7 +605,7 @@ def _read_order_rows(page) -> list[dict]:
 def _parse_challan_pdf(pdf_path: Path) -> list[dict]:
     """
     Extract order details from a downloaded FnP branding challan PDF.
-    Returns one dict per page (each page = one order):
+    Returns one dict per (page, SKU) — multi-SKU orders yield multiple dicts:
       {order_no, sku_raw, qty, order_date (date|None), pincode (str|None)}
 
     Patterns confirmed on real challans:
@@ -638,9 +638,18 @@ def _parse_challan_pdf(pdf_path: Path) -> list[dict]:
                     except ValueError:
                         logger.warning("PDF page %d: could not parse date %r", page_num, m.group(1))
 
-                # TCB SKU: no trailing \b — "GIFTS-TCB003_OP_NB25" has _ after digits (word char)
-                m = _re.search(r'\bTCB(\d{3})', text, _re.IGNORECASE)
-                sku_raw = f"TCB{m.group(1).upper()}" if m else None
+                # Find ALL TCB SKUs on this page — multi-item orders have one per product block.
+                # Deduplicate in order of appearance (same SKU in description + code = 1 line).
+                sku_matches = _re.findall(r'\bTCB(\d{3})', text, _re.IGNORECASE)
+                seen_skus: set = set()
+                sku_raw_list: list = []
+                for raw_digits in sku_matches:
+                    sku = f"TCB{raw_digits.upper()}"
+                    if sku not in seen_skus:
+                        seen_skus.add(sku)
+                        sku_raw_list.append(sku)
+                if not sku_raw_list:
+                    sku_raw_list = [None]
 
                 # Pincode: first 6-digit number in the address block (after "To :").
                 # Much more reliable than city-name extraction from PDF text.
@@ -651,17 +660,18 @@ def _parse_challan_pdf(pdf_path: Path) -> list[dict]:
                 if pm:
                     pincode_raw = pm.group(1)
 
-                logger.info(
-                    "PDF page %d: order_no=%s sku=%s date=%s pincode=%s",
-                    page_num, order_no, sku_raw, order_date, pincode_raw,
-                )
-                results.append({
-                    "order_no":   order_no,
-                    "sku_raw":    sku_raw,
-                    "qty":        1,
-                    "order_date": order_date,
-                    "pincode":    pincode_raw,
-                })
+                for sku_raw in sku_raw_list:
+                    logger.info(
+                        "PDF page %d: order_no=%s sku=%s date=%s pincode=%s",
+                        page_num, order_no, sku_raw, order_date, pincode_raw,
+                    )
+                    results.append({
+                        "order_no":   order_no,
+                        "sku_raw":    sku_raw,
+                        "qty":        1,
+                        "order_date": order_date,
+                        "pincode":    pincode_raw,
+                    })
     except Exception as exc:
         logger.error("_parse_challan_pdf failed on %s: %s", pdf_path.name, exc)
     return results
