@@ -210,11 +210,13 @@ def _ping_dev_db() -> None:
         hp, db   = hi.rsplit("/", 1)
         host, port = hp.rsplit(":", 1)
         import psycopg2
-        psycopg2.connect(
+        conn = psycopg2.connect(
             host=host, port=int(port), dbname=db,
             user=user, password=pw, sslmode="require",
             connect_timeout=15,
-        ).close()
+        )
+        conn.cursor().execute("SELECT 1")
+        conn.close()
         logger.info("Dev DB ping: OK")
     except Exception as exc:
         logger.warning("Dev DB ping failed (non-fatal): %s", exc)
