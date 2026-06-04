@@ -1,6 +1,6 @@
 # Sales MIS + Demand Planning System — Build Plan
 
-*Last updated: 25-May-2026*
+*Last updated: 4-Jun-2026*
 
 ---
 
@@ -21,6 +21,7 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | `ui/tinysteps_app.py` | Warehouse app — Ship Out, Inward, Assembly, Write-off, Reorder, Geography |
 | `ui/growthspurt_app.py` | Sales MIS — Overview, Trends, By Channel, By SKU, Returns, Geography |
 | Return reason fields | `return_reason`, `return_responsible`, `return_customer_verbatim` — all channels |
+| Monthly return enrichment | `ingest/enrich_az_return_reasons.py` — reads Amazon Returns Google Sheet (Tab: Amazon) directly; 3-month rolling window; handles Refunded (→ RTO/SALE_RETURN) and Replaced (→ FULFILLED + reason fields) separately; cross-checks A/B/C. `ingest/reconcile_fc_orders.py` — FC gap detection (Excel Delivered + Shipped files) + return tagging + enrichment from Google Sheet Tab: First Cry. Both run monthly after payout loaders. |
 | COGS / lot system | Full lot-based COGS for all 6 channels. Migration 014: `orders.lot_id` (FK → `sku_cogs_lots`) + `orders.supply_state`. Per-channel finalization functions (`finalize_az_cogs`, `finalize_blk_cogs`, `finalize_fnp_fc_cogs`) stamp lot_id + cogs + `lot_cogs_finalized=True`. Order rows split per lot for multi-lot dispatches. |
 | `mcp/server.py` | Vignesh — FastMCP server, 9 tools, connected to Claude.ai + Claude Desktop |
 | `automation/blinkit_scraper.py` + `blinkit_auth.py` | Playwright scraper — logs into Blinkit portal, downloads last-7d XLSX, ingests to DB. Headless timing fixed 17-May (sleep 8s, selector timeout 10s). |
@@ -32,6 +33,8 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | `automation/fc_scraper.py` + `fc_auth.py` | Playwright scraper — accepts FC orders, fills shipment dims, downloads Invoice+PackingSlip PDFs, emails. Multi-item order fix 21-May (row-by-row SKU+qty, all Status dropdowns). Runs 10:30/20:00 IST ✅ Active. |
 | `automation/email_sender.py` | SMTP email helper — `send_with_attachments()` + `send_alert()`. `send_alert()` supports `EMAIL_HIMANSHU_ALT` for backup delivery to personal Gmail. |
 | **Blinkit Replenishment (Phase J)** | See section below. Full end-to-end replenishment engine built 21-May-2026. |
+| **Blinkit perf data cleanup (28-May)** | `blinkit_performance_ads` table fully dropped (dev + prod, migration 017). Trigger 2 updated to Column Q definition: `inventory_available=False AND total_orders>0`. `blinkit_performance_scraper.py` `ingest()` now runs Pass 0a before `process_file()` — new DS appearing in auto-downloaded files are seeded before load (was silently skipping them). |
+| **COGS lot fix (28-May)** | Created lot_id=149 for 4 orphaned TCB003 units at ₹698.447 COGS — units existed in OWN_WH but had no lot (initial seeding undercount + returns consumed prior lots). Order processed successfully via TinySteps (txn_id=390). |
 
 ---
 
@@ -160,12 +163,16 @@ Compounds forward from last observed month's units.
 ### Constants
 `FORECAST_MONTHS=6` | `LOOKBACK_MONTHS=4` | `DEFAULT_GROWTH_RATE=15%` | `MAX_MONTHLY_GROWTH=35%` | `MIN_RELIABLE_VOLUME=10` | `MIN_NON_OOS_DAYS=5`
 
-### Streamlit Forecast tab
+### Streamlit Forecast tab (as of 28-May-2026)
 - **▶ Regenerate** — runs `tcb/forecasting.py` as subprocess
-- **Editable grid** — SKU × 6 months; edit then Lock to save as USER_FINAL
-- **Lock Edited Cells** — `lock_sku_month()` distributes total proportionally across channels via VELOCITY_BASE mix
+- **Editable grid** — SKU × 6 forecast months + 3 history columns (L2LM, LM, current month projected). No horizontal scroll.
+  - Inactive/opportunistic SKUs excluded: `_FC_EXCLUDE = {TCB007, TCB009, TCB009_2}` — only active SKUs shown
+  - History columns: read-only, short headers (`Apr '26` format), current month shows pro-rated full-month projection (`MTD × days_in_month / days_elapsed`)
+  - **TOTAL row** appended inside the same `st.data_editor` table (bold, not editable)
+- **Lock Edited Cells** — `lock_sku_month()` distributes total proportionally across channels via VELOCITY_BASE mix. Lock logic skips TOTAL row and `_FC_EXCLUDE` SKUs.
 - **Reset to Base** — deletes USER_FINAL rows for chosen SKU + months
 - **Channel Breakdown expander** | **Excel Download** (3 sheets: Summary, Channel Breakdown, Assumptions)
+- **QC + locking in progress** (started 28-May-2026) — reviewing VELOCITY_BASE numbers per SKU, locking confirmed USER_FINAL values for Jun–Nov 2026
 
 **Vignesh tool to add (Phase H):** `forecast_demand` — returns locked USER_FINAL forecast.
 
@@ -468,6 +475,38 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 
 ---
 
+## FnP Fulfillment Reconciliation — Pending (Next Session)
+
+### Current state of `load_fnp_sales.py`
+
+Built as a **one-time historical backfill** to load all FnP orders that existed before the FnP scraper was set up. Takes two inputs: `FnP_Extracted.xlsx` (order × SKU with city/state/date) and a CDA delivery report (confirmed-delivered orders). Determines status by cross-referencing them (FULFILLED if in report, PENDING if recent, SALE_RETURN if old and absent). Has a hardcoded fix for order 7044576301 (in delivery report but missing from Extracted). Still does UPDATE on existing orders — same issue as old `load_fc_sales.py`.
+
+**This script must not be re-run as-is** — it would overwrite App-recorded data with report data.
+
+### What it should become (monthly recurring tool)
+
+The FnP CDA delivery report (`cda-export_*.xls`) is the authoritative source for which orders have been delivered to the customer. The new flow:
+
+1. **FC scraper marks orders as `SHIPPED`** (not `FULFILLED`) when it accepts and ships an order via the App. `FULFILLED` should only be set by the delivery report confirming actual delivery. **Requires a status change in `automation/fc_scraper.py`** — currently the scraper marks App entries as FULFILLED at ship time. This needs to change to `SHIPPED`.
+
+2. **Monthly reconciliation script** (rewrite of `load_fnp_sales.py`):
+   - Reads the monthly CDA delivery report
+   - Any DB order (FnP channel, status `SHIPPED`) that appears in the report → update to `FULFILLED`
+   - Any DB order that is `SHIPPED` but NOT in the report AND is older than ~7 days → flag as "long-pending — investigate" (stale shipment, possible lost in transit or return not captured)
+   - Any order in the report NOT in DB at all → flag as "App miss"
+   - No pricing recalculation, no COGS changes — those happen at App ship time
+   - TP validation retained: compare GRAND_TOTAL from report against sum of `sku_channel_tp` — flag any gap > ₹1
+
+### Dependency
+- `automation/fc_scraper.py` (and `automation/fnp_scraper.py`) must be updated to write `status = SHIPPED` instead of `FULFILLED` when recording the ship-out in the App.
+- All downstream queries (Sales MIS, WhatsApp summary, MCP tools) that filter on `FULFILLED` need to also include `SHIPPED` for revenue counting — or we define SHIPPED as "revenue recognised, pending delivery confirmation".
+- Agreed convention: for P&L and MIS, `SHIPPED` = counts as sale (revenue recognised). `FULFILLED` = additionally confirmed delivered. Both count as revenue.
+
+**File to create:** Rename/rewrite `load_fnp_sales.py` → `reconcile_fnp_orders.py` (consistent with `reconcile_fc_orders.py`).
+**Status: 🔲 Pending — starting next session (5-Jun-2026)**
+
+---
+
 ## Build Order Going Forward
 
 ```
@@ -503,8 +542,9 @@ Items explicitly decided to skip for now but worth revisiting:
 | `ingest/load_blinkit_sales.py` | ✅ Built |
 | `ingest/load_amazon_sales.py` | ✅ Built |
 | `ingest/load_amazon_payout.py` | ✅ Built |
-| `ingest/load_fnp_sales.py` | ✅ Built |
-| `ingest/load_fc_sales.py` | ✅ Built |
+| `ingest/load_fnp_sales.py` | ⚠️ Historical one-time loader — do NOT re-run. To be replaced by `reconcile_fnp_orders.py` (see FnP Fulfillment Reconciliation section) |
+| `ingest/reconcile_fc_orders.py` | ✅ Built (replaces `load_fc_sales.py`) — monthly FC gap detection + return tagging from Google Sheet |
+| `ingest/enrich_az_return_reasons.py` | ✅ Built — monthly Amazon return reason enrichment from Google Sheet (3-month window, Refunded/Replaced handling) |
 | `automation/amazon_sp_api.py` | ✅ Built — orders + finances, poll/download |
 | `mcp/server.py` | ✅ Built — 9 tools, live on Claude.ai |
 | `automation/blinkit_scraper.py` | ✅ Live. Stealth Chrome fix 18-May (bot detection bypass, panel download, sidebar retry) |
