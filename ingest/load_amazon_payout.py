@@ -67,7 +67,13 @@ def _flt(val: str) -> float:
 
 
 def _parse_date(val: str) -> date:
-    return datetime.strptime(val.strip(), "%d-%m-%Y").date()
+    s = val.strip()
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    raise ValueError(f"Cannot parse date: {s!r}")
 
 
 def _build_return_map(rows: list[dict]) -> dict[str, tuple[str, date | None]]:
