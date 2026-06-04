@@ -156,7 +156,7 @@ def _load_forward_orders(
             delivered_rows.append({**base, "status": "FULFILLED",
                                    "selling_price": sp, "gross_value": gv,
                                    "discount_pct": discount_pct,
-                                   "cogs": get_sku_cogs_at_date(sku_id, order_date)})
+                                   "cogs": None})
             if supply_state:
                 supply_state_map[order_id] = supply_state
 
@@ -254,6 +254,11 @@ def _apply_lot_cogs(db, delivered_rows: list[dict],
             update["cogs"] = round(unit_cogs * row["quantity"], 2)
             if lot_id is not None:
                 update["lot_id"] = lot_id
+        else:
+            # No lot available — fall back to static BOM COGS so the row isn't left with cogs=NULL
+            fallback = get_sku_cogs_at_date(row["sku_id"], date.fromisoformat(row["order_date"]))
+            if fallback is not None:
+                update["cogs"] = fallback
 
         db.table("orders").update(update).eq("order_id", oid).eq("channel_id", BLK_CHANNEL_ID).execute()
         finalized += 1
@@ -263,8 +268,9 @@ def _apply_lot_cogs(db, delivered_rows: list[dict],
 
 def _flag_daily_not_in_payout(db, delivered_rows: list[dict]) -> int:
     """
-    Warn about orders loaded from daily sales files (lot_cogs_finalized=False)
-    whose order_date falls within the payout period but are absent from the payout.
+    Warn about ALL FULFILLED orders in DB whose order_date falls within the payout
+    period but are absent from the payout file.  These may represent orders that
+    appeared in the daily MTD file but were later cancelled or not settled by Blinkit.
     Returns count of flagged orders.
     """
     if not delivered_rows:
@@ -278,7 +284,6 @@ def _flag_daily_not_in_payout(db, delivered_rows: list[dict]) -> int:
                  .select("order_id")
                  .eq("channel_id", BLK_CHANNEL_ID)
                  .eq("status", "FULFILLED")
-                 .eq("lot_cogs_finalized", False)
                  .gte("order_date", min_date)
                  .lte("order_date", max_date)
                  .execute().data)
@@ -310,12 +315,23 @@ def load_payout_folder(folder: Path, db, dry_run: bool = False) -> tuple[int, in
     wb.close()
 
     if dry_run:
+        all_ids = [r["order_id"] for r in delivered_rows]
+        existing: set[str] = set()
+        for i in range(0, len(all_ids), 500):
+            rows = (db.table("orders")
+                      .select("order_id")
+                      .in_("order_id", all_ids[i : i + 500])
+                      .eq("channel_id", BLK_CHANNEL_ID)
+                      .execute().data)
+            existing.update(r["order_id"] for r in rows)
+        dry_new = len(delivered_rows) - len(existing)
         print(
-            f"[DRY RUN] Forward Orders: {len(delivered_rows)} delivered, "
+            f"[DRY RUN] Forward Orders: {len(delivered_rows)} delivered "
+            f"({dry_new} new / {len(existing)} already in DB), "
             f"{len(cancelled_rows)} cancelled | Returns: {len(return_updates)} matched | "
             f"Supply states captured: {len(supply_state_map)}"
         )
-        return len(delivered_rows) + len(cancelled_rows), 0, len(return_updates)
+        return dry_new + len(cancelled_rows), len(existing), len(return_updates)
 
     # Upsert delivered orders — existing rows not overwritten (idempotent)
     new_count = 0
