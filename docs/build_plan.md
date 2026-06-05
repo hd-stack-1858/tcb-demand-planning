@@ -502,8 +502,8 @@ The FnP CDA delivery report (`cda-export_*.xls`) is the authoritative source for
 - All downstream queries (Sales MIS, WhatsApp summary, MCP tools) that filter on `FULFILLED` need to also include `SHIPPED` for revenue counting — or we define SHIPPED as "revenue recognised, pending delivery confirmation".
 - Agreed convention: for P&L and MIS, `SHIPPED` = counts as sale (revenue recognised). `FULFILLED` = additionally confirmed delivered. Both count as revenue.
 
-**File to create:** Rename/rewrite `load_fnp_sales.py` → `reconcile_fnp_orders.py` (consistent with `reconcile_fc_orders.py`).
-**Status: 🔲 Pending — starting next session (5-Jun-2026)**
+**File:** `ingest/reconcile_fnp_orders.py` ✅ Done (5-Jun-2026)
+**Status:** Monthly tool. Drop new `cda-export_*.xls` in `data/fnp/manual/` and run `python ingest/reconcile_fnp_orders.py`.
 
 ---
 
@@ -542,7 +542,8 @@ Items explicitly decided to skip for now but worth revisiting:
 | `ingest/load_blinkit_sales.py` | ✅ Built |
 | `ingest/load_amazon_sales.py` | ✅ Built |
 | `ingest/load_amazon_payout.py` | ✅ Built |
-| `ingest/load_fnp_sales.py` | ⚠️ Historical one-time loader — do NOT re-run. To be replaced by `reconcile_fnp_orders.py` (see FnP Fulfillment Reconciliation section) |
+| `ingest/load_fnp_sales.py` | ⚠️ Historical one-time loader — do NOT re-run. Superseded by `reconcile_fnp_orders.py` |
+| `ingest/reconcile_fnp_orders.py` | ✅ Monthly FnP CDA reconciliation — payment risk + app miss + enrichment |
 | `ingest/reconcile_fc_orders.py` | ✅ Built (replaces `load_fc_sales.py`) — monthly FC gap detection + return tagging from Google Sheet |
 | `ingest/enrich_az_return_reasons.py` | ✅ Built — monthly Amazon return reason enrichment from Google Sheet (3-month window, Refunded/Replaced handling) |
 | `automation/amazon_sp_api.py` | ✅ Built — orders + finances, poll/download |
