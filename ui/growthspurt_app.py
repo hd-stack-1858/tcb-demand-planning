@@ -2601,7 +2601,7 @@ def tab_forecast():
         act_dict = (
             raw_df[
                 (raw_df["order_date"].dt.date >= hist_starts[0]) &
-                (raw_df["status"].isin(NET_STATUSES))
+                (raw_df["status"].isin(GROSS_STATUSES))
             ]
             .assign(mth=lambda x: x["order_date"].dt.to_period("M").dt.start_time.dt.date)
             .groupby(["sku_id", "mth"])["quantity"].sum()

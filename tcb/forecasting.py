@@ -40,7 +40,7 @@ MIN_NON_OOS_DAYS     = 5       # min non-OOS days required to use real ADS; else
 VELOCITY_BASE       = "VELOCITY_BASE"
 USER_FINAL          = "USER_FINAL"
 LOOKBACK_MONTHS     = 4       # months of history for growth-rate computation
-NET_STATUSES        = ("FULFILLED", "PENDING")
+GROSS_STATUSES      = ("FULFILLED", "PENDING", "RTO", "SALE_RETURN", "REPLACEMENT")
 
 LAUNCH_PLAN_PATH = Path("data/blinkit/manual/City Launch Plan_Blinkit.xlsx")
 
@@ -443,7 +443,7 @@ def fetch_historical_monthly_units(lookback_months: int = LOOKBACK_MONTHS) -> pd
             db.table("orders")
             .select("sku_id, channel_id, order_date, quantity, status")
             .gte("order_date", cutoff)
-            .in_("status", list(NET_STATUSES))
+            .in_("status", list(GROSS_STATUSES))
             .range(offset, offset + 999)
             .execute().data
         )
