@@ -42,3 +42,4 @@ build/
 fnp_reports/
 fc_reports/
 firstcry_reports/
+.gstack/
