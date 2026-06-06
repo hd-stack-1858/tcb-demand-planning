@@ -58,18 +58,21 @@ WH_SOH_NAME_TO_CODE = {
 }
 
 # Columns to extract from SOH (after 3-row header parse)
+# Names are exact matches to row-2 sub-headers in the Blinkit SOH Excel.
 COL_ITEM_ID    = 'Item ID'
 COL_ITEM_NAME  = 'Item Name'
 COL_WH_FAC_ID  = 'Warehouse Facility ID'
 COL_WH_NAME    = 'Warehouse Facility Name'
-COL_INCOMING   = 'Net Incoming Scheduled Inventory'  # "Incoming scheduled inventory"
-COL_WH_UNITS   = 'Warehouse'
-COL_DS_UNITS   = 'Darkstore'
-COL_TRANSIT    = 'In-between'
-COL_TOTAL_SELL = 'Total Sellable'
-COL_LAST_7D    = 'Last 7 Days'
-COL_LAST_15D   = 'Last 15 Days'
-COL_LAST_30D   = 'Last 30 Days'
+COL_INCOMING   = 'Incoming scheduled inventory'  # col 8: raw inbound stock (not yet received at WH)
+COL_RECALLED   = 'Recalled inventory'            # col 9: being returned to us (still in our lots)
+COL_TOTAL_SELL = 'Total sellable'                # col 10: WH + In-between + Darkstore
+COL_WH_UNITS   = 'Warehouse'                     # col 11
+COL_TRANSIT    = 'In-between'                    # col 12
+COL_DS_UNITS   = 'Darkstore'                     # col 13
+COL_UNSELLABLE = 'Total unsellable'              # col 14: damaged + lost + expired + near expiry
+COL_LAST_7D    = 'Last 7 days'
+COL_LAST_15D   = 'Last 15 days'
+COL_LAST_30D   = 'Last 30 days'
 
 
 def parse_soh_file(filepath: Path) -> tuple[pd.DataFrame, date]:
@@ -79,15 +82,26 @@ def parse_soh_file(filepath: Path) -> tuple[pd.DataFrame, date]:
     """
     raw = pd.read_excel(filepath, header=None)
 
-    # Row 0 has the timestamp in first cell (e.g. "As of 20 May 2026")
+    # Row 0 has the timestamp. Two known formats:
+    #   Auto-downloaded: "This sheet was generated at 2026-06-05 12:03:55"
+    #   Manual export:   "As of 20 May 2026"
     timestamp_cell = str(raw.iloc[0, 0]) if pd.notna(raw.iloc[0, 0]) else ''
     snap_date = date.today()
-    m = re.search(r'(\d{1,2})\s+(\w+)\s+(\d{4})', timestamp_cell)
-    if m:
+    # Try ISO format first (auto-downloaded files)
+    m_iso = re.search(r'(\d{4})-(\d{2})-(\d{2})', timestamp_cell)
+    if m_iso:
         try:
-            snap_date = pd.to_datetime(f"{m.group(1)} {m.group(2)} {m.group(3)}").date()
+            snap_date = date(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3)))
         except Exception:
             pass
+    else:
+        # Fallback: "DD Mon YYYY" (manual export)
+        m_dmy = re.search(r'(\d{1,2})\s+(\w+)\s+(\d{4})', timestamp_cell)
+        if m_dmy:
+            try:
+                snap_date = pd.to_datetime(f"{m_dmy.group(1)} {m_dmy.group(2)} {m_dmy.group(3)}").date()
+            except Exception:
+                pass
 
     # Row 2 (index 2) has actual column names
     col_names = raw.iloc[2].tolist()
@@ -97,8 +111,9 @@ def parse_soh_file(filepath: Path) -> tuple[pd.DataFrame, date]:
     df = df[df[COL_ITEM_ID].astype(str).str.strip() != '']
 
     # Numeric columns
-    for col in [COL_INCOMING, COL_WH_UNITS, COL_DS_UNITS, COL_TRANSIT,
-                COL_TOTAL_SELL, COL_LAST_7D, COL_LAST_15D, COL_LAST_30D]:
+    for col in [COL_INCOMING, COL_RECALLED, COL_TOTAL_SELL,
+                COL_WH_UNITS, COL_TRANSIT, COL_DS_UNITS, COL_UNSELLABLE,
+                COL_LAST_7D, COL_LAST_15D, COL_LAST_30D]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
 
@@ -162,17 +177,19 @@ def load_file(filepath: Path, dry_run: bool = False):
             continue
 
         record = {
-            'snapshot_date':  str(snap_date),
-            'location_id':    location_id,
-            'sku_id':         sku_id,
-            'units_wh':       int(row.get(COL_WH_UNITS,   0) or 0),
-            'units_incoming': int(row.get(COL_INCOMING,   0) or 0),
-            'units_ds':       int(row.get(COL_DS_UNITS,   0) or 0),
-            'units_transit':  int(row.get(COL_TRANSIT,    0) or 0),
-            'total_sellable': int(row.get(COL_TOTAL_SELL, 0) or 0),
-            'last_7d_sales':  int(row.get(COL_LAST_7D,    0) or 0) or None,
-            'last_15d_sales': int(row.get(COL_LAST_15D,   0) or 0) or None,
-            'last_30d_sales': int(row.get(COL_LAST_30D,   0) or 0) or None,
+            'snapshot_date':   str(snap_date),
+            'location_id':     location_id,
+            'sku_id':          sku_id,
+            'units_wh':        int(row.get(COL_WH_UNITS,   0) or 0),
+            'units_incoming':  int(row.get(COL_INCOMING,   0) or 0),
+            'units_ds':        int(row.get(COL_DS_UNITS,   0) or 0),
+            'units_transit':   int(row.get(COL_TRANSIT,    0) or 0),
+            'total_sellable':  int(row.get(COL_TOTAL_SELL, 0) or 0),
+            'units_unsellable':int(row.get(COL_UNSELLABLE, 0) or 0),
+            'units_recalled':  int(row.get(COL_RECALLED,   0) or 0),
+            'last_7d_sales':   int(row.get(COL_LAST_7D,    0) or 0) or None,
+            'last_15d_sales':  int(row.get(COL_LAST_15D,   0) or 0) or None,
+            'last_30d_sales':  int(row.get(COL_LAST_30D,   0) or 0) or None,
         }
 
         if wh_name == 'Farukhnagar - SR':
@@ -182,8 +199,8 @@ def load_file(filepath: Path, dry_run: bool = False):
                 farukhnagar_rows[key] = record.copy()
             else:
                 # Add inventory units to existing Faridabad row
-                for field in ('units_wh', 'units_incoming', 'units_ds',
-                              'units_transit', 'total_sellable'):
+                for field in ('units_wh', 'units_incoming', 'units_ds', 'units_transit',
+                              'total_sellable', 'units_unsellable', 'units_recalled'):
                     farukhnagar_rows[key][field] += record[field]
             continue
 
@@ -195,8 +212,8 @@ def load_file(filepath: Path, dry_run: bool = False):
         matched = False
         for rec in records:
             if rec['location_id'] == loc_id and rec['sku_id'] == sku_id:
-                for field in ('units_wh', 'units_incoming', 'units_ds',
-                              'units_transit', 'total_sellable'):
+                for field in ('units_wh', 'units_incoming', 'units_ds', 'units_transit',
+                              'total_sellable', 'units_unsellable', 'units_recalled'):
                     rec[field] += far_rec[field]
                 matched = True
                 break

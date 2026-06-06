@@ -37,7 +37,14 @@ logger = logging.getLogger(__name__)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 BLK_CHANNEL_ID = 4
-_TOTAL_SELLABLE_COL = 10   # 0-based index in the data row
+# 0-based column indices (row 3 sub-headers)
+_COL_ITEM_ID        = 0
+_COL_FAC_ID         = 5
+# col 7 = Net_scheduled = Incoming_scheduled − Recalled (can be negative — do NOT use directly)
+_COL_INC_SCHEDULED  = 8   # Incoming inventory: Incoming scheduled (raw inbound stock)
+_COL_RECALLED       = 9   # Incoming inventory: Recalled inventory (returning to us, still in our lots)
+_COL_TOTAL_SELLABLE = 10  # Sellable inventory: Total sellable (WH + In-between + Darkstore)
+_COL_TOTAL_UNSELL   = 14  # Unsellable inventory: Total unsellable (damaged/lost/expired)
 
 
 def _parse_file_timestamp(ws) -> datetime:
@@ -53,7 +60,19 @@ def _parse_file_timestamp(ws) -> datetime:
 
 def _load_soh(filepath: Path, fac_to_loc: dict[int, int],
               item_to_sku: dict[int, str]) -> dict[tuple[str, int], int]:
-    """Parse SOH file. Returns {(sku_id, location_id): total_sellable}."""
+    """
+    Parse SOH file. Returns {(sku_id, location_id): total_blinkit_qty}.
+
+    total_blinkit_qty = Total_sellable + Total_unsellable + Incoming_scheduled + Recalled
+    Column relationship: Net_scheduled (col 7) = Incoming_scheduled − Recalled (can go negative).
+    We use the raw sub-columns, NOT Net_scheduled, to avoid sign errors.
+
+    What each component represents:
+      Sellable:  WH + In-between + Darkstore — available for orders
+      Unsellable: damaged/lost/expired — still our stock, just blocked
+      Incoming_scheduled: stock in transit TO Blinkit WH, not yet received
+      Recalled: stock in transit BACK to us — still in our COGS lots until return is processed
+    """
     wb = openpyxl.load_workbook(str(filepath), read_only=False, data_only=True)
     ws = wb.active
     soh: dict[tuple[str, int], int] = {}
@@ -62,9 +81,8 @@ def _load_soh(filepath: Path, fac_to_loc: dict[int, int],
     for row in ws.iter_rows(min_row=4, values_only=True):
         if row[0] is None:
             continue
-        item_id = row[0]
-        fac_id  = row[5]
-        tot_sell = row[_TOTAL_SELLABLE_COL]
+        item_id = row[_COL_ITEM_ID]
+        fac_id  = row[_COL_FAC_ID]
 
         sku_id = item_to_sku.get(int(item_id))
         loc_id = fac_to_loc.get(int(fac_id))
@@ -73,7 +91,11 @@ def _load_soh(filepath: Path, fac_to_loc: dict[int, int],
             skipped += 1
             continue
 
-        qty = int(tot_sell) if tot_sell is not None else 0
+        sellable   = int(row[_COL_TOTAL_SELLABLE] or 0)
+        unsellable = int(row[_COL_TOTAL_UNSELL]   or 0)
+        incoming   = int(row[_COL_INC_SCHEDULED]  or 0)
+        recalled   = int(row[_COL_RECALLED]        or 0)
+        qty = sellable + unsellable + incoming + recalled
         soh[(sku_id, loc_id)] = qty
 
     wb.close()
@@ -187,7 +209,8 @@ def main(filepath: Path, env: str, dry_run: bool) -> None:
     # Union of all keys
     all_keys = set(expected.keys()) | set(current_lots.keys())
 
-    print(f"\n{'SKU':<12} {'Loc':<6} {'Location':<30} {'Expected':>9} {'DB_Total':>9} {'Delta':>7}")
+    print(f"\n{'SKU':<12} {'Loc':<6} {'Location':<30} {'BLK_Total':>9} {'DB_Total':>9} {'Delta':>7}")
+    print("  (BLK_Total = Sellable + Unsellable + Incoming_scheduled + Recalled)")
     print("-" * 80)
 
     updates: list[dict] = []   # {lot_id, new_qty_remaining}
