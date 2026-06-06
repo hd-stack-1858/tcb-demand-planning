@@ -988,9 +988,10 @@ with tab_shipments:
     import os
     from tcb.blinkit_invoice import (
         parse_ro_excel, parse_ro_pdf,
-        check_deviations, check_wh_address,
+        check_deviations,
         generate_invoice_excel,
         DELIVERY_PARTNER_GSTIN,
+        WH_CONSIGNEE, CONSIGNEE_NAME, wh_key_from_pdf_name,
     )
 
     st.subheader("Blinkit Invoice Generator")
@@ -1031,37 +1032,89 @@ with tab_shipments:
         # RO number from filename
         ro_number = os.path.splitext(ro_excel_file.name)[0]
 
-        # ── Parse PDF — drives WH name, consignee, tax type ───────────────────
-        consignee = {"name": "", "address": "", "gstin": "", "wh_name": "", "tax_type": ""}
+        # ── WH Selection — primary source for consignee address/GSTIN ─────────
+        # PDF (if uploaded) is used ONLY to auto-select the WH dropdown.
+        # Address and GSTIN always come from the hardcoded WH_CONSIGNEE dict —
+        # never from PDF parsing — so layout differences between PDFs don't matter.
+        _detected_wh_key = ""
         if ro_pdf_file:
             try:
                 pdf_data = parse_ro_pdf(ro_pdf_file.getvalue())
-                consignee = pdf_data
                 if pdf_data.get("ro_number") and pdf_data["ro_number"] != ro_number:
-                    st.warning(f"RO number in PDF ({pdf_data['ro_number']}) differs from Excel filename ({ro_number}) — using filename.")
-            except Exception as e:
-                st.warning(f"Could not parse PDF ({e}) — enter consignee details manually below.")
+                    st.warning(f"RO number in PDF ({pdf_data['ro_number']}) differs from Excel filename ({ro_number}).")
+                _detected_wh_key = wh_key_from_pdf_name(pdf_data.get("wh_name", ""))
+            except Exception:
+                pass  # PDF parse failure is OK — user selects WH manually
 
-        if not consignee.get("name"):
-            consignee["name"] = "BLINK COMMERCE PRIVATE LIMITED"
-            if ro_pdf_file:
-                st.warning("Could not extract consignee details from PDF — please enter address and GSTIN below.")
-
-        # Directly write parsed values to session state when files change.
-        # This is reliable: st.text_input reads from session_state[key] when key exists,
-        # so writing here BEFORE widgets render guarantees the correct value is shown.
+        _wh_options = list(WH_CONSIGNEE.keys()) + ["Other (enter manually)"]
         _file_sig = f"{ro_excel_file.name}|{ro_pdf_file.name if ro_pdf_file else ''}"
         if st.session_state.get("_inv_file_sig") != _file_sig:
             st.session_state["_inv_file_sig"] = _file_sig
-            st.session_state["inv_cname"]  = consignee.get("name", "")
-            st.session_state["inv_caddr"]  = consignee.get("address", "")
-            st.session_state["inv_cgstin"] = consignee.get("gstin", "")
+            if _detected_wh_key:
+                st.session_state["_inv_wh_key"] = _detected_wh_key
+            else:
+                st.session_state["_inv_wh_key"] = _wh_options[0]
+
+        _cur_wh = st.session_state.get("_inv_wh_key", _wh_options[0])
+        _wh_idx = _wh_options.index(_cur_wh) if _cur_wh in _wh_options else 0
 
         st.divider()
 
-        # WH name info (from PDF, not a dropdown)
-        wh_label = consignee.get("wh_name") or "Unknown (not found in PDF)"
-        st.caption(f"Destination WH: **{wh_label}**")
+        selected_wh = st.selectbox(
+            "Destination Warehouse", _wh_options, index=_wh_idx, key="inv_wh_sel"
+        )
+        st.session_state["_inv_wh_key"] = selected_wh
+        # Clear cached consignee inputs when WH dropdown changes so new dict values take effect
+        if st.session_state.get("_inv_wh_rendered") != selected_wh:
+            st.session_state["_inv_wh_rendered"] = selected_wh
+            for _k in ("inv_cname", "inv_caddr", "inv_cgstin"):
+                st.session_state.pop(_k, None)
+
+        if selected_wh != "Other (enter manually)":
+            wh_info = WH_CONSIGNEE[selected_wh]
+            consignee_name    = CONSIGNEE_NAME
+            consignee_gstin   = wh_info["gstin"]
+            consignee_address = wh_info["address"]
+            wh_label = selected_wh
+            gstin_missing = not bool(consignee_gstin)
+            if gstin_missing:
+                st.warning(f"GSTIN not yet recorded for **{selected_wh}**. Enter it below — once confirmed, tell me and I'll hardcode it.")
+                tax_type = "IGST"   # safe default until GSTIN is known
+            else:
+                tax_type  = "CGST_SGST" if consignee_gstin.startswith("29") else "IGST"
+                tax_label = "CGST 2.5% + SGST 2.5% (Karnataka — intra-state)" if tax_type == "CGST_SGST" \
+                            else "IGST 5% (inter-state)"
+                st.caption(f"GSTIN: **{consignee_gstin}** | Tax: **{tax_label}**")
+            with st.expander(
+                "Consignee details — enter GSTIN" if gstin_missing else "Consignee details (click to view/override)",
+                expanded=gstin_missing,
+            ):
+                consignee_name    = st.text_input("Consignee Name",    value=consignee_name,    key="inv_cname")
+                consignee_address = st.text_area ("Consignee Address", value=consignee_address, key="inv_caddr", height=80)
+                consignee_gstin   = st.text_input("Consignee GSTIN",   value=consignee_gstin,   key="inv_cgstin")
+                if consignee_gstin:
+                    tax_type  = "CGST_SGST" if consignee_gstin.startswith("29") else "IGST"
+                    tax_label = "CGST 2.5% + SGST 2.5% (Karnataka — intra-state)" if tax_type == "CGST_SGST" \
+                                else "IGST 5% (inter-state)"
+                    st.caption(f"Tax: **{tax_label}** (from GSTIN)")
+        else:
+            wh_label = "Manual"
+            st.info("Select a known WH above, or enter consignee details manually here.")
+            consignee_name    = st.text_input("Consignee Name",    value=CONSIGNEE_NAME, key="inv_cname")
+            consignee_address = st.text_area ("Consignee Address", key="inv_caddr", height=80)
+            consignee_gstin   = st.text_input("Consignee GSTIN",   key="inv_cgstin")
+            if consignee_gstin:
+                tax_type  = "CGST_SGST" if consignee_gstin.startswith("29") else "IGST"
+                tax_label = "CGST 2.5% + SGST 2.5% (Karnataka — intra-state)" if tax_type == "CGST_SGST" \
+                            else "IGST 5% (inter-state)"
+                st.caption(f"Tax type: **{tax_label}** (auto from GSTIN)")
+            else:
+                tax_choice = st.radio(
+                    "Tax type",
+                    ["IGST 5% — Inter-state", "CGST 2.5% + SGST 2.5% — Karnataka (intra-state)"],
+                    key="inv_tax_manual"
+                )
+                tax_type = "CGST_SGST" if "Karnataka" in tax_choice else "IGST"
 
         # ── Inputs ─────────────────────────────────────────────────────────────
         c1, c2 = st.columns(2)
@@ -1079,27 +1132,6 @@ with tab_shipments:
             delivery_date = st.date_input(
                 "Delivery Date", value=date.today() + timedelta(days=8), key="inv_del_date"
             )
-
-        # Tax type — auto from GSTIN, fallback selector if GSTIN not parsed
-        if consignee.get("tax_type"):
-            tax_type  = consignee["tax_type"]
-            tax_label = "CGST 2.5% + SGST 2.5% (Karnataka — intra-state)" if tax_type == "CGST_SGST" \
-                        else "IGST 5% (inter-state)"
-            st.caption(f"Tax type: **{tax_label}** (from GSTIN {consignee.get('gstin', '')})")
-        else:
-            tax_choice = st.radio(
-                "Tax type (could not auto-detect — GSTIN missing)",
-                ["IGST 5% — Inter-state", "CGST 2.5% + SGST 2.5% — Karnataka (intra-state)"],
-                key="inv_tax_manual"
-            )
-            tax_type = "CGST_SGST" if "Karnataka" in tax_choice else "IGST"
-
-        # Consignee fields — values come from session_state (set above on file change)
-        pdf_parsed_ok = bool(st.session_state.get("inv_cgstin", ""))
-        with st.expander("Consignee Details (from PDF — edit if needed)", expanded=not pdf_parsed_ok):
-            consignee_name    = st.text_input("Consignee Name",    key="inv_cname")
-            consignee_address = st.text_area ("Consignee Address", key="inv_caddr", height=80)
-            consignee_gstin   = st.text_input("Consignee GSTIN",   key="inv_cgstin")
 
         # ── Parsed Line Items Preview ──────────────────────────────────────────
         st.subheader("Parsed Line Items")
@@ -1135,9 +1167,6 @@ with tab_shipments:
                 if msgs:
                     st.warning(f"⚠️ {d['item_code']} ({d['description'][:30]}): {' | '.join(msgs)} — verify before generating")
 
-            addr_warn = check_wh_address(db, wh_label, consignee_address)
-            if addr_warn:
-                st.warning(f"⚠️ {addr_warn}")
         except Exception:
             pass   # deviation check is advisory — never block invoice generation
 
