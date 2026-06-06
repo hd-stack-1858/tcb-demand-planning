@@ -33,7 +33,7 @@ DELIVERY_PARTNER_GSTIN = {
 # Addresses match partner_locations DB exactly (sourced from Blinkit RO PDFs at onboarding).
 # WH addresses are stable — Blinkit issues a new WH code when an address changes.
 # gstin = "" means not yet confirmed (first RO from that WH will reveal it — update dict then).
-WH_CONSIGNEE: dict[str, dict] = {
+WH_CONSIGNEE = {
     # ── Karnataka (GSTIN 29) ────────────────────────────────────────────────────
     "Bengaluru B3": {
         "gstin":   "29AAFCG9846E1Z7",
