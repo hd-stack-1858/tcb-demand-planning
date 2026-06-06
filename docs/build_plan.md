@@ -1,6 +1,6 @@
 # Sales MIS + Demand Planning System — Build Plan
 
-*Last updated: 4-Jun-2026*
+*Last updated: 6-Jun-2026*
 
 ---
 
@@ -52,6 +52,7 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | H | Vignesh as Proactive Agent — memory + scheduling + decision logic | 🔲 Next |
 | I | Full Autonomy — approval gates, self-monitoring, agent loop | 🔲 Pending |
 | J | Blinkit Replenishment Model | ✅ Done (24-May-2026) — fully closed |
+| **K** | **Daily Lot / SOH Reconciliation — Blinkit + Amazon** | **🔴 Urgent — do before Phase E** |
 
 ---
 
@@ -507,12 +508,54 @@ The FnP CDA delivery report (`cda-export_*.xls`) is the authoritative source for
 
 ---
 
+## Phase K — Daily Lot / SOH Reconciliation 🔴 Urgent
+
+**Why urgent:** `sku_cogs_lots.qty_remaining` is the source of truth for unsold inventory at Blinkit and Amazon WHs. This data feeds the replenishment engine (Phase J) and will feed the reorder plan (Phase E). As of 6-Jun-2026, the lots at several WHs were 30–44 units overstated vs. Blinkit's actual SOH (e.g. TCB001 Faridabad: DB=40, Blinkit=0). Without daily reconciliation, reorder decisions built on stale lot data will be wrong.
+
+**Root cause of drift:** `finalize_blk_cogs()` consumes lots using state-level FIFO — it doesn't guarantee per-WH accuracy. Internal Blinkit stock redistributions (WH→WH) are invisible to our system. Over days these compound into significant gaps.
+
+### K1 — Blinkit: auto-reconcile lots after every SOH download
+
+**Trigger:** End of G4 step in `daily_runner.py` (after `blinkit_soh_scraper.py` runs and SOH is saved).
+
+**What to build:**
+- Call `setup/refresh_blinkit_lots.py` automatically as part of G4, using the freshly downloaded SOH file
+- Formula already correct (Sellable + Unsellable + Incoming_scheduled + Recalled — fixed 6-Jun-2026)
+- Run in non-dry-run mode daily — it is idempotent (adjusts qty_remaining to match SOH; safe to re-run)
+- Log adjustments to a new `lot_reconciliation_log` table (or append to existing automation logs): date, sku_id, location_id, old_qty, new_qty, delta, reason='SOH_REFRESH'
+- Alert via WhatsApp if any single SKU×WH delta exceeds ±20 units (signals something unexpected — recalled stock, large loss, etc.)
+
+**Files to change:** `automation/daily_runner.py` (add G4b step), `setup/refresh_blinkit_lots.py` (accept `--log` flag to write to DB)
+
+### K2 — Amazon: build `refresh_amazon_lots.py` + wire to daily runner
+
+**Current state:** No Amazon lot reconciliation exists. `finalize_az_cogs()` runs daily and consumes AZ lots FIFO, but Amazon can have stock movements (returns received, adjustments, reimbursements) invisible to our system.
+
+**What to build:**
+- `setup/refresh_amazon_lots.py` — pulls Amazon FBA inventory via SP-API (`getInventorySummaries` endpoint, already authenticated in `automation/amazon_sp_api.py`), compares against `sku_cogs_lots.qty_remaining` at AZ channel, reconciles
+- SP-API call: `GET /fba/inventory/v1/summaries?granularityType=Marketplace&granularityId=A21TJRUUN4KGV&details=true` — returns ASIN-level `fulfillableQuantity`, `reservedQuantity`, `inboundReceivingQuantity`
+- Map: `fulfillableQuantity + reservedQuantity + inboundReceivingQuantity` → expected lot total (same logic as Blinkit: sellable + in-transit)
+- Wire to G1b in `daily_runner.py` (after Amazon COGS finalization)
+
+**Files to build:** `setup/refresh_amazon_lots.py` | **Files to change:** `automation/daily_runner.py`
+
+### K3 — Integrity check in daily runner
+
+Wire `setup/check_lots_integrity.py` (built 6-Jun-2026) to run after K1+K2 and email/WhatsApp a daily lot health summary. At minimum report: Check 1 (bounds) + Check 2 (Own WH vs sku_inventory) — these should always be green.
+
+### K — Why before Phase E
+
+Phase E (Reorder Integration) computes reorder quantities from: demand forecast + days cover at each location. Days cover = `SUM(lot qty_remaining across all locations) / daily_velocity`. If lots are 30–40 units overstated at partner WHs, reorder triggers will fire late and we will go OOS. Lot data must be trustworthy before reorder automation goes live.
+
+---
+
 ## Build Order Going Forward
 
 ```
 Track 1 — Forecasting + Reorder:
   D. Demand Forecasting Engine ✅ Done
-  E. Reorder Integration + Vignesh tool (tcb/reorder.py + Reorder Plan tab) ← next
+  K. Daily Lot/SOH Reconciliation (Blinkit + Amazon) ← URGENT, do first
+  E. Reorder Integration + Vignesh tool (tcb/reorder.py + Reorder Plan tab)
 
 Track 2 — Vignesh agent layer (can start in parallel):
   H. Memory + decision playbooks + enhanced WhatsApp alerts
