@@ -244,7 +244,17 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
         expected_name = f"sales-report-7d-{today_str}.xlsx"
 
         with page.expect_download(timeout=90_000) as dl_info:
-            reports_btn.first.click()
+            try:
+                reports_btn.first.click(timeout=5_000)
+            except Exception:
+                # Overlay div (sc-cOpHyq / loading layer) intercepting pointer events —
+                # bypass with JS click which ignores pointer-event interception.
+                logger.info("Direct click intercepted by overlay — using JS click on Reports button")
+                page.evaluate(
+                    "() => { const b = [...document.querySelectorAll('button')]"
+                    ".find(e => (e.textContent||'').trim()==='Reports' && e.offsetParent!==null);"
+                    " if (b) b.click(); }"
+                )
             # Wait briefly — if a download panel opened, find the trigger within it
             time.sleep(3)
             for dl_sel in [

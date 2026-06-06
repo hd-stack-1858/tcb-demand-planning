@@ -157,18 +157,54 @@ def _click_js(page, text: str) -> bool:
     return False
 
 
+def _click_js_normalized(page, text: str) -> bool:
+    """
+    JS click without offsetParent check — more reliable for dropdown menus.
+    offsetParent is null for position:absolute children in headless Chromium even
+    when the element is visually open; this function skips that check.
+    Also normalises inner whitespace so 'Detailed\\nReport' matches 'Detailed Report'.
+    """
+    try:
+        clicked = page.evaluate(f"""
+            () => {{
+                const target = '{text}';
+                const el = [...document.querySelectorAll(
+                    'a, button, li, div, span, [role="menuitem"], [role="option"]'
+                )].find(e => (e.innerText || '').replace(/\\s+/g, ' ').trim() === target);
+                if (!el) return false;
+                el.click();
+                return true;
+            }}
+        """)
+        if clicked:
+            time.sleep(0.5)
+            logger.info("JS-normalized-clicked '%s'", text)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _log_visible_links(page):
     try:
         links = page.evaluate("""
-            () => [...document.querySelectorAll('a, button, [role="tab"], [role="menuitem"]')]
-                .filter(e => e.offsetParent !== null)
+            () => [...document.querySelectorAll(
+                'a, button, li, [role="tab"], [role="menuitem"], [role="option"]'
+            )]
+                .filter(e => {
+                    // getBoundingClientRect is more reliable than offsetParent for
+                    // position:absolute dropdown children in headless Chromium.
+                    const r = e.getBoundingClientRect();
+                    return r.width > 0 || r.height > 0;
+                })
                 .map(e => ({
                     tag:  e.tagName,
-                    text: (e.innerText||'').trim().slice(0,50),
+                    text: (e.innerText||'').replace(/\\s+/g,' ').trim().slice(0,60),
                     href: e.href||'',
                     aria: e.getAttribute('aria-label')||''
                 }))
-                .slice(0, 30)
+                .filter(e => e.text.length > 0)
+                .slice(0, 40)
         """)
         logger.info('Visible interactive elements: %s', links)
     except Exception:
@@ -341,6 +377,10 @@ def scrape(headed: bool = False) -> Path:
 
         time.sleep(1)
 
+        # Log dropdown contents NOW (before expect_download) so any future label
+        # change is diagnosable without needing --headed.
+        _log_visible_links(page)
+
         # ── Step 6: Click "Detailed Report" — this triggers the download ─────
         # Must be inside expect_download() so Playwright captures the file event.
         today_prefix = date.today().strftime('%Y%m%d')
@@ -350,16 +390,40 @@ def scrape(headed: bool = False) -> Path:
         with page.expect_download(timeout=600_000) as dl_info:  # 10-minute timeout
             detailed_clicked = False
             for label in ['Detailed Report', 'Detailed', 'Detail Report']:
-                if _click_by_text(page, label, timeout=5_000) or _click_js(page, label):
+                # Try JS click FIRST — it's instant and avoids the dropdown auto-closing
+                # during a long Playwright wait. Also normalises whitespace so innerText
+                # with a newline ("Detailed\nReport") still matches.
+                if _click_js_normalized(page, label) or _click_by_text(page, label, timeout=2_000):
                     detailed_clicked = True
                     logger.info("Clicked dropdown item: '%s'", label)
                     break
 
             if not detailed_clicked:
-                _log_visible_links(page)
+                # Last resort: click the first visible menuitem / li in the open dropdown
+                logger.info("Exact label not found — trying first visible dropdown item")
+                for sel in [
+                    '[role="menuitem"]',
+                    '[role="option"]',
+                    'ul[class*="dropdown"] li',
+                    'ul[class*="menu"] li',
+                    'div[class*="dropdown"] li',
+                ]:
+                    try:
+                        el = page.locator(sel).first
+                        if el.count() and el.is_visible(timeout=2_000):
+                            text = el.inner_text()
+                            el.click()
+                            detailed_clicked = True
+                            logger.info("Clicked first dropdown item via '%s': text=%r", sel, text)
+                            break
+                    except Exception:
+                        continue
+
+            if not detailed_clicked:
                 browser.close()
                 raise RuntimeError(
                     'Could not find "Detailed Report" in Reports dropdown. '
+                    'Check log for "Visible interactive elements" to see current labels. '
                     'Run with --headed to debug.'
                 )
 
