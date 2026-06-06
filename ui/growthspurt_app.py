@@ -2227,10 +2227,14 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
         w_ds  = [d for d in all_ds if d["parent_location_id"] == wid]
         w_ids = {d["location_id"] for d in w_ds}
 
-        ds_closed_count = len({
+        # A DS is "no active SKUs" only if it has zero active eligibility rows.
+        # Using "has any darkstore_closed row" is wrong — a DS can have stale
+        # darkstore_closed for old SKU assessments while being active for current ones.
+        active_ds_ids_wh = {
             e["location_id"] for e in all_elig
-            if e["location_id"] in w_ids and e["status"] == "darkstore_closed"
-        })
+            if e["location_id"] in w_ids and e["status"] == "active"
+        }
+        ds_closed_count = len(w_ids - active_ds_ids_wh)
 
         # All cities served by this WH (from DS records)
         all_wh_cities = sorted({
@@ -2248,28 +2252,24 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
                     city_active_skus[city].add(e["sku_id"])
                 wh_active_skus.add(e["sku_id"])
 
-        # DS count per city (total and closed)
+        # DS count per city (total and those with no active SKUs)
         city_ds_count: dict = defaultdict(int)
         for d in w_ds:
             city = ds_city_lkp.get(d["location_id"], "")
             if city:
                 city_ds_count[city] += 1
 
-        closed_ds_ids_wh = {
-            e["location_id"] for e in all_elig
-            if e["location_id"] in w_ids and e["status"] == "darkstore_closed"
-        }
-        city_closed_ds_count: dict = defaultdict(int)
+        city_no_active_ds_count: dict = defaultdict(int)
         for d in w_ds:
             city = ds_city_lkp.get(d["location_id"], "")
-            if city and d["location_id"] in closed_ds_ids_wh:
-                city_closed_ds_count[city] += 1
+            if city and d["location_id"] not in active_ds_ids_wh:
+                city_no_active_ds_count[city] += 1
 
         city_parts = []
         for city in all_wh_cities:
             active_skus    = len(city_active_skus.get(city, set()))
             total_ds       = city_ds_count.get(city, 0)
-            closed_ds      = city_closed_ds_count.get(city, 0)
+            closed_ds      = city_no_active_ds_count.get(city, 0)
             active_ds      = total_ds - closed_ds
             if active_skus == 0:
                 color = "#374151"  # black/dark — no SKUs launched in this city

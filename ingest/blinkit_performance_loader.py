@@ -666,6 +666,8 @@ def propagate_darkstore_closed() -> tuple[int, int]:
     Pass A: update existing non-closed rows for closed DS → darkstore_closed.
     Pass B: insert rows for SKUs that were never deployed to a now-closed DS
             (these have no eligibility row at all, so Pass A misses them).
+    Only propagates to DS with ZERO active rows — a DS with any active row has
+    reopened and must not be overwritten.
     Returns (rows_updated, rows_inserted).
     """
     CHUNK = 100
@@ -675,7 +677,17 @@ def propagate_darkstore_closed() -> tuple[int, int]:
              .select('location_id') \
              .eq('status', 'darkstore_closed') \
              .execute().data
-    closed_ds_ids = list({r['location_id'] for r in rows})
+    closed_ds_ids = {r['location_id'] for r in rows}
+    if not closed_ds_ids:
+        return 0, 0
+
+    # Exclude DS that have any active row — those DS have reopened
+    active_rows = sb.table('blinkit_ds_sku_eligibility') \
+                   .select('location_id') \
+                   .eq('status', 'active') \
+                   .execute().data
+    active_ds_ids = {r['location_id'] for r in active_rows}
+    closed_ds_ids = list(closed_ds_ids - active_ds_ids)
     if not closed_ds_ids:
         return 0, 0
 
