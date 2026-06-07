@@ -2234,7 +2234,13 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
             e["location_id"] for e in all_elig
             if e["location_id"] in w_ids and e["status"] == "active"
         }
-        ds_closed_count = len(w_ids - active_ds_ids_wh)
+        # DS that have appeared in eligibility data at all (i.e., a SKU was ever
+        # assessed / listed there). DS with NO eligibility rows are "not launched" —
+        # not "closed". Only DS that had eligibility but have none active now count.
+        has_elig_ds_ids = {
+            e["location_id"] for e in all_elig if e["location_id"] in w_ids
+        }
+        ds_closed_count = len(has_elig_ds_ids - active_ds_ids_wh)
 
         # All cities served by this WH (from DS records)
         all_wh_cities = sorted({
