@@ -374,6 +374,24 @@ def _click_accept(page) -> None:
     logger.info("ACCEPT clicked.")
 
 
+def _wait_for_table_rows(page, timeout_each: int = 6_000) -> bool:
+    """
+    Wait for Angular to render order rows after navigating to a list page.
+    Angular fetches rows via XHR after the load event — the heading appears
+    instantly but rows can lag by 1–3 s.  Returns True if rows are found.
+    """
+    for sel in ["tbody tr", "table tr", "[ng-repeat]", "tr td"]:
+        try:
+            page.wait_for_selector(sel, timeout=timeout_each)
+            time.sleep(0.5)
+            logger.info("Table rows ready via selector '%s'.", sel)
+            return True
+        except PWTimeout:
+            continue
+    logger.warning("Table rows not detected — proceeding anyway (Select All may find nothing).")
+    return False
+
+
 def _click_branding_challan(page) -> Path:
     """
     Click BRANDING CHALLAN and save the challan PDF.
@@ -421,7 +439,15 @@ def _click_branding_challan(page) -> Path:
         filename = download.suggested_filename or dest.name
         dest = DOWNLOAD_DIR / filename
         download.save_as(str(dest))
-        logger.info("Challan saved: %s (%d bytes)", dest, dest.stat().st_size)
+        size = dest.stat().st_size
+        logger.info("Challan saved: %s (%d bytes)", dest, size)
+        if size == 0:
+            dest.unlink(missing_ok=True)
+            raise RuntimeError(
+                "BRANDING CHALLAN download returned a 0-byte file — orders were likely not "
+                "selected (Angular table rows hadn't loaded before Select All was clicked). "
+                "Order remains in 'Orders to be shipped' and will be retried next run."
+            )
         return dest
 
     except PWTimeout:
@@ -755,7 +781,7 @@ def _release_lock() -> None:
     LOCK_FILE.unlink(missing_ok=True)
 
 
-def run(dry_run: bool = False, headed: bool = False) -> dict:
+def run(dry_run: bool = False, headed: bool = False, no_email: bool = False) -> dict:
     """
     Full FnP processing pipeline. Returns result dict:
       allocated_accepted  int   — total orders accepted across all date columns
@@ -766,6 +792,9 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
 
     Retries once on PWTimeout — the FnP portal is intermittently slow (30–60+ s
     load times), causing transient navigation timeouts that resolve on a retry.
+
+    no_email=True: download challan + record DB but skip the Dilwar/Himanshu challan
+    email entirely. Use only for manual re-runs where the challan email was already sent.
     """
     if not _acquire_lock():
         logger.warning("Another FnP scraper instance is running — exiting to avoid clash.")
@@ -778,7 +807,7 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
     try:
         for attempt in range(1, 3):
             try:
-                return _run_once(dry_run=dry_run, headed=headed)
+                return _run_once(dry_run=dry_run, headed=headed, no_email=no_email)
             except PWTimeout as exc:
                 if attempt == 2:
                     raise
@@ -789,7 +818,7 @@ def run(dry_run: bool = False, headed: bool = False) -> dict:
         _release_lock()
 
 
-def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
+def _run_once(dry_run: bool = False, headed: bool = False, no_email: bool = False) -> dict:
     """Single attempt of the FnP pipeline (called by run() with retry wrapper)."""
     result: dict = {
         "allocated_accepted": 0,
@@ -908,6 +937,9 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
                 _click_column(page, "Orders to be shipped", col_idx)
                 count = _read_order_count(page)
                 total_ship += count if count > 0 else col_count
+                # Wait for Angular XHR to populate table rows BEFORE clicking Select All.
+                # Without this wait the checkbox fires before rows exist → 0-byte download.
+                _wait_for_table_rows(page)
                 _select_all(page)
                 pdf = _click_branding_challan(page)
                 pdf_paths.append(pdf)
@@ -965,6 +997,10 @@ def _run_once(dry_run: bool = False, headed: bool = False) -> dict:
 
     # ── Step 5: Email all PDFs in one message ─────────────────────────────────
     if not pdf_paths:
+        return result
+
+    if no_email:
+        logger.info("--no-email flag set — challan downloaded and DB recorded; email skipped.")
         return result
 
     from automation.email_sender import send_with_attachments
@@ -1041,7 +1077,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="FnP order processor")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Download challan but do NOT send email")
+                        help="Download challan but skip email AND DB writes")
+    parser.add_argument("--no-email", action="store_true",
+                        help="Download challan + record DB but skip challan email (use when re-running after a failed run where email already went)")
     parser.add_argument("--headed", action="store_true",
                         help="Show browser window — use this for first-run debugging")
     args = parser.parse_args()
@@ -1053,7 +1091,7 @@ if __name__ == "__main__":
     logger.info("=" * 55)
 
     try:
-        result = run(dry_run=args.dry_run, headed=args.headed)
+        result = run(dry_run=args.dry_run, headed=args.headed, no_email=args.no_email)
         if result.get("lock_skipped"):
             print("Another FnP scraper instance is already running — exiting.")
             sys.exit(0)
@@ -1064,7 +1102,7 @@ if __name__ == "__main__":
                 f"FnP: allocated_accepted={result['allocated_accepted']} | "
                 f"ship_count={result['ship_count']} | "
                 f"challan={'downloaded' if result['challan_downloaded'] else 'N/A'} | "
-                f"email={'sent' if result['emailed'] else ('dry-run' if args.dry_run else 'not sent')}"
+                f"email={'sent' if result['emailed'] else ('dry-run' if args.dry_run else ('no-email' if args.no_email else 'not sent'))}"
             )
     except Exception as e:
         logger.error("FAILED: %s", e)
