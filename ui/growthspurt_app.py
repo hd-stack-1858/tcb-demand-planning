@@ -2227,20 +2227,24 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
         w_ds  = [d for d in all_ds if d["parent_location_id"] == wid]
         w_ids = {d["location_id"] for d in w_ds}
 
-        # A DS is "no active SKUs" only if it has zero active eligibility rows.
-        # Using "has any darkstore_closed row" is wrong — a DS can have stale
-        # darkstore_closed for old SKU assessments while being active for current ones.
+        # Closed DS: has darkstore_closed for ANY SKU AND no active row for ANY SKU.
+        # Same invariant as propagate_darkstore_closed in blinkit_performance_loader.py:
+        # if any SKU is active on a DS, the store has reopened → not closed.
         active_ds_ids_wh = {
             e["location_id"] for e in all_elig
             if e["location_id"] in w_ids and e["status"] == "active"
         }
-        # DS that have appeared in eligibility data at all (i.e., a SKU was ever
-        # assessed / listed there). DS with NO eligibility rows are "not launched" —
-        # not "closed". Only DS that had eligibility but have none active now count.
-        has_elig_ds_ids = {
-            e["location_id"] for e in all_elig if e["location_id"] in w_ids
+        has_dark_closed_ids = {
+            e["location_id"] for e in all_elig
+            if e["location_id"] in w_ids and e["status"] == "darkstore_closed"
         }
-        ds_closed_count = len(has_elig_ds_ids - active_ds_ids_wh)
+        closed_ds_ids_wh   = has_dark_closed_ids - active_ds_ids_wh
+        ds_closed_count    = len(closed_ds_ids_wh)
+
+        # Not-closed DS: every DS that is NOT in closed_ds_ids_wh.
+        # Includes active, launch_awaited, sku_moved_out, etc. — any status
+        # except a confirmed-closed store.  City (N) shows how these distribute.
+        not_closed_ds_ids_wh = w_ids - closed_ds_ids_wh
 
         # All cities served by this WH (from DS records)
         all_wh_cities = sorted({
@@ -2248,7 +2252,7 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
             for d in w_ds if ds_city_lkp.get(d["location_id"], "")
         })
 
-        # Active SKU count per city + WH-level SKUs launched
+        # Active SKU count per city (drives color) + WH-level SKUs launched
         city_active_skus: dict = defaultdict(set)
         wh_active_skus: set = set()
         for e in all_elig:
@@ -2258,25 +2262,17 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
                     city_active_skus[city].add(e["sku_id"])
                 wh_active_skus.add(e["sku_id"])
 
-        # DS count per city (total and those with no active SKUs)
-        city_ds_count: dict = defaultdict(int)
+        # Not-closed DS count per city → shown as (N) in city list
+        city_open_ds_count: dict = defaultdict(int)
         for d in w_ds:
             city = ds_city_lkp.get(d["location_id"], "")
-            if city:
-                city_ds_count[city] += 1
-
-        city_no_active_ds_count: dict = defaultdict(int)
-        for d in w_ds:
-            city = ds_city_lkp.get(d["location_id"], "")
-            if city and d["location_id"] not in active_ds_ids_wh:
-                city_no_active_ds_count[city] += 1
+            if city and d["location_id"] in not_closed_ds_ids_wh:
+                city_open_ds_count[city] += 1
 
         city_parts = []
         for city in all_wh_cities:
-            active_skus    = len(city_active_skus.get(city, set()))
-            total_ds       = city_ds_count.get(city, 0)
-            closed_ds      = city_no_active_ds_count.get(city, 0)
-            active_ds      = total_ds - closed_ds
+            active_skus = len(city_active_skus.get(city, set()))
+            open_ds     = city_open_ds_count.get(city, 0)
             if active_skus == 0:
                 color = "#374151"  # black/dark — no SKUs launched in this city
             elif active_skus >= 10:
@@ -2286,7 +2282,7 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
             else:
                 color = "#EF4444"
             city_parts.append(
-                f'<span style="color:{color};font-weight:500">{city}&nbsp;({active_ds})</span>'
+                f'<span style="color:{color};font-weight:500">{city}&nbsp;({open_ds})</span>'
             )
 
         html_rows.append(
@@ -2306,7 +2302,7 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
         "<th style='padding:7px 14px;text-align:center'>Total DS</th>"
         "<th style='padding:7px 14px;text-align:center'>DS Closed</th>"
         "<th style='padding:7px 14px;text-align:center'>SKUs Launched</th>"
-        "<th style='padding:7px 14px;text-align:left'>Cities Served (Active DS count)</th>"
+        "<th style='padding:7px 14px;text-align:left'>Cities Served (Open DS count)</th>"
         "</tr></thead>"
         f"<tbody>{''.join(html_rows)}</tbody></table>"
     )
