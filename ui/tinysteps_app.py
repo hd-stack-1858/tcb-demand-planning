@@ -2,7 +2,13 @@
 The Cradle Box — Warehouse Operations App
 """
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from pathlib import Path
+
+# Resolve project root once at import time — robust against Streamlit's __file__ quirks
+_HERE = Path(__file__).resolve().parent          # ui/
+PROJECT_ROOT = _HERE.parent                       # project root
+
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import streamlit as st
 import pandas as pd
@@ -19,7 +25,7 @@ st.set_page_config(page_title="Tiny Steps WMS", page_icon="📦", layout="center
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 import base64
-logo_path = os.path.join(os.path.dirname(__file__), '..', 'assets', 'logo.png')
+logo_path = PROJECT_ROOT / "assets" / "logo.png"
 if os.path.exists(logo_path):
     with open(logo_path, "rb") as _f:
         _logo_b64 = base64.b64encode(_f.read()).decode()
@@ -1179,6 +1185,8 @@ with tab_shipments:
                 st.error("Consignee name is required — upload PDF or type manually.")
             else:
                 try:
+                    safe_inv  = invoice_no.strip().replace("/", "_")
+                    inv_fname = f"Blinkit Invoice {safe_inv} (RO {ro_number}).xlsx"
                     xlsx_bytes = generate_invoice_excel(
                         line_items       = line_items,
                         ro_number        = ro_number,
@@ -1194,44 +1202,57 @@ with tab_shipments:
                         tax_type         = tax_type,
                     )
 
-                    # Build folder name: YYYYMM_RO#_WH Name
-                    month_tag  = invoice_date.strftime("%Y%m")
-                    wh_suffix  = wh_label.replace(" - ", " ").replace("/", "-") \
-                                         .replace("\\", "-").strip()
-                    folder_name = f"{month_tag}_{ro_number}_{wh_suffix}"
-                    folder = os.path.join(
-                        os.path.dirname(__file__), "..", "data", "blinkit",
-                        "auto", "shipments", folder_name
-                    )
-                    os.makedirs(folder, exist_ok=True)
-
-                    # Invoice filename: "Blinkit Invoice GT_26-27_017 (RO 43886110036715).xlsx"
-                    safe_inv   = invoice_no.strip().replace("/", "_")
-                    inv_fname  = f"Blinkit Invoice {safe_inv} (RO {ro_number}).xlsx"
-                    save_path  = os.path.join(folder, inv_fname)
-                    with open(save_path, "wb") as f:
-                        f.write(xlsx_bytes)
-
-                    # Save RO Excel
-                    with open(os.path.join(folder, f"{ro_number}.xlsx"), "wb") as f:
-                        f.write(ro_excel_file.getvalue())
-
-                    # Save RO PDF if uploaded
-                    if ro_pdf_file:
-                        with open(os.path.join(folder, f"{ro_number}.pdf"), "wb") as f:
-                            f.write(ro_pdf_file.getvalue())
-
-                    st.success(f"Invoice generated — {invoice_no}")
-                    st.caption(f"Saved to: data/blinkit/auto/shipments/{folder_name}/")
-
-                    st.download_button(
-                        label    = f"⬇ Download Invoice Excel — {invoice_no}",
-                        data     = xlsx_bytes,
-                        file_name= inv_fname,
-                        mime     = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key      = "dl_invoice",
-                    )
+                    # Store everything in session state so download buttons
+                    # survive the rerun that clicking a download button triggers
+                    st.session_state["_inv"] = {
+                        "invoice_no":   invoice_no.strip(),
+                        "inv_fname":    inv_fname,
+                        "inv_bytes":    xlsx_bytes,
+                        "ro_no":        ro_number,
+                        "ro_xl_bytes":  ro_excel_file.getvalue(),
+                        "ro_pdf_bytes": ro_pdf_file.getvalue() if ro_pdf_file else None,
+                        "ro_pdf_fname": f"{ro_number}.pdf" if ro_pdf_file else None,
+                    }
                 except Exception as e:
+                    import traceback as _tb
                     st.error(f"Invoice generation failed: {e}")
+                    st.code(_tb.format_exc())
+
+        # ── Download buttons — rendered from session state so they persist
+        #    across reruns triggered by clicking any one of the buttons ──────────
+        if st.session_state.get("_inv"):
+            _s = st.session_state["_inv"]
+            st.success(f"Invoice generated — {_s['invoice_no']}")
+            dl1, dl2, dl3 = st.columns(3)
+            with dl1:
+                st.download_button(
+                    label     = f"⬇ Invoice Excel",
+                    data      = _s["inv_bytes"],
+                    file_name = _s["inv_fname"],
+                    mime      = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key       = "dl_invoice",
+                    use_container_width=True,
+                )
+            with dl2:
+                st.download_button(
+                    label     = f"⬇ RO Excel",
+                    data      = _s["ro_xl_bytes"],
+                    file_name = f"{_s['ro_no']}.xlsx",
+                    mime      = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key       = "dl_ro_excel",
+                    use_container_width=True,
+                )
+            with dl3:
+                if _s["ro_pdf_bytes"]:
+                    st.download_button(
+                        label     = f"⬇ RO PDF",
+                        data      = _s["ro_pdf_bytes"],
+                        file_name = _s["ro_pdf_fname"],
+                        mime      = "application/pdf",
+                        key       = "dl_ro_pdf",
+                        use_container_width=True,
+                    )
+                else:
+                    st.caption("No PDF uploaded")
     else:
         st.info("Upload a Blinkit RO Excel file to get started.")
