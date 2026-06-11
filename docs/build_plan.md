@@ -53,7 +53,7 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | I | Full Autonomy — approval gates, self-monitoring, agent loop | 🔲 Pending |
 | J | Blinkit Replenishment Model | ✅ Done (24-May-2026) — fully closed |
 | **K** | **Daily Lot / SOH Reconciliation — Blinkit + Amazon** | **🔴 Urgent — do before Phase E** |
-| **L** | **Rename `items.supplier_id` → `latest_supplier_id`** | **✅ Done (11-Jun-2026) — apply migration 021 to prod** |
+| **L** | **Rename `items.supplier_id` → `latest_supplier_id`** | **✅ Done (11-Jun-2026)** |
 
 ---
 
