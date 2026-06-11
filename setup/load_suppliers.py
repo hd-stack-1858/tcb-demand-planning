@@ -217,7 +217,7 @@ for item_code, sup_name in ITEM_SUPPLIER.items():
     item_id = code_to_id.get(item_code)
     supplier_id = name_to_id.get(sup_name)
     if item_id and supplier_id:
-        db.table("items").update({"supplier_id": supplier_id}).eq("item_id", item_id).execute()
+        db.table("items").update({"latest_supplier_id": supplier_id}).eq("item_id", item_id).execute()
         print(f"  {item_code} -> {sup_name} (supplier_id={supplier_id})")
         linked += 1
     else:
@@ -226,8 +226,8 @@ for item_code, sup_name in ITEM_SUPPLIER.items():
 print(f"\nDone. {linked} items linked to suppliers.")
 
 # ── Step 6: Verify ───────────────────────────────────────────────────────────
-print("\nVerification — items with supplier_id NULL:")
-unlinked = db.table("items").select("item_code, name").is_("supplier_id", "null").execute().data
+print("\nVerification — items with latest_supplier_id NULL:")
+unlinked = db.table("items").select("item_code, name").is_("latest_supplier_id", "null").execute().data
 if unlinked:
     for r in unlinked:
         print(f"  {r['item_code']} {r['name']}")

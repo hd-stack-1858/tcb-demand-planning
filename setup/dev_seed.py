@@ -127,7 +127,7 @@ for item_code, name, itype, unit, rp, supplier_name in ITEMS:
         "unit":           unit,
         "reorder_point":  rp,
         "safety_stock":   rp // 2,
-        "supplier_id":    sup.get(supplier_name),
+        "latest_supplier_id": sup.get(supplier_name),
         "lead_time_days": 14 if supplier_name in ("Craftworks Handicrafts", "WoodWorks Studio") else 7,
         "moq":            1,
         "is_active":      True,

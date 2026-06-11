@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS items (
   item_code       TEXT UNIQUE NOT NULL,
   name            TEXT NOT NULL,
   item_type       TEXT NOT NULL CHECK (item_type IN ('PRODUCT','PACKAGING')),
-  supplier_id     INT REFERENCES suppliers(supplier_id),
+  latest_supplier_id INT REFERENCES suppliers(supplier_id),
   unit            TEXT DEFAULT 'piece',
   reorder_point   INT DEFAULT 0,
   safety_stock    INT DEFAULT 0,

@@ -53,6 +53,7 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | I | Full Autonomy — approval gates, self-monitoring, agent loop | 🔲 Pending |
 | J | Blinkit Replenishment Model | ✅ Done (24-May-2026) — fully closed |
 | **K** | **Daily Lot / SOH Reconciliation — Blinkit + Amazon** | **🔴 Urgent — do before Phase E** |
+| **L** | **Rename `items.supplier_id` → `latest_supplier_id`** | **✅ Done (11-Jun-2026) — apply migration 021 to prod** |
 
 ---
 
@@ -505,6 +506,21 @@ The FnP CDA delivery report (`cda-export_*.xls`) is the authoritative source for
 
 **File:** `ingest/reconcile_fnp_orders.py` ✅ Done (5-Jun-2026)
 **Status:** Monthly tool. Drop new `cda-export_*.xls` in `data/fnp/manual/` and run `python ingest/reconcile_fnp_orders.py`.
+
+---
+
+## Phase L — Rename `items.supplier_id` → `latest_supplier_id` ✅ Done (11-Jun-2026)
+
+**Why:** `items.supplier_id` implied one supplier per item, which is wrong. Items can have multiple parallel suppliers — the authoritative relationship lives in `item_batches.supplier_id`. Renamed to `latest_supplier_id` to make the display-only, snapshot semantics explicit.
+
+**What was done:**
+- Migration `021_items_latest_supplier_id.sql`: `ALTER TABLE items RENAME COLUMN supplier_id TO latest_supplier_id`
+- `receive_item()` in `tcb/inventory.py` now syncs `items.latest_supplier_id` on every receipt (only when supplier_id is not None)
+- `get_item_stock()` select string updated
+- `setup/dev_seed.py`, `setup/load_suppliers.py`, `setup/01_create_tables.sql`, `setup/dev_schema.sql` all updated
+- `load_reorder_alerts()` in tinysteps_app.py needed no change (uses PostgREST FK join `suppliers(name)`, not the column name)
+
+**Himanshu must apply to prod:** Run `setup/migrations/021_items_latest_supplier_id.sql` on prod DB.
 
 ---
 

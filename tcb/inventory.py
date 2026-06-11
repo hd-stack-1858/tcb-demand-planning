@@ -172,7 +172,7 @@ def get_item_stock():
     db = get_client()
     own_wh_id = _own_wh_id()
     rows = (db.table("inventory")
-              .select("item_id, quantity_on_hand, items(item_code, name, unit, reorder_point, moq, lead_time_days, supplier_id, suppliers(name))")
+              .select("item_id, quantity_on_hand, items(item_code, name, unit, reorder_point, moq, lead_time_days, latest_supplier_id, suppliers(name))")
               .eq("channel_id", own_wh_id)
               .execute().data)
     agg = defaultdict(lambda: {
@@ -1060,6 +1060,9 @@ def return_item(item_id, qty, from_channel_id=None, notes="", created_by="app"):
             "is_current":    True,
         }).execute()
         batch_id = result.data[0]["batch_id"]
+
+    if supplier_id is not None:
+        db.table("items").update({"latest_supplier_id": supplier_id}).eq("item_id", item_id).execute()
 
     existing_inv = (db.table("inventory")
                       .select("inv_id, quantity_on_hand")
