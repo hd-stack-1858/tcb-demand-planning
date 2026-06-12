@@ -758,6 +758,31 @@ def _record_fnp_order(order_no: str, sku_id: str, qty: int,
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
+def _retry_failed_alert(error_msg: str) -> None:
+    """
+    Block and retry the failure alert every 30s until internet is back (up to 1 hour).
+    Called when the initial alert send failed (e.g. ERR_INTERNET_DISCONNECTED).
+    """
+    from automation.email_sender import send_alert
+    failed_at = datetime.now().strftime("%d-%b %H:%M")
+    subject = f"⚠️ FnP Scraper — Failed ({failed_at}, alert delayed)"
+    body = (
+        f"Error: {error_msg}\n\n"
+        f"Alert was delayed — internet was down at the time of failure.\n"
+        f"Log: automation/logs/fnp_{date.today().strftime('%Y%m%d')}.log"
+    )
+    logger.info("Waiting for internet to come back to send failure alert...")
+    for elapsed in range(30, 3601, 30):
+        time.sleep(30)
+        try:
+            send_alert(subject=subject, body=body)
+            logger.info("Delayed failure alert sent after %ds.", elapsed)
+            return
+        except Exception:
+            logger.debug("Alert retry at %ds — still no internet.", elapsed)
+    logger.error("Could not send failure alert after 1 hour — giving up.")
+
+
 def _acquire_lock() -> bool:
     """Return True if this process owns the lock. False if another instance is running."""
     if LOCK_FILE.exists():
@@ -1116,6 +1141,6 @@ if __name__ == "__main__":
                 ),
             )
         except Exception:
-            pass
+            _retry_failed_alert(str(e))
         print(f"ERROR: {e}")
         sys.exit(1)
