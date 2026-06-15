@@ -2197,7 +2197,7 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
     if _refresh:
         with st.spinner("Generating replenishment plan (~30s)…"):
             _result = _sp.run(
-                [sys.executable, "tcb/replenishment.py"],
+                [sys.executable, "-m", "tcb.replenishment"],
                 capture_output=True, text=True, encoding="utf-8",
                 cwd=str(Path(".").resolve()),
             )
@@ -2543,7 +2543,7 @@ def tab_forecast():
     if regen:
         with st.spinner("Running forecast engine (~20s)..."):
             _r = subprocess.run(
-                [sys.executable, "tcb/forecasting.py"],
+                [sys.executable, "-m", "tcb.forecasting"],
                 capture_output=True, text=True, encoding="utf-8",
                 cwd=str(Path(".").resolve()),
             )
@@ -2595,7 +2595,7 @@ def tab_forecast():
             coh = replen_agg.merge(fc_df, on='sku_id', how='outer').fillna(0)
             coh['replen_30d'] = coh['replen_30d'].astype(int)
             coh['fc_m1']      = coh['fc_m1'].astype(int)
-            replen_nonzero    = coh['replen_30d'].replace(0, pd.NA)
+            replen_nonzero    = coh['replen_30d'].astype(float).replace(0.0, float('nan'))
             coh['delta_pct']  = ((coh['fc_m1'] - coh['replen_30d']) / replen_nonzero * 100).round(1)
             coh['status']     = coh['delta_pct'].apply(
                 lambda d: '🔴 Under-call' if pd.notna(d) and d < -5 else '✅ OK'
