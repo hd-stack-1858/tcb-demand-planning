@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from tcb.db import get_client
+from tcb.blinkit_ads import compute_blinkit_ads
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 BLINKIT_CHANNEL_ID  = 4
@@ -36,7 +37,6 @@ FORECAST_MONTHS     = 6
 DEFAULT_GROWTH_RATE  = 0.15    # 15%/month fallback when <2 MoM observations
 MAX_MONTHLY_GROWTH   = 0.35    # cap on P75 growth rate — prevents explosive projections from small-data noise
 MIN_RELIABLE_VOLUME  = 10      # total units over lookback period; below this, use DEFAULT_GROWTH_RATE
-MIN_NON_OOS_DAYS     = 5       # min non-OOS days required to use real ADS; else use SKU fallback
 VELOCITY_BASE       = "VELOCITY_BASE"
 USER_FINAL          = "USER_FINAL"
 LOOKBACK_MONTHS     = 4       # months of history for growth-rate computation
@@ -149,110 +149,6 @@ def parse_city_launch_plan(path: Path | None = None) -> dict[str, dict[str, list
 
 
 # ── Blinkit ADS model ─────────────────────────────────────────────────────────
-def fetch_blinkit_daily_ads() -> pd.DataFrame:
-    """
-    Load the latest 30 days of day-level data from blinkit_performance_detail.
-    Uses inventory_available (Column Q) as the DS-level OOS signal.
-    Returns: location_id, sku_id, city, total_orders, inventory_available, data_date
-    """
-    rows = _paginate(
-        "blinkit_performance_detail",
-        "location_id,sku_id,city,total_orders,inventory_available,data_date",
-    )
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    df["total_orders"]        = pd.to_numeric(df["total_orders"], errors="coerce").fillna(0).astype(int)
-    df["inventory_available"] = df["inventory_available"].fillna(True).astype(bool)
-    df["data_date"]           = pd.to_datetime(df["data_date"]).dt.date
-
-    # Rolling 30-day window per SKU
-    max_date_per_sku = df.groupby("sku_id")["data_date"].max().to_dict()
-    df["_cutoff"] = df["sku_id"].map(
-        lambda s: max_date_per_sku.get(s, date.today()) - timedelta(days=29)
-    )
-    df = df[df["data_date"] >= df["_cutoff"]].copy()
-    df.drop(columns=["_cutoff"], inplace=True)
-    return df
-
-
-def compute_ds_ads(daily_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    ADS = SUM(total_orders WHERE inventory_available) / COUNT(inventory_available days)
-    per (location_id, sku_id) over the 30-day window already applied by fetch_blinkit_daily_ads.
-
-    P25/P75/P90 are computed across ALL DSes with avail_days >= MIN_NON_OOS_DAYS,
-    including zero-ADS ones. This gives the true distribution, not a cherry-picked
-    top-performer sample.
-
-    Returns: location_id, sku_id, mean_ads, avail_days, city,
-             sku_p25_ads, sku_p75_ads, sku_p90_ads
-    """
-    if daily_df.empty:
-        return pd.DataFrame(columns=[
-            "location_id", "sku_id", "mean_ads", "avail_days", "city",
-            "sku_p25_ads", "sku_p75_ads", "sku_p90_ads",
-        ])
-
-    records = []
-    for (loc_id, sku_id), grp in daily_df.groupby(["location_id", "sku_id"]):
-        avail = grp[grp["inventory_available"]]["total_orders"].values
-        n = int(len(avail))
-        city_vals = grp["city"].dropna()
-        city = str(city_vals.iloc[0]).strip() if len(city_vals) > 0 else None
-        if n < MIN_NON_OOS_DAYS:
-            records.append({
-                "location_id": loc_id, "sku_id": sku_id,
-                "mean_ads": None, "avail_days": n, "city": city,
-            })
-        else:
-            records.append({
-                "location_id": loc_id, "sku_id": sku_id,
-                "mean_ads": float(avail.sum()) / n,
-                "avail_days": n, "city": city,
-            })
-
-    ads_df = pd.DataFrame(records)
-
-    # DSes with enough available days to be reliable — includes ADS=0 DSes (intentional)
-    valid = ads_df[ads_df["mean_ads"].notna()]
-
-    # Fill insufficient-data DSes with SKU-median of reliable DSes
-    if not valid.empty:
-        median_ads = valid.groupby("sku_id")["mean_ads"].median().rename("median_ads")
-        ads_df = ads_df.join(median_ads, on="sku_id")
-        mask = ads_df["mean_ads"].isna()
-        ads_df.loc[mask, "mean_ads"] = ads_df.loc[mask, "median_ads"]
-        ads_df.drop(columns=["median_ads"], inplace=True)
-
-    ads_df["mean_ads"] = ads_df["mean_ads"].fillna(0)
-
-    # P25/P75/P90 across ALL reliable DSes, including zeros
-    if not valid.empty:
-        percentiles = (
-            valid.groupby("sku_id")["mean_ads"]
-            .agg(
-                sku_p25_ads=lambda x: float(np.percentile(x, 25)),
-                sku_p75_ads=lambda x: float(np.percentile(x, 75)),
-                sku_p90_ads=lambda x: float(np.percentile(x, 90)),
-            )
-        )
-        ads_df = ads_df.join(percentiles, on="sku_id")
-    else:
-        for col in ("sku_p25_ads", "sku_p75_ads", "sku_p90_ads"):
-            ads_df[col] = 0.0
-
-    for col in ("sku_p25_ads", "sku_p75_ads", "sku_p90_ads"):
-        ads_df[col] = ads_df[col].fillna(0)
-
-    return ads_df
-
-
-# Keep alias so nothing else breaks if referenced
-compute_ds_p75_ads = compute_ds_ads
-
-
 def forecast_blinkit(forecast_dates: list[date]) -> pd.DataFrame:
     """
     Blinkit demand forecast using ADS × DS count × 30.
@@ -269,12 +165,21 @@ def forecast_blinkit(forecast_dates: list[date]) -> pd.DataFrame:
     launch_plan = parse_city_launch_plan()
 
     print("  [Blinkit] Fetching performance ADS data...")
-    daily_df = fetch_blinkit_daily_ads()
-    if daily_df.empty:
+    perf_rows = _paginate(
+        "blinkit_performance_detail",
+        "location_id,sku_id,city,total_orders,inventory_available,data_date",
+    )
+    if not perf_rows:
         print("  [Blinkit] No ADS data found — skipping Blinkit model")
         return pd.DataFrame()
+    daily_df = pd.DataFrame(perf_rows)
+    daily_df["total_orders"]        = pd.to_numeric(daily_df["total_orders"], errors="coerce").fillna(0).astype(int)
+    daily_df["inventory_available"] = daily_df["inventory_available"].fillna(True).astype(bool)
+    daily_df["data_date"]           = pd.to_datetime(daily_df["data_date"]).dt.date
 
-    ads_df = compute_ds_ads(daily_df)
+    ads_df = compute_blinkit_ads(daily_df)
+    # Forecast uses in-stock velocity (assumes adequate stock going forward)
+    ads_df = ads_df.rename(columns={"filled_in_stock_ads": "mean_ads"})
     print(f"  [Blinkit] ADS computed for {len(ads_df)} DS-SKU pairs")
 
     db = get_client()

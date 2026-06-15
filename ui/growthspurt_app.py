@@ -1827,6 +1827,22 @@ def _load_all_elig() -> list:
     return rows
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_blinkit_fc_month1(month1_str: str) -> "pd.DataFrame":
+    db = get_client()
+    rows = (
+        db.table('demand_forecasts')
+        .select('sku_id,forecast_units')
+        .eq('channel_id', 4)
+        .eq('forecast_month', month1_str)
+        .eq('model', 'VELOCITY_BASE')
+        .execute().data
+    )
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=['sku_id', 'forecast_units'])
+    df['forecast_units'] = pd.to_numeric(df['forecast_units'], errors='coerce').fillna(0).astype(int)
+    return df.rename(columns={'forecast_units': 'fc_m1'})
+
+
 def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
     """Blinkit Deepdive — stacked horizontal bar of dark store status per city, per SKU."""
     st.markdown("#### Darkstore Launch Status")
@@ -2560,6 +2576,49 @@ def tab_forecast():
     date_to_label  = {fm: fm.strftime("%b '%y") for fm in forecast_dates}
     month_labels   = [date_to_label[fm] for fm in forecast_dates]
     label_to_date  = {v: k for k, v in date_to_label.items()}
+
+    # ── Coherency check: Forecast Month 1 vs Replenishment 30-day demand ─────────
+    with st.expander("🔍 Forecast vs Replenishment Coherency — Month 1 Blinkit"):
+        plan_df = _get_replen_plan()
+        month1_str = forecast_dates[0].isoformat()
+        if plan_df.empty:
+            st.info("No replenishment plan found. Run the replenishment engine first.")
+        else:
+            replen_agg = (
+                plan_df.groupby('sku_id', as_index=False)['total_ads']
+                .sum()
+                .assign(replen_30d=lambda d: (d['total_ads'] * 30).round(0).astype(int))
+                [['sku_id', 'replen_30d']]
+            )
+            fc_df = _load_blinkit_fc_month1(month1_str)
+
+            coh = replen_agg.merge(fc_df, on='sku_id', how='outer').fillna(0)
+            coh['replen_30d'] = coh['replen_30d'].astype(int)
+            coh['fc_m1']      = coh['fc_m1'].astype(int)
+            replen_nonzero    = coh['replen_30d'].replace(0, pd.NA)
+            coh['delta_pct']  = ((coh['fc_m1'] - coh['replen_30d']) / replen_nonzero * 100).round(1)
+            coh['status']     = coh['delta_pct'].apply(
+                lambda d: '🔴 Under-call' if pd.notna(d) and d < -5 else '✅ OK'
+            )
+
+            under_calls = coh[coh['status'] == '🔴 Under-call']
+            if not under_calls.empty:
+                st.warning(f"⚠️ {len(under_calls)} SKU(s) where Blinkit forecast is >5% below replenishment demand — review before next ship.")
+            else:
+                st.success("All Blinkit SKUs: Forecast Month 1 ≥ Replenishment 30-day demand ✓")
+
+            coh_display = coh.rename(columns={
+                'sku_id':     'SKU',
+                'replen_30d': 'Replen 30d',
+                'fc_m1':      f'Forecast {forecast_dates[0].strftime("%b %y")} (Blinkit)',
+                'delta_pct':  'Delta (%)',
+                'status':     'Status',
+            })
+            st.dataframe(coh_display, use_container_width=True, hide_index=True)
+            st.caption(
+                "Replen 30d = SUM(total_ads) × 30 days — raw monthly demand signal, no coverage buffer. "
+                "🔴 fires only when Forecast < Replen × 0.95 (over-forecast is always OK)."
+            )
 
     # ── Build pivot ────────────────────────────────────────────────────────────
     pivot = (

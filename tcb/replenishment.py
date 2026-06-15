@@ -4,17 +4,17 @@ Blinkit Replenishment Engine
 Computes how many units to ship to each Blinkit WH per SKU.
 
 Formula per WH × SKU:
-    ADS_per_DS   = SUM(total_orders WHERE NOT wh_oos_flag)
-                 / COUNT(days WHERE NOT wh_oos_flag)
-                 within the latest assessment period for that SKU
+    ADS_per_DS   = imputed_ads from tcb.blinkit_ads.compute_blinkit_ads()
+                   (rolling 30-day window; OOS days imputed with city P75;
+                    never-stocked DS imputed with city P50 — conservative)
 
     total_demand = SUM(ADS_per_DS across active eligible DS) × coverage_days
     transit_buf  = SUM(ADS_per_DS) × transit_buffer_days
     target_stock = total_demand + transit_buf
-    eff_stock    = units_wh + units_incoming  (latest SOH snapshot)
+    eff_stock    = units_wh + units_incoming + units_transit + units_ds
     units_to_ship = max(0, target_stock − eff_stock)
 
-Coverage : 30 days  (monthly shipping cadence)
+Coverage : 33 days  (30-day cadence + 3-day upward buffer to reduce OOS risk)
 Buffer   : 7 days   (in-transit safety stock)
 Gate     : ₹1,50,000 invoice value per WH before that WH's shipment is triggered
 
@@ -34,10 +34,11 @@ from pathlib import Path
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client
+
+from tcb.blinkit_ads import compute_blinkit_ads
 
 # ── Environment ────────────────────────────────────────────────────────────────
 env = os.environ.get('TCB_ENV', 'prod')
@@ -64,7 +65,7 @@ def _sb_execute(query, retries: int = 2):
             else:
                 raise
 
-COVERAGE_DAYS     = 30
+COVERAGE_DAYS     = 33
 TRANSIT_BUFFER    = 7
 MIN_AVAILABLE_DAYS = 5   # min Q=Y days to compute reliable raw ADS for a DS
 MIN_INVOICE_VALUE = 150_000  # ₹1.5L gate per WH
@@ -365,93 +366,6 @@ def load_sp_lookup() -> dict:
     }
 
 
-# ── ADS computation ────────────────────────────────────────────────────────────
-
-def compute_ads(perf_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute ADS per (sku_id, location_id) using a rolling 30-day window.
-
-    raw_ADS     = SUM(total_orders WHERE inventory_available) / COUNT(inventory_available days)
-    imputed_ADS = (orders on available days + city_P75_ADS × oos_days) / 30
-
-    ads column = imputed_ADS (used for target stock in replenishment plan).
-
-    Returns DataFrame with columns:
-        sku_id, location_id, ads, had_oos_days, period_days,
-        non_oos_days, raw_ads, imputed_ads, city, assessment_start, assessment_end
-    """
-    if perf_df.empty:
-        return pd.DataFrame()
-
-    # Rolling 30-day window per SKU
-    max_date_per_sku = perf_df.groupby('sku_id')['data_date'].max().to_dict()
-    perf_df = perf_df.copy()
-    perf_df['_cutoff'] = perf_df['sku_id'].map(
-        lambda s: max_date_per_sku[s] - timedelta(days=29)
-    )
-    perf = perf_df[perf_df['data_date'] >= perf_df['_cutoff']].copy()
-
-    # DS-level raw ADS
-    results = []
-    for (sku_id, loc_id), grp in perf.groupby(['sku_id', 'location_id']):
-        avail      = grp[grp['inventory_available']]
-        avail_days = len(avail)
-        oos_days   = len(grp) - avail_days
-        raw_ads    = float(avail['total_orders'].sum()) / avail_days if avail_days > 0 else 0.0
-        city_vals  = grp['city'].dropna()
-        city       = str(city_vals.iloc[0]).strip() if len(city_vals) > 0 else None
-        results.append({
-            'sku_id':      sku_id,
-            'location_id': loc_id,
-            'raw_ads':     round(raw_ads, 4),
-            'avail_days':  avail_days,
-            'oos_days':    oos_days,
-            'total_days':  len(grp),
-            'city':        city,
-        })
-
-    if not results:
-        return pd.DataFrame()
-
-    ads_df = pd.DataFrame(results)
-
-    # City-level P75 ADS (imputation value for Q=0 days)
-    # Only include DSes with enough available days for a reliable signal
-    reliable = ads_df[ads_df['avail_days'] >= MIN_AVAILABLE_DAYS]
-    city_p75: dict[tuple, float] = {}
-    if not reliable.empty:
-        for (s_id, city), grp in reliable[reliable['city'].notna()].groupby(['sku_id', 'city']):
-            city_p75[(s_id, city)] = float(np.percentile(grp['raw_ads'].values, 75))
-
-    sku_p75_fallback: dict[str, float] = {}
-    if not reliable.empty:
-        for s_id, grp in reliable.groupby('sku_id'):
-            sku_p75_fallback[s_id] = float(np.percentile(grp['raw_ads'].values, 75))
-
-    def _imputed_ads(row) -> float:
-        ds_city = row['city']
-        p75 = city_p75.get((row['sku_id'], ds_city), 0.0) if ds_city else 0.0
-        if p75 == 0.0:
-            p75 = sku_p75_fallback.get(row['sku_id'], 0.0)
-        return round((row['raw_ads'] * row['avail_days'] + p75 * row['oos_days']) / 30, 4)
-
-    ads_df['imputed_ads'] = ads_df.apply(_imputed_ads, axis=1)
-    ads_df['ads']         = ads_df['imputed_ads']
-    ads_df['had_oos_days'] = ads_df['oos_days'] > 0
-    ads_df['period_days']  = ads_df['total_days']
-    ads_df['non_oos_days'] = ads_df['avail_days']
-
-    max_dt_map = perf.groupby('sku_id')['data_date'].max().to_dict()
-    ads_df['assessment_start'] = ads_df['sku_id'].apply(
-        lambda s: str(max_dt_map.get(s, date.today()) - timedelta(days=29))
-    )
-    ads_df['assessment_end'] = ads_df['sku_id'].apply(
-        lambda s: str(max_dt_map.get(s, date.today()))
-    )
-
-    return ads_df
-
-
 # ── Replenishment plan computation ─────────────────────────────────────────────
 
 def compute_replenishment_plan(
@@ -488,8 +402,14 @@ def compute_replenishment_plan(
         snap_date = inv_df['snapshot_date'].iloc[0]
         print(f'  Snapshot date: {snap_date} | Rows: {len(inv_df)}')
 
-    # Compute ADS per DS-SKU
-    ads_df = compute_ads(perf_df)
+    # Compute ADS per DS-SKU via shared module
+    ads_df = compute_blinkit_ads(perf_df)
+    if ads_df.empty:
+        print('[WARN] No ADS data found — load performance CSVs first.')
+        return pd.DataFrame()
+    ads_df = ads_df.rename(columns={'imputed_ads': 'ads', 'total_days': 'period_days'})
+    ads_df['had_oos_days'] = ads_df['oos_days'] > 0
+    ads_df['non_oos_days'] = ads_df['avail_days']
     print(f'  ADS rows computed: {len(ads_df)}')
 
     # DS → WH mapping
@@ -498,9 +418,6 @@ def compute_replenishment_plan(
 
     # Build working set from ADS data — DS-SKUs with performance data are eligible by default.
     # Explicitly excluded pairs (non-active eligibility status) are removed.
-    if ads_df.empty:
-        print('[WARN] No ADS data found — load performance CSVs first.')
-        return pd.DataFrame()
 
     elig_with_ads = ads_df.copy()
     # Keep only DS rows that are active in partner_locations
@@ -925,7 +842,7 @@ def main():
     args = parser.parse_args()
 
     print(f'Environment: {env}')
-    print(f'Coverage: {args.coverage}d | Buffer: {args.buffer}d | Gate: ₹{MIN_INVOICE_VALUE:,}')
+    print(f'Coverage: {args.coverage}d (33=30d cadence+3d buffer) | Buffer: {args.buffer}d | Gate: ₹{MIN_INVOICE_VALUE:,}')
     print()
 
     plan_df = compute_replenishment_plan(
