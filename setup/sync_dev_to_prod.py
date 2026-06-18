@@ -10,16 +10,18 @@ Usage:
     python setup/sync_dev_to_prod.py --dry-run  # show plan, no writes
 """
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 from dotenv import dotenv_values
 import psycopg2
 from psycopg2.extras import execute_values
 from supabase import create_client
 
-ROOT     = Path(__file__).parent.parent
-PROD_CFG = dotenv_values(ROOT / ".env")
-DEV_CFG  = dotenv_values(ROOT / ".env.dev")
-DRY      = "--dry-run" in sys.argv
+ROOT        = Path(__file__).parent.parent
+PROD_CFG    = dotenv_values(ROOT / ".env")
+DEV_CFG     = dotenv_values(ROOT / ".env.dev")
+DRY         = "--dry-run" in sys.argv
+CUTOFF_DAYS = 90  # window for recent transactional data (orders, txns, snapshots)
 
 prod_sb = create_client(PROD_CFG["SUPABASE_URL"], PROD_CFG["SUPABASE_KEY"])
 
@@ -60,6 +62,44 @@ def _fetch_prod(table: str) -> list[dict]:
     return rows
 
 
+def _fetch_prod_filtered(table: str, date_col: str, cutoff_iso: str) -> list[dict]:
+    rows, off, ps = [], 0, 1000
+    while True:
+        b = (prod_sb.table(table).select("*").gte(date_col, cutoff_iso)
+             .range(off, off + ps - 1).execute().data)
+        rows.extend(b)
+        if len(b) < ps:
+            break
+        off += ps
+    return rows
+
+
+def _insert_rows(table: str, rows: list[dict], pk_col: str | None = None,
+                  exclude_cols: set[str] | None = None, label: str | None = None):
+    label = label or table
+    if not rows:
+        print(f"  SKIP {label} (no rows in prod window)")
+        return
+    exclude_cols = exclude_cols or set()
+    cols    = [c for c in rows[0].keys() if c not in exclude_cols]
+    col_sql = ", ".join(f'"{c}"' for c in cols)
+    vals    = [tuple(r[c] for c in cols) for r in rows]
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                f'INSERT INTO "{table}" ({col_sql}) VALUES %s ON CONFLICT DO NOTHING',
+                vals,
+            )
+            if pk_col:
+                cur.execute(
+                    f"SELECT setval(pg_get_serial_sequence('{table}', '{pk_col}'), "
+                    f"(SELECT COALESCE(MAX(\"{pk_col}\"), 1) FROM \"{table}\"))"
+                )
+            conn.commit()
+    print(f"  OK   {label}: {len(rows)} rows")
+
+
 # ── DDL strings ───────────────────────────────────────────────────────────────
 
 _BLINKIT_DS_ELIGIBILITY = """
@@ -95,6 +135,26 @@ CREATE TABLE IF NOT EXISTS blinkit_inventory_snapshots (
     UNIQUE (snapshot_date, location_id, sku_id)
 );
 """
+
+_BLINKIT_PERFORMANCE_DETAIL = """
+CREATE TABLE IF NOT EXISTS blinkit_performance_detail (
+    data_date              DATE     NOT NULL,
+    location_id            INTEGER  NOT NULL,
+    sku_id                 TEXT     NOT NULL,
+    ds_name                TEXT,
+    city                   TEXT,
+    serving_wh             TEXT,
+    inventory_available    BOOLEAN  NOT NULL DEFAULT FALSE,
+    total_orders           INTEGER  NOT NULL DEFAULT 0,
+    orders_with_complaint  INTEGER  NOT NULL DEFAULT 0,
+    download_date          DATE     NOT NULL,
+    CONSTRAINT blinkit_performance_detail_pkey
+        PRIMARY KEY (data_date, location_id, sku_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bpd_sku_date ON blinkit_performance_detail (sku_id, data_date);
+CREATE INDEX IF NOT EXISTS idx_bpd_loc_sku ON blinkit_performance_detail (location_id, sku_id);
+"""
+
 
 _V_ASSEMBLABLE_SKUS = """
 CREATE OR REPLACE VIEW v_assemblable_skus AS
@@ -188,6 +248,14 @@ def phase1_schema():
     ]:
         _sql(cur, stmt, label)
 
+    # orders: add DIRECT to fulfillment_type check (migration 006)
+    _sql(cur, "ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_fulfillment_type_check",
+         "orders: drop old fulfillment_type check")
+    _sql(cur,
+         "ALTER TABLE orders ADD CONSTRAINT orders_fulfillment_type_check "
+         "CHECK (fulfillment_type IN ('DROP_SHIP', 'OUTRIGHT', 'SOR', 'DIRECT'))",
+         "orders: add fulfillment_type check with DIRECT")
+
     # orders: add REPLACEMENT to status check (migration 021)
     _sql(cur, "ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check",
          "orders: drop old status check")
@@ -199,6 +267,7 @@ def phase1_schema():
     print("\n=== Phase 2: Create missing tables ===")
     _sql(cur, _BLINKIT_DS_ELIGIBILITY, "CREATE blinkit_ds_sku_eligibility")
     _sql(cur, _BLINKIT_INV_SNAPSHOTS,  "CREATE blinkit_inventory_snapshots")
+    _sql(cur, _BLINKIT_PERFORMANCE_DETAIL, "CREATE blinkit_performance_detail")
 
     print("\n=== Phase 3: Create missing views ===")
     _sql(cur, _V_ASSEMBLABLE_SKUS, "CREATE v_assemblable_skus")
@@ -213,6 +282,7 @@ def phase4_clear_data():
     # Leaf-first order avoids FK violations without CASCADE.
     # Tables that may not exist in dev (e.g. already dropped stale ones) are skipped.
     clear_order = [
+        "blinkit_performance_detail",
         "blinkit_ds_sku_eligibility",
         "blinkit_inventory_snapshots",
         "orders",
@@ -225,7 +295,7 @@ def phase4_clear_data():
         "bom",
         "sku_channel_ids",
         "sku_pricing",
-        "sku_channel_sp",
+        "sku_channel_tp",
         "partner_locations",
         "items",
         "channels",
@@ -261,6 +331,8 @@ def phase5_load_master():
         ("items",          "item_id"),
         ("bom",            "bom_id"),
         ("sku_channel_ids","id"),
+        ("sku_pricing",    "pricing_id"),
+        ("sku_channel_tp", "tp_id"),
     ]
 
     for table, pk_col in master_tables:
@@ -314,8 +386,40 @@ def phase5_load_master():
               f"({len(roots)} root + {len(children)} DS)")
 
 
-def phase6_verify():
-    print("\n=== Phase 6: Verify ===")
+def phase6_load_current_state():
+    """Full copy of current-state tables from prod — these aren't date-filtered,
+    they represent a single live balance per row (stock on hand, open lots, etc)."""
+    print("\n=== Phase 6: Load current-state data (full copy) from prod ===")
+    _insert_rows("item_batches", _fetch_prod("item_batches"), pk_col="batch_id")
+    _insert_rows("sku_cogs_lots", _fetch_prod("sku_cogs_lots"), pk_col="lot_id")
+    _insert_rows("inventory", _fetch_prod("inventory"), pk_col="inv_id")
+    _insert_rows("sku_inventory", _fetch_prod("sku_inventory"), pk_col="sku_inv_id")
+    _insert_rows("blinkit_ds_sku_eligibility", _fetch_prod("blinkit_ds_sku_eligibility"))
+
+
+def phase7_load_recent_transactional():
+    """Copy the last CUTOFF_DAYS of transactional history from prod — enough for
+    realistic order flow, ADS/replenishment calcs, and recent stock movements
+    without dragging the entire prod history into dev."""
+    cutoff = (date.today() - timedelta(days=CUTOFF_DAYS)).isoformat()
+    print(f"\n=== Phase 7: Load recent transactional data (since {cutoff}) ===")
+    _insert_rows("orders",
+                 _fetch_prod_filtered("orders", "order_date", cutoff))
+    _insert_rows("inventory_transactions",
+                 _fetch_prod_filtered("inventory_transactions", "txn_date", cutoff),
+                 pk_col="txn_id")
+    _insert_rows("sku_inventory_transactions",
+                 _fetch_prod_filtered("sku_inventory_transactions", "txn_date", cutoff),
+                 pk_col="txn_id")
+    _insert_rows("blinkit_inventory_snapshots",
+                 _fetch_prod_filtered("blinkit_inventory_snapshots", "snapshot_date", cutoff),
+                 pk_col="id")
+    _insert_rows("blinkit_performance_detail",
+                 _fetch_prod_filtered("blinkit_performance_detail", "data_date", cutoff))
+
+
+def phase8_verify():
+    print("\n=== Phase 8: Verify ===")
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -330,7 +434,11 @@ def phase6_verify():
             # Row counts for key tables
             counts = {}
             for t in ("channels","suppliers","items","bom","skus","sku_channel_ids",
-                      "partner_locations","company_config"):
+                      "partner_locations","company_config","sku_pricing","sku_channel_tp",
+                      "item_batches","sku_cogs_lots","inventory","sku_inventory",
+                      "orders","inventory_transactions","sku_inventory_transactions",
+                      "blinkit_ds_sku_eligibility","blinkit_inventory_snapshots",
+                      "blinkit_performance_detail"):
                 cur.execute(f"SELECT COUNT(*) FROM {t}")
                 counts[t] = cur.fetchone()[0]
 
@@ -377,8 +485,14 @@ def main():
     # Phase 5: load master data (one conn per table — isolates failures)
     phase5_load_master()
 
-    # Phase 6: verify
-    phase6_verify()
+    # Phase 6: load current-state data (full copy — stock, lots, batches)
+    phase6_load_current_state()
+
+    # Phase 7: load recent transactional history (last CUTOFF_DAYS days)
+    phase7_load_recent_transactional()
+
+    # Phase 8: verify
+    phase8_verify()
 
     print("\nSync complete.")
 
