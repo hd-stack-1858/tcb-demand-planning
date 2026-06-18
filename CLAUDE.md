@@ -198,6 +198,37 @@ See `docs/build_plan.md` for full detail and scope per phase. (`docs/build_plan_
 
 ---
 
+## DB Change Workflow — MANDATORY
+
+Follow this exact sequence for **any** work that touches DB schema or data:
+
+### Step 1 — Sync dev to prod before starting
+```
+python setup/sync_dev_to_prod.py
+```
+Always run this first. Dev may have drifted from prod (stale stock values, missing rows, schema gaps). Syncing ensures dev is a faithful copy of prod before any new work begins.
+
+### Step 2 — Make all schema changes in dev first
+- New tables, columns, constraints, indexes → apply to dev via psycopg2 (see [[feedback-dev-db-direct-access]])
+- Write the migration SQL in `setup/migrations/NNN_name.sql` (next sequential number)
+- Test all code against dev (`TCB_ENV=dev`) until the feature works end-to-end
+
+### Step 3 — Himanshu applies the migration to prod manually
+- Share the `setup/migrations/NNN_name.sql` file with Himanshu
+- Himanshu runs it in the Supabase prod SQL editor
+- **Claude never touches prod DDL** — not via MCP, not via psycopg2, not via Supabase client
+
+### Step 4 — Push code
+- Commit code changes + the migration file together
+- `git push origin main` → Streamlit Cloud auto-deploys
+
+### Why this order matters
+- Dev sync first prevents "works on my machine" bugs where dev schema is behind prod
+- Dev-first schema means prod never sees untested DDL
+- Himanshu controls the prod apply so there's always a human sign-off before prod changes
+
+---
+
 ## DB State Verification Standard — MANDATORY
 
 When investigating data discrepancies or answering "why does X show Y?":
