@@ -100,6 +100,35 @@ def _insert_rows(table: str, rows: list[dict], pk_col: str | None = None,
     print(f"  OK   {label}: {len(rows)} rows")
 
 
+def _upsert_rows(table: str, rows: list[dict], pk_col: str, label: str | None = None):
+    """Insert rows from prod; update all non-PK columns on conflict.
+    Used for current-state tables (inventory, item_batches, sku_cogs_lots,
+    sku_inventory) where dev may already have rows with stale values."""
+    label = label or table
+    if not rows:
+        print(f"  SKIP {label} (no rows)")
+        return
+    cols     = list(rows[0].keys())
+    col_sql  = ", ".join(f'"{c}"' for c in cols)
+    upd_cols = [c for c in cols if c != pk_col]
+    upd_sql  = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in upd_cols)
+    vals     = [tuple(r[c] for c in cols) for r in rows]
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                f'INSERT INTO "{table}" ({col_sql}) VALUES %s '
+                f'ON CONFLICT ("{pk_col}") DO UPDATE SET {upd_sql}',
+                vals,
+            )
+            cur.execute(
+                f"SELECT setval(pg_get_serial_sequence('{table}', '{pk_col}'), "
+                f"(SELECT COALESCE(MAX(\"{pk_col}\"), 1) FROM \"{table}\"))"
+            )
+            conn.commit()
+    print(f"  OK   {label}: {len(rows)} rows (upserted)")
+
+
 # ── DDL strings ───────────────────────────────────────────────────────────────
 
 _BLINKIT_DS_ELIGIBILITY = """
@@ -205,22 +234,20 @@ def phase1_schema():
 
     print("\n=== Phase 1c: Schema fixes ===")
 
-    # inventory: drop batch_id FK column — db.py inserts without it (NOT NULL blocks)
+    # inventory: ensure batch_id FK column exists (prod tracks inventory per-batch)
     _sql(cur,
-         "ALTER TABLE inventory DROP COLUMN IF EXISTS batch_id CASCADE",
-         "inventory: drop batch_id")
-    # Truncate stale inventory data before adding unique constraint — old rows
-    # have multiple entries per (item_id, channel_id) due to batch_id FK.
-    _sql(cur,
-         "TRUNCATE inventory RESTART IDENTITY CASCADE",
-         "inventory: truncate stale rows (replaced by prod data in Phase 5)")
+         "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS "
+         "batch_id INTEGER REFERENCES item_batches(batch_id)",
+         "inventory: ensure batch_id FK column exists")
+    # Drop the old over-restrictive unique constraint (prod allows multiple rows
+    # per item_id/channel_id, one per batch — required for per-batch tracking).
     _sql(cur,
          "ALTER TABLE inventory DROP CONSTRAINT IF EXISTS inventory_item_channel_uq",
-         "inventory: drop old unique constraint if any")
+         "inventory: drop over-restrictive unique constraint if present")
+    # Truncate inventory — phase 6 will upsert current prod stock values.
     _sql(cur,
-         "ALTER TABLE inventory ADD CONSTRAINT inventory_item_channel_uq "
-         "UNIQUE(item_id, channel_id)",
-         "inventory: add UNIQUE(item_id, channel_id)")
+         "TRUNCATE inventory RESTART IDENTITY CASCADE",
+         "inventory: truncate stale rows (phase 6 will reload from prod)")
 
     # inventory_transactions: unit_cost dropped in migration 004
     _sql(cur,
@@ -388,12 +415,14 @@ def phase5_load_master():
 
 def phase6_load_current_state():
     """Full copy of current-state tables from prod — these aren't date-filtered,
-    they represent a single live balance per row (stock on hand, open lots, etc)."""
+    they represent a single live balance per row (stock on hand, open lots, etc).
+    Uses _upsert_rows (not _insert_rows) so existing dev rows with stale values
+    (e.g. inventory.quantity_on_hand=0) are overwritten with prod's live figures."""
     print("\n=== Phase 6: Load current-state data (full copy) from prod ===")
-    _insert_rows("item_batches", _fetch_prod("item_batches"), pk_col="batch_id")
-    _insert_rows("sku_cogs_lots", _fetch_prod("sku_cogs_lots"), pk_col="lot_id")
-    _insert_rows("inventory", _fetch_prod("inventory"), pk_col="inv_id")
-    _insert_rows("sku_inventory", _fetch_prod("sku_inventory"), pk_col="sku_inv_id")
+    _upsert_rows("item_batches",   _fetch_prod("item_batches"),   pk_col="batch_id")
+    _upsert_rows("sku_cogs_lots",  _fetch_prod("sku_cogs_lots"),  pk_col="lot_id")
+    _upsert_rows("inventory",      _fetch_prod("inventory"),      pk_col="inv_id")
+    _upsert_rows("sku_inventory",  _fetch_prod("sku_inventory"),  pk_col="sku_inv_id")
     _insert_rows("blinkit_ds_sku_eligibility", _fetch_prod("blinkit_ds_sku_eligibility"))
 
 
