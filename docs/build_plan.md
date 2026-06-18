@@ -553,6 +553,13 @@ Daily check of SOH `damaged + lost` columns. Email to Himanshu when new losses a
 ### K2 — Amazon Lot Reconciliation
 Deferred until K1 is stable. Build `setup/refresh_amazon_lots.py` via SP-API `getInventorySummaries`. Wire to G1b in daily runner.
 
+### G2c + K1b — Queued (planned 18-Jun-2026, not yet started)
+Scope confirmed with Himanshu: build G2c (WH-level Blinkit COGS finalization — replaces state-level `finalize_blk_cogs()`) together with running/applying the K1b baseline reset, since resetting the baseline without G2c would just let lots drift again immediately (same Pune/Mumbai cross-WH bug). K1c (daily monitoring) and K1d (damaged/lost alert) explicitly deferred to a later session — not blocking.
+
+**Plan:** `docs/plans/groovy-yawning-summit.md` — covers: apply migration 024 to dev (WH name sync), review + apply K1b baseline diff with Himanshu sign-off (new `lot_reconciliation_log` table, migration 025), build `finalize_blk_cogs_wh_level()` in `tcb/inventory.py` (joins MTD sales × performance detail by sku/city/date, exact-WH FIFO consumption via existing `_consume_lots_fifo`, hold-not-partial on mismatch/missing data), rewire `daily_runner.py` so BLK COGS finalization runs after G5 (performance data) instead of right after G2.
+
+Verified during planning: all 1997 current BLK FULFILLED orders have `quantity=1` (order count = unit count, simplifies the join); 0 orders currently pending finalization (clean start, no backlog to catch up).
+
 ### K — Why before Phase E
 Phase E computes `days_cover = lot qty_remaining / daily_velocity`. Overstated lots → reorder triggers fire late → OOS. Lot data must be trustworthy before reorder automation goes live.
 

@@ -111,6 +111,14 @@ When adding a new automation or a new channel: place scraper output in `data/<ch
 
 Phase H is implemented. Core files: `tcb/replenishment.py` (engine + Excel), `ingest/blinkit_performance_loader.py` (DS master + ADS loader), `ingest/blinkit_inventory_loader.py` (SOH snapshot), `automation/blinkit_performance_scraper.py` (daily Playwright download).
 
+### Blinkit Performance Detail Report — the most important Blinkit data source
+
+The **Performance Detail report** (`blinkit_performance_detail` table) feeds nearly every Blinkit process: WH-level COGS finalization (G2c), demand/ADS calculation, the replenishment plan, and DS eligibility status. Before touching any of those, read the full column-by-column reference in memory: `.claude/memory/blinkit_perf_detail_columns.md` (APPROVED 2026-06-18).
+
+Two corrections to keep in mind so old assumptions don't creep back in:
+- `Considered for assessment (Y/N)` is the **primary eligibility gate** — a dark store-SKU-date with `Considered=N` is excluded entirely from ADS and replenishment, not just treated as a zero-sales day.
+- The WH-out-of-stock signal does **not** come from text-matching the Remarks column ("Insufficient Inventory at warehouse for transfers" is not parsed). It comes from `Considered=Y AND Available=0` rows, surfaced as a stock-out-days count per WH/SKU in the replenishment plan.
+
 ### Blinkit Seller Process (must understand before touching this system)
 
 Launching a SKU in a new city is a **3-step gate**:
@@ -165,16 +173,36 @@ effective_stock = wh_soh + units_incoming + units_in_transit
 - DS master is auto-refreshed from CSVs on every loader run (Pass 0a) — new DS are seeded, `is_active` is synced from latest file
 - **ES numbers are NOT globally unique across cities** — e.g. ES7 exists in both Faridabad and Kochi. DS unique codes use MD5 hash of full name, not ES number alone.
 
+### WH-Level COGS Finalization (G2c — agreed Jun 2026, not yet built)
+
+**State-level FIFO is SUPERSEDED.** It caused cross-WH lot attribution drift (e.g. Mumbai orders consuming Pune lots because both are Maharashtra). Do not extend state-level consumption.
+
+**New design:** Daily join of two reports at `(sku_id, customer_city, date)`:
+1. MTD sales report → order count by SKU + customer city
+2. Performance detail (`blinkit_performance_detail`) → WH attribution by `serving_wh` per city
+
+Result: each DELIVERED order is attributed to a specific WH → consume that WH's FIFO lot.
+
+**Mismatch rule:** If sales count ≠ perf detail count for any (sku, city, date) → hold COGS finalization for those units + email Himanshu. Never partially finalize.
+
+**Missing performance data:** If G5 (performance scraper) fails → hold ALL COGS finalization for that day + email alert. Payout backstop catches deferred days at payout time (uses state-level as last resort).
+
+**Job order:** G5 (performance scraper, 7-8 min) must complete → then G2c (WH-level finalization).
+
+**WH names:** `partner_locations.name` exactly matches `serving_wh` in performance detail after migration 024. Keep in sync if Blinkit renames any WH.
+
+**Baseline:** K1b resets lots = SOH before Jun 19. New system starts clean from Jun 19.
+
 ### WH Geography (Blinkit)
 
-| WH Code | WH Name | Key Cities Served |
+| WH Code | WH Name (exact, matches serving_wh) | Key Cities Served |
 |---------|---------|-------------------|
-| BLK_WH_1873 | Bengaluru B3 | Bengaluru + Ballari, Bidar, Hosur, Kurnool (outlying) |
-| BLK_WH_5397 | Bengaluru B5 | Bengaluru + all South India: Kochi, Coimbatore, Mysore, Mangaluru, Trivandrum, Davanagere, Manipal, Chikkamagaluru |
-| BLK_WH_2681 | Coimbatore C1 | Coimbatore (also partially served by B5) |
-| BLK_WH_5096 | Faridabad | Faridabad + NCR south |
-| BLK_WH_2010 | Kundli | NCR north/Haryana |
-| BLK_WH_2576 | Noida N1 | Noida/UP |
+| BLK_WH_1873 | Bengaluru B3 - Feeder | Bengaluru + Ballari, Bidar, Hosur, Kurnool (outlying) |
+| BLK_WH_5397 | Bengaluru B5 - Feeder | Bengaluru + all South India: Kochi, Coimbatore, Mysore, Mangaluru, Trivandrum, Davanagere, Manipal, Chikkamagaluru |
+| BLK_WH_2681 | Coimbatore C1 - Feeder | Coimbatore (also partially served by B5) |
+| BLK_WH_5096 | Faridabad - Feeder | Faridabad + NCR south |
+| BLK_WH_2010 | Kundli - Feeder | NCR north/Haryana |
+| BLK_WH_2576 | Noida N1 - Feeder | Noida/UP |
 | BLK_WH_3201 | Hyderabad H3 | Hyderabad + surrounding AP/Telangana |
 
 Full 20-WH mapping lives in `_PERF_WH_TO_CODE` dict in `tcb/replenishment.py`.
