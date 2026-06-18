@@ -156,12 +156,16 @@ def _send_whatsapp(amazon_result: dict, blinkit_result: dict, dry_run: bool) -> 
 def _run_soh() -> dict:
     """G4: Blinkit SOH scraper + ingest. Immediate download (~30 sec)."""
     logger.info("Blinkit SOH scraper (G4): starting...")
-    proc = subprocess.run(
-        [PYTHON, str(PROJECT / "automation" / "blinkit_soh_scraper.py")],
-        capture_output=True, text=True, cwd=str(PROJECT),
-        env={**os.environ, "TCB_ENV": "prod"},
-        timeout=120,  # 2-minute cap — download is immediate
-    )
+    try:
+        proc = subprocess.run(
+            [PYTHON, str(PROJECT / "automation" / "blinkit_soh_scraper.py")],
+            capture_output=True, text=True, cwd=str(PROJECT),
+            env={**os.environ, "TCB_ENV": "prod"},
+            timeout=120,  # 2-minute cap — download is immediate
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("Blinkit SOH scraper timed out after 120s.")
+        return {"status": "error", "exit_code": "timeout", "stderr": "Timed out after 120s"}
 
     if proc.returncode == 0:
         logger.info("Blinkit SOH scraper: OK — %s", proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "done")
@@ -177,12 +181,16 @@ def _run_soh() -> dict:
 def _run_performance() -> dict:
     """G5: Blinkit performance scraper + loader. Runs last — download takes 7-8 min."""
     logger.info("Blinkit performance scraper (G5): starting...")
-    proc = subprocess.run(
-        [PYTHON, str(PROJECT / "automation" / "blinkit_performance_scraper.py")],
-        capture_output=True, text=True, cwd=str(PROJECT),
-        env={**os.environ, "TCB_ENV": "prod"},
-        timeout=720,  # 12-minute hard cap (download is 7-8 min + ingest overhead)
-    )
+    try:
+        proc = subprocess.run(
+            [PYTHON, str(PROJECT / "automation" / "blinkit_performance_scraper.py")],
+            capture_output=True, text=True, cwd=str(PROJECT),
+            env={**os.environ, "TCB_ENV": "prod"},
+            timeout=900,  # 15-minute hard cap (download is 7-8 min + ingest overhead, which has grown with file size)
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("Blinkit performance scraper timed out after 900s.")
+        return {"status": "error", "exit_code": "timeout", "stderr": "Timed out after 900s"}
 
     if proc.returncode == 0:
         logger.info("Blinkit performance scraper: OK — %s", proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "done")
@@ -396,4 +404,23 @@ if __name__ == "__main__":
                         help="Run ingestion but skip WhatsApp send")
     args = parser.parse_args()
 
-    sys.exit(run(dry_run=args.dry_run))
+    try:
+        sys.exit(run(dry_run=args.dry_run))
+    except SystemExit:
+        raise
+    except Exception:
+        logger.exception("Daily runner crashed with an unhandled exception")
+        try:
+            from automation.email_sender import send_alert
+            today = date.today().strftime("%d-%b")
+            log = f"automation/logs/daily_runner_{date.today().strftime('%Y%m%d')}.log"
+            send_alert(
+                subject=f"🔴 Daily Runner CRASHED ({today})",
+                body=(
+                    f"daily_runner.py crashed with an unhandled exception and stopped mid-run.\n\n"
+                    f"See traceback in log: {log}"
+                ),
+            )
+        except Exception:
+            logger.exception("Could not send crash alert email")
+        sys.exit(3)
