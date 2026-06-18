@@ -60,6 +60,7 @@ for _k, _v in [
     ("pending_wo",       None),
     ("ret_key",          0),
     ("ret_success",      None),
+    ("ret_error",        None),
     ("returning",        False),
     ("pending_ret",      None),
     ("recv_form_key",    0),
@@ -427,7 +428,9 @@ with tab_ship:
                 try:
                     if p["level"] == "sku":
                         writeoff_sku(row["sku"], row["qty"],
-                                     reason=p["reason"], notes=p["wo_notes"], created_by="app")
+                                     reason=p["reason"], notes=p["wo_notes"], created_by="app",
+                                     from_channel_id=p.get("from_channel_id"),
+                                     partner_location_id=p.get("partner_location_id"))
                         st.write(f"Written off {row['qty']}x {row['sku']}")
                     else:
                         writeoff_item(row["item_id"], row["qty"],
@@ -445,7 +448,8 @@ with tab_ship:
                 wo_str = ", ".join(f"{r['qty']}x {r['sku']}" for r in p["to_wo"])
             else:
                 wo_str = ", ".join(f"{r['qty']}x {r['item_name']}" for r in p["to_wo"])
-            st.session_state.wo_success = f"Written off [{p['reason']}] -- {wo_str}"
+            loc = p.get("location_label", "Own Warehouse")
+            st.session_state.wo_success = f"Written off [{p['reason']}] from {loc} — {wo_str}"
         else:
             st.session_state.wo_error = "Write-off failed:\n" + "\n".join(errors)
         st.session_state.writing_off = False
@@ -512,15 +516,52 @@ with tab_ship:
         wo_notes = st.text_input("Notes (optional)", key=f"wo_notes_{st.session_state.wo_key}")
 
         if writeoff_level.startswith("📦"):
+            # Stock can be sitting at OWN_WH or at a partner SOR WH (e.g. Blinkit
+            # damaged/lost per SOH) — partner stock position lives only in
+            # sku_cogs_lots, never in sku_inventory.
+            sor_channels_wo = [c for c in all_channels if c["business_model"] == "SOR"]
+            wo_loc_opts = {"🏠 Own Warehouse": None} | {c["name"]: c for c in sor_channels_wo}
+            wo_loc_label = st.selectbox("Where is this stock located?",
+                                         list(wo_loc_opts.keys()), key=f"wo_loc_sel_{st.session_state.wo_key}")
+            wo_channel = wo_loc_opts[wo_loc_label]
+
+            wo_from_channel_id = None
+            wo_partner_location_id = None
+            wo_sor_wh_missing = False
+            if wo_channel is not None:
+                wo_from_channel_id = wo_channel["channel_id"]
+                sor_whs_wo = load_sor_whs(wo_from_channel_id)
+                if sor_whs_wo:
+                    wh_wo_opts = {f"{w['name']} ({w['city']})": w for w in sor_whs_wo}
+                    wh_wo_label = st.selectbox(f"{wo_loc_label} Warehouse",
+                                                list(wh_wo_opts.keys()), key=f"wo_sor_wh_{st.session_state.wo_key}")
+                    wo_partner_location_id = wh_wo_opts[wh_wo_label]["location_id"]
+                else:
+                    st.warning(f"No active warehouses found for {wo_loc_label}. Add one in partner_locations.")
+                    wo_sor_wh_missing = True
+
             st.markdown("**Enter quantities to write off:**")
-            sku_stock_wo = {r["sku_id"]: r["qty_on_hand"] for r in get_sku_stock()}
+            if wo_from_channel_id is None:
+                sku_stock_wo = {r["sku_id"]: r["qty_on_hand"] for r in get_sku_stock()}
+            elif wo_sor_wh_missing:
+                sku_stock_wo = {}
+            else:
+                lot_rows_wo  = (db.table("sku_cogs_lots")
+                                   .select("sku_id, qty_remaining")
+                                   .eq("channel_id", wo_from_channel_id)
+                                   .eq("partner_location_id", wo_partner_location_id)
+                                   .gt("qty_remaining", 0)
+                                   .execute().data)
+                sku_stock_wo = {}
+                for r in lot_rows_wo:
+                    sku_stock_wo[r["sku_id"]] = sku_stock_wo.get(r["sku_id"], 0) + r["qty_remaining"]
             wo_rows = [
                 {"SKU": s["sku_id"], "Name": s["name"],
                  "In Stock": sku_stock_wo.get(s["sku_id"], 0), "Write-off Qty": 0}
                 for s in load_skus() if sku_stock_wo.get(s["sku_id"], 0) > 0
             ]
             if not wo_rows:
-                st.info("No assembled SKU stock to write off.")
+                st.info("No assembled SKU stock to write off at this location.")
             else:
                 wo_edited = st.data_editor(
                     pd.DataFrame(wo_rows),
@@ -535,15 +576,24 @@ with tab_ship:
                 )
                 if st.button("Write Off ✅", type="primary", key="wo_sku_btn"):
                     to_wo = wo_edited[wo_edited["Write-off Qty"] > 0]
-                    if len(to_wo) == 0:
+                    if wo_sor_wh_missing:
+                        st.error(f"❌ Select a {wo_loc_label} warehouse before recording this write-off.")
+                    elif len(to_wo) == 0:
                         st.error("Enter at least one quantity.")
                     else:
+                        if wo_from_channel_id is None:
+                            location_label = "Own Warehouse"
+                        else:
+                            location_label = f"{wo_loc_label} — {wh_wo_label}"
                         st.session_state.writing_off = True
                         st.session_state.pending_wo  = {
-                            "level":    "sku",
-                            "reason":   reason,
-                            "wo_notes": wo_notes,
-                            "to_wo":    [{"sku": r["SKU"], "qty": int(r["Write-off Qty"])}
+                            "level":               "sku",
+                            "reason":              reason,
+                            "wo_notes":            wo_notes,
+                            "from_channel_id":     wo_from_channel_id,
+                            "partner_location_id": wo_partner_location_id,
+                            "location_label":      location_label,
+                            "to_wo":               [{"sku": r["SKU"], "qty": int(r["Write-off Qty"])}
                                          for _, r in to_wo.iterrows()],
                         }
                         st.rerun()
@@ -844,11 +894,12 @@ with tab_returns:
                 try:
                     if p["level"] == "sku":
                         return_sku(
-                            sku_id          = row["sku"],
-                            qty             = row["qty"],
-                            from_channel_id = p["ch_ret_channel_id"],
-                            notes           = p["full_notes"],
-                            created_by      = "app",
+                            sku_id              = row["sku"],
+                            qty                 = row["qty"],
+                            from_channel_id     = p["ch_ret_channel_id"],
+                            partner_location_id = p.get("partner_location_id"),
+                            notes               = p["full_notes"],
+                            created_by          = "app",
                         )
                         st.write(f"Returned {row['qty']}× {row['sku']}")
                     else:
@@ -867,14 +918,14 @@ with tab_returns:
                 label="Return recorded" if not errors else "Completed with errors",
                 state="complete" if not errors else "error",
             )
-        for msg in errors:
-            st.error(msg)
         if not errors:
             if p["level"] == "sku":
                 ret_str = ", ".join(f"{r['qty']}× {r['sku']}" for r in p["to_ret"])
             else:
                 ret_str = ", ".join(f"{r['qty']}× {r['item_name']}" for r in p["to_ret"])
             st.session_state.ret_success = f"✅ Returned from **{p['ch_ret_label']}** — {ret_str}"
+        else:
+            st.session_state.ret_error = "Return failed:\n" + "\n".join(errors)
         st.session_state.returning    = False
         st.session_state.pending_ret  = None
         st.session_state.ret_key     += 1
@@ -887,6 +938,12 @@ with tab_returns:
         if st.button("Dismiss ✕", key="dismiss_ret"):
             pass
         st.session_state.ret_success = None
+
+    if st.session_state.ret_error:
+        st.error(st.session_state.ret_error)
+        if st.button("Dismiss ✕", key="dismiss_ret_err"):
+            pass
+        st.session_state.ret_error = None
 
     # ── Form ─────────────────────────────────────────────────────────────────
     all_channels_ret = load_channels()
@@ -905,6 +962,23 @@ with tab_returns:
     ret_notes     = st.text_input("Notes (optional)",     key=f"ret_notes_{st.session_state.ret_key}")
 
     if return_type.startswith("📦"):
+        # SOR channels (Blinkit) hold lots per-WH — must know which WH this is
+        # returning from, or the lot consumed/restored won't match the real one.
+        ret_partner_location_id = None
+        ret_sor_wh_missing = False
+        if ch_ret["business_model"] == "SOR":
+            sor_whs_ret = load_sor_whs(ch_ret["channel_id"])
+            if sor_whs_ret:
+                wh_ret_opts = {f"{w['name']} ({w['city']})": w for w in sor_whs_ret}
+                wh_ret_label = st.selectbox(
+                    f"{ch_ret_label} Warehouse — which WH is this recall returning from?",
+                    list(wh_ret_opts.keys()), key=f"ret_sor_wh_{st.session_state.ret_key}",
+                )
+                ret_partner_location_id = wh_ret_opts[wh_ret_label]["location_id"]
+            else:
+                st.warning(f"No active warehouses found for {ch_ret_label}. Add one in partner_locations.")
+                ret_sor_wh_missing = True
+
         st.markdown("**Enter return qty for each SKU:**")
         skus_ret = load_skus()
         ret_sku_rows = [
@@ -923,17 +997,20 @@ with tab_returns:
         )
         if st.button("Inward Return ✅", type="primary", key="ret_sku_btn"):
             to_ret = ret_sku_edited[ret_sku_edited["Return Qty"] > 0]
-            if len(to_ret) == 0:
+            if ret_sor_wh_missing:
+                st.error(f"❌ Select a {ch_ret_label} warehouse before recording this return.")
+            elif len(to_ret) == 0:
                 st.error("Enter at least one quantity.")
             else:
                 full_notes = f"Return from {ch_ret_label} | {ret_reference} | {ret_notes}".strip(" |")
                 st.session_state.returning   = True
                 st.session_state.pending_ret = {
-                    "level":             "sku",
-                    "ch_ret_label":      ch_ret_label,
-                    "ch_ret_channel_id": ch_ret["channel_id"],
-                    "full_notes":        full_notes,
-                    "to_ret":            [{"sku": r["SKU"], "qty": int(r["Return Qty"])}
+                    "level":               "sku",
+                    "ch_ret_label":        ch_ret_label,
+                    "ch_ret_channel_id":   ch_ret["channel_id"],
+                    "partner_location_id": ret_partner_location_id,
+                    "full_notes":          full_notes,
+                    "to_ret":              [{"sku": r["SKU"], "qty": int(r["Return Qty"])}
                                           for _, r in to_ret.iterrows()],
                 }
                 st.rerun()

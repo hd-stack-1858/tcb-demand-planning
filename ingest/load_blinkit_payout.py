@@ -170,7 +170,9 @@ def _load_returns(
 
     Skips rows whose (forward_invoice_id, item_id) belongs to a CANCELLED forward order.
     Uses item_id (col 15) to resolve the exact line item for multi-SKU orders.
-    Returns list of {order_id, return_date} update dicts for genuine SALE_RETURN orders.
+    Returns list of {order_id, return_date, supply_state} update dicts for genuine
+    SALE_RETURN orders. supply_state (col 10) is used to restore the lot the unit
+    lands back in at Blinkit — see _restore_lot_for_return().
     """
     updates: list[dict] = []
     unmatched = 0
@@ -181,6 +183,7 @@ def _load_returns(
 
         fwd_invoice_id = str(raw[1]) if raw[1] else None
         return_date_raw = raw[5]
+        supply_state = str(raw[10]).strip() if raw[10] else None
         return_item_id = str(raw[15]) if len(raw) > 15 and raw[15] else None
 
         if not fwd_invoice_id:
@@ -203,7 +206,7 @@ def _load_returns(
         except ValueError:
             return_date = None
 
-        updates.append({"order_id": order_id, "return_date": return_date})
+        updates.append({"order_id": order_id, "return_date": return_date, "supply_state": supply_state})
 
     if unmatched:
         logger.warning("%d return rows had no matching Forward Order", unmatched)
@@ -300,6 +303,8 @@ def _flag_daily_not_in_payout(db, delivered_rows: list[dict]) -> int:
 
 def load_payout_folder(folder: Path, db, dry_run: bool = False) -> tuple[int, int, int]:
     """Load one payout folder. Returns (new_orders, skipped_orders, returns_marked)."""
+    from tcb.inventory import restore_lot_on_confirmed_return
+
     payout_file = folder / _PAYOUT_FILE
     if not payout_file.exists():
         raise FileNotFoundError(f"{_PAYOUT_FILE} not found in {folder}")
@@ -367,7 +372,30 @@ def load_payout_folder(folder: Path, db, dry_run: bool = False) -> tuple[int, in
 
     # Mark genuine customer returns
     returns_marked = 0
+    lots_restored = 0
     for upd in return_updates:
+        existing = (
+            db.table("orders")
+            .select("sku_id, quantity, cogs, lot_cogs_finalized")
+            .eq("order_id", upd["order_id"])
+            .eq("channel_id", BLK_CHANNEL_ID)
+            .execute().data
+        )
+        if existing and existing[0]["lot_cogs_finalized"] and existing[0]["cogs"] is not None:
+            qty = int(existing[0]["quantity"])
+            if qty > 0:
+                unit_cogs = round(float(existing[0]["cogs"]) / qty, 4)
+                restore_lot_on_confirmed_return(
+                    existing[0]["sku_id"], qty, unit_cogs, BLK_CHANNEL_ID,
+                    supply_state=upd.get("supply_state"),
+                )
+                lots_restored += 1
+            else:
+                logger.warning(
+                    "Order %s is lot_cogs_finalized with quantity=0 — skipping lot restore",
+                    upd["order_id"],
+                )
+
         result = (
             db.table("orders")
             .update({"status": "SALE_RETURN",
@@ -378,6 +406,9 @@ def load_payout_folder(folder: Path, db, dry_run: bool = False) -> tuple[int, in
         )
         if result.data:
             returns_marked += 1
+
+    if lots_restored:
+        logger.info("BLK lots restored for confirmed returns: %d", lots_restored)
 
     return new_count, skipped, returns_marked
 

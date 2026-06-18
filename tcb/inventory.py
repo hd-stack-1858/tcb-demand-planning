@@ -932,8 +932,8 @@ def record_outright_transfer(sku_id, qty, channel_id, reference="",
         }).execute()
 
 
-def return_sku(sku_id, qty, from_channel_id, partner_location_id=None,
-               notes="", created_by="app"):
+def return_sku(sku_id, qty, from_channel_id,
+               notes="", created_by="app", partner_location_id=None):
     """
     Return assembled SKU from a partner back into OWN_WH stock.
     For TRANSFER_OUT channels (SOR/FBA/OUTRIGHT): consumes partner lots and
@@ -1017,6 +1017,51 @@ def return_sku(sku_id, qty, from_channel_id, partner_location_id=None,
         )
 
 
+def restore_lot_on_confirmed_return(sku_id, qty, unit_cogs, channel_id,
+                                    supply_state=None, created_by="system"):
+    """
+    Restore qty units to a partner-channel lot when a previously-consumed sale is
+    confirmed returned (e.g. a Blinkit payout file's Cancelled/Returned tab flips an
+    order to SALE_RETURN after its lot was already consumed at sale time, or the
+    equivalent for Amazon). The unit goes back into the partner's own sellable stock
+    — not OWN_WH (that's return_sku()'s job for physical recalls).
+
+    Picks any active WH-type location in supply_state so the restored unit stays
+    eligible for tier-1 state-level FIFO matching in consume_sor_sale(); falls back
+    to a NULL-location lot (still reachable via tier-2 channel-wide pool) when no
+    supply_state or no matching WH is found.
+    """
+    db = get_client()
+    qty = int(qty)
+
+    location_id = None
+    if supply_state:
+        loc = (db.table("partner_locations")
+                 .select("location_id")
+                 .eq("channel_id", channel_id)
+                 .eq("state", supply_state)
+                 .eq("location_type", "WH")
+                 .eq("is_active", True)
+                 .limit(1).execute().data)
+        if loc:
+            location_id = loc[0]["location_id"]
+
+    _upsert_lot(db, sku_id, channel_id, location_id, date.today(), unit_cogs, qty)
+
+    txn = {
+        "type":          "TRANSFER_IN",
+        "sku_id":        sku_id,
+        "to_channel_id": channel_id,
+        "quantity":      qty,
+        "unit_cogs":     unit_cogs,
+        "notes":         "Customer return confirmed — lot restored to partner sellable stock",
+        "created_by":    created_by,
+    }
+    if location_id is not None:
+        txn["partner_location_id"] = location_id
+    db.table("sku_inventory_transactions").insert(txn).execute()
+
+
 def return_item(item_id, qty, from_channel_id=None, notes="", created_by="app"):
     """
     Return individual item/packaging component to OWN_WH.
@@ -1061,9 +1106,6 @@ def return_item(item_id, qty, from_channel_id=None, notes="", created_by="app"):
         }).execute()
         batch_id = result.data[0]["batch_id"]
 
-    if supplier_id is not None:
-        db.table("items").update({"latest_supplier_id": supplier_id}).eq("item_id", item_id).execute()
-
     existing_inv = (db.table("inventory")
                       .select("inv_id, quantity_on_hand")
                       .eq("item_id", item_id)
@@ -1096,34 +1138,44 @@ def return_item(item_id, qty, from_channel_id=None, notes="", created_by="app"):
     }).execute()
 
 
-def writeoff_sku(sku_id, qty, reason, notes="", created_by="app"):
-    """Write off assembled SKU qty from OWN_WH (Lost / Damaged / QC Reject).
-    Consumes COGS lots FIFO."""
+def writeoff_sku(sku_id, qty, reason, notes="", created_by="app",
+                 from_channel_id=None, partner_location_id=None):
+    """Write off assembled SKU qty (Lost / Damaged / QC Reject). Consumes COGS lots FIFO.
+    Defaults to OWN_WH. Pass from_channel_id/partner_location_id to write off stock at a
+    partner location (e.g. Blinkit SOH damaged/lost) — partner channel stock position
+    lives only in sku_cogs_lots, so sku_inventory.qty_on_hand is untouched in that case."""
     db = get_client()
     own_wh_id = _own_wh_id()
     qty = int(qty)
+    channel_id = own_wh_id if from_channel_id is None else from_channel_id
 
-    inv = (db.table("sku_inventory").select("sku_inv_id, qty_on_hand")
-             .eq("sku_id", sku_id).eq("channel_id", own_wh_id).execute().data)
-    available = inv[0]["qty_on_hand"] if inv else 0
-    if available < qty:
-        raise ValueError(f"Insufficient SKU stock: need {qty}, have {available}")
+    if channel_id == own_wh_id:
+        inv = (db.table("sku_inventory").select("sku_inv_id, qty_on_hand")
+                 .eq("sku_id", sku_id).eq("channel_id", own_wh_id).execute().data)
+        available = inv[0]["qty_on_hand"] if inv else 0
+        if available < qty:
+            raise ValueError(f"Insufficient SKU stock: need {qty}, have {available}")
 
-    _, unit_cogs = _consume_lots_fifo(db, sku_id, own_wh_id, qty)
+    _, unit_cogs = _consume_lots_fifo(db, sku_id, channel_id, qty,
+                                       partner_location_id=partner_location_id)
 
-    db.table("sku_inventory").update(
-        {"qty_on_hand": available - qty, "last_updated": _now()}
-    ).eq("sku_inv_id", inv[0]["sku_inv_id"]).execute()
+    if channel_id == own_wh_id:
+        db.table("sku_inventory").update(
+            {"qty_on_hand": available - qty, "last_updated": _now()}
+        ).eq("sku_inv_id", inv[0]["sku_inv_id"]).execute()
 
-    db.table("sku_inventory_transactions").insert({
+    txn = {
         "type":            "ADJUSTMENT",
         "sku_id":          sku_id,
-        "from_channel_id": own_wh_id,
+        "from_channel_id": channel_id,
         "quantity":        qty,
         "unit_cogs":       unit_cogs,
         "notes":           f"[WRITE-OFF: {reason}] {notes}".strip(),
         "created_by":      created_by,
-    }).execute()
+    }
+    if partner_location_id is not None:
+        txn["partner_location_id"] = partner_location_id
+    db.table("sku_inventory_transactions").insert(txn).execute()
 
 
 def writeoff_item(item_id, qty, reason, notes="", created_by="app"):
