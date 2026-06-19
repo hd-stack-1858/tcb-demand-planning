@@ -59,7 +59,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
         logging.FileHandler(str(log_file), encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
+        logging.StreamHandler(open(sys.stdout.fileno(), mode="w", encoding="utf-8", buffering=1)),
     ],
 )
 logger = logging.getLogger(__name__)
