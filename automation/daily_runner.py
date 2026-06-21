@@ -5,7 +5,7 @@ Sequence:
   12:01  → G1: Amazon SP-API (orders + finances)
   12:01  → G2: Blinkit scraper (MTD sales)
   ~12:15 → G3: WhatsApp briefing (after G1 + G2 complete)
-  ~12:15 → G4: Blinkit SOH scraper + ingest (immediate download, ~30 sec)
+  ~12:15 → G4: Blinkit SOH scraper + ingest (download + ingest, ~1-3 min)
   ~12:16 → G5: Blinkit performance scraper + loader (7-8 min download)
   ~12:25 → G6: Dev DB ping (keep Supabase free-tier active — prevent 7-day auto-pause)
 
@@ -154,18 +154,18 @@ def _send_whatsapp(amazon_result: dict, blinkit_result: dict, dry_run: bool) -> 
 
 
 def _run_soh() -> dict:
-    """G4: Blinkit SOH scraper + ingest. Immediate download (~30 sec)."""
+    """G4: Blinkit SOH scraper + ingest. Download is immediate; portal nav + DB ingest add up."""
     logger.info("Blinkit SOH scraper (G4): starting...")
     try:
         proc = subprocess.run(
             [PYTHON, str(PROJECT / "automation" / "blinkit_soh_scraper.py")],
             capture_output=True, text=True, cwd=str(PROJECT),
             env={**os.environ, "TCB_ENV": "prod"},
-            timeout=120,  # 2-minute cap — download is immediate
+            timeout=240,  # 4-minute cap — sum of internal Playwright step timeouts can exceed 2 min on a slow portal day
         )
     except subprocess.TimeoutExpired:
-        logger.error("Blinkit SOH scraper timed out after 120s.")
-        return {"status": "error", "exit_code": "timeout", "stderr": "Timed out after 120s"}
+        logger.error("Blinkit SOH scraper timed out after 240s.")
+        return {"status": "error", "exit_code": "timeout", "stderr": "Timed out after 240s"}
 
     if proc.returncode == 0:
         logger.info("Blinkit SOH scraper: OK — %s", proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "done")
