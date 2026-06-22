@@ -948,10 +948,26 @@ def _run_once(dry_run: bool = False, headed: bool = False, no_email: bool = Fals
                         break
 
                 if not ship_cols:
-                    logger.warning(
-                        "Orders were accepted but challan not yet available after ~60s. "
-                        "Likely past FnP's evening cutoff — challan will appear in tomorrow's run."
+                    msg = (
+                        f"{result['allocated_accepted']} order(s) were ACCEPTED on FnP but "
+                        f"0 challan(s) were available after ~60s of retrying. "
+                        f"Likely a FUTURE-dated order — it should appear in tomorrow's run. "
+                        f"CHECK: log in to partner.fnp.com and confirm the order is sitting in "
+                        f"the 'Orders to be shipped' FUTURE bucket. If not, contact FnP support."
                     )
+                    logger.warning(msg)
+                    result["challan_gap"] = result["allocated_accepted"]
+                    if not dry_run and not no_email:
+                        from automation.email_sender import send_alert
+                        try:
+                            send_alert(
+                                f"⚠️ FnP Challan — {date.today().strftime('%d-%b-%Y')} "
+                                f"(0 of {result['allocated_accepted']} challan, full gap) [ACTION NEEDED]",
+                                f"Hi,\n\n*** ACTION NEEDED ***\n{msg}\n*********************\n\n"
+                                f"— Vignesh (automated)\n",
+                            )
+                        except Exception:
+                            logger.exception("Failed to send full-gap alert email.")
                     browser.close()
                     return result
 
