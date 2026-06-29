@@ -306,12 +306,17 @@ def _select_all(page) -> None:
             if (!cb) return {found: false};
             cb.scrollIntoView({behavior: 'instant', block: 'center'});
             cb.click();
+            // Force Angular digest so ng-model/ng-click bindings propagate immediately.
+            try {
+                const $rootScope = angular.element(document).injector().get('$rootScope');
+                $rootScope.$apply();
+            } catch (e) { /* angular not available or not needed */ }
             return {found: true, id: cb.id, checked: cb.checked};
         }
     """)
     logger.info("Select All result: %s", result)
     if result and result.get("found"):
-        time.sleep(1)
+        time.sleep(2)  # Extra sleep so Angular digest cycle fully propagates selectall to rows
         return
     logger.warning("No 'Select All' checkbox found.")
 
@@ -374,13 +379,23 @@ def _click_accept(page) -> None:
     logger.info("ACCEPT clicked.")
 
 
-def _wait_for_table_rows(page, timeout_each: int = 6_000) -> bool:
+def _wait_for_table_rows(page, timeout_each: int = 15_000) -> bool:
     """
     Wait for Angular to render order rows after navigating to a list page.
     Angular fetches rows via XHR after the load event — the heading appears
     instantly but rows can lag by 1–3 s.  Returns True if rows are found.
+
+    FnP uses div[ng-repeat="order in globalOrderListTobeRender"] for order rows,
+    NOT tbody/tr — so the tbody/tr selectors are fallbacks for structural changes.
     """
-    for sel in ["tbody tr", "table tr", "[ng-repeat]", "tr td"]:
+    # FnP-specific: order rows are DIVs with ng-repeat, not table rows.
+    for sel in [
+        'div[ng-repeat="order in globalOrderListTobeRender"]',
+        "tbody tr",
+        "table tr",
+        "[ng-repeat]",
+        "tr td",
+    ]:
         try:
             page.wait_for_selector(sel, timeout=timeout_each)
             time.sleep(0.5)
@@ -390,6 +405,40 @@ def _wait_for_table_rows(page, timeout_each: int = 6_000) -> bool:
             continue
     logger.warning("Table rows not detected — proceeding anyway (Select All may find nothing).")
     return False
+
+
+def _wait_for_row_checkboxes(page, expected: int = 1, timeout_s: int = 20) -> None:
+    """
+    Wait until Angular has rendered actual order rows and bound their checkboxes.
+    FnP uses div[ng-repeat="order in globalOrderListTobeRender"] for rows (not tbody/tr),
+    so we look for checkboxes inside those divs.
+    """
+    for attempt in range(timeout_s):
+        n = page.evaluate("""
+            () => {
+                const rows = document.querySelectorAll(
+                    'div[ng-repeat="order in globalOrderListTobeRender"]'
+                );
+                let total = 0;
+                rows.forEach(r => {
+                    total += r.querySelectorAll('input[type="checkbox"]').length;
+                });
+                // Fallback: any checkbox that isn't the header selectall
+                if (total === 0) {
+                    const all = document.querySelectorAll('input[type="checkbox"]');
+                    total = [...all].filter(c => c.id !== 'selectall'
+                        && c.id !== 'selectisOccasionProduct').length;
+                }
+                return total;
+            }
+        """)
+        if n >= expected:
+            logger.info("Row checkboxes ready: %d found (expected %d).", n, expected)
+            return
+        if attempt == 0:
+            logger.info("Waiting for row checkboxes in order divs (expected %d, found 0)...", expected)
+        time.sleep(1)
+    logger.warning("Row checkboxes not found after %ds — proceeding.", timeout_s)
 
 
 def _click_branding_challan(page) -> Path:
@@ -981,6 +1030,8 @@ def _run_once(dry_run: bool = False, headed: bool = False, no_email: bool = Fals
                 # Wait for Angular XHR to populate table rows BEFORE clicking Select All.
                 # Without this wait the checkbox fires before rows exist → 0-byte download.
                 _wait_for_table_rows(page)
+                expected_rows = count if count > 0 else col_count
+                _wait_for_row_checkboxes(page, expected=expected_rows)
                 _select_all(page)
                 pdf = _click_branding_challan(page)
                 pdf_paths.append(pdf)
