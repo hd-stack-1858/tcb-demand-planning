@@ -387,7 +387,7 @@ def scrape(headed: bool = False) -> Path:
         expected_name = f'blinkit_performance_detail_{today_prefix}.csv'
         logger.info('Clicking Detailed Report and waiting for CSV (up to 10 min)...')
 
-        with page.expect_download(timeout=600_000) as dl_info:  # 10-minute timeout
+        with page.expect_download(timeout=900_000) as dl_info:  # 15-minute timeout (file is ~85K rows now)
             detailed_clicked = False
             for label in ['Detailed Report', 'Detailed', 'Detail Report']:
                 # Try JS click FIRST — it's instant and avoids the dropdown auto-closing

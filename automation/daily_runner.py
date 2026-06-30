@@ -186,11 +186,12 @@ def _run_performance() -> dict:
             [PYTHON, str(PROJECT / "automation" / "blinkit_performance_scraper.py")],
             capture_output=True, text=True, cwd=str(PROJECT),
             env={**os.environ, "TCB_ENV": "prod"},
-            timeout=900,  # 15-minute hard cap (download is 7-8 min + ingest overhead, which has grown with file size)
+            timeout=1800,  # 30-minute hard cap (file is 85K rows; download up to 15 min + ingest ~5 min on busy portal days)
         )
-    except subprocess.TimeoutExpired:
-        logger.error("Blinkit performance scraper timed out after 900s.")
-        return {"status": "error", "exit_code": "timeout", "stderr": "Timed out after 900s"}
+    except subprocess.TimeoutExpired as exc:
+        captured = (exc.stderr or "")[-1000:]
+        logger.error("Blinkit performance scraper timed out after 900s.\nLast output:\n%s", captured)
+        return {"status": "error", "exit_code": "timeout", "stderr": f"Timed out after 900s\n{captured}"}
 
     if proc.returncode == 0:
         logger.info("Blinkit performance scraper: OK — %s", proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "done")
