@@ -68,6 +68,10 @@ CHANNEL_COLOR_MAP = {
     "D2C":            "#222222",
 }
 
+# Channels billed by purchase order (bulk invoice) — current-month data must NOT be
+# linearly projected because one billing early in the month ≠ daily run-rate.
+OUTRIGHT_CHANNELS = {"Peeko", "Kiddo"}
+
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
@@ -168,11 +172,14 @@ def _cur_mult() -> float:
 
 
 def _project_col(df: pd.DataFrame, value_col: str, mult: float) -> pd.DataFrame:
-    """Scale current-month rows by mult, rounded to nearest whole number."""
+    """Scale current-month rows by mult, rounded to nearest whole number.
+    Outright channels (Peeko, Kiddo) are billed by PO and are never projected."""
     today  = date.today()
     cur_ts = pd.Timestamp(date(today.year, today.month, 1))
     out    = df.copy()
     mask   = out["month_dt"] == cur_ts
+    if "channel_name" in out.columns:
+        mask = mask & ~out["channel_name"].isin(OUTRIGHT_CHANNELS)
     out.loc[mask, value_col] = (out.loc[mask, value_col] * mult).round(0)
     return out
 
@@ -357,11 +364,15 @@ def tab_overview(raw_df: pd.DataFrame, fdf: pd.DataFrame, net_mode: bool, filter
     mtd_rev   = cur["gross_value"].sum()
     data_days = max(today.day - 1, 1)
     mult = days_in_month / data_days
+    cur_out  = cur[cur["channel_name"].isin(OUTRIGHT_CHANNELS)]
+    cur_reg  = cur[~cur["channel_name"].isin(OUTRIGHT_CHANNELS)]
+    proj_units = round(cur_reg["quantity"].sum() * mult) + int(cur_out["quantity"].sum())
+    proj_rev   = cur_reg["gross_value"].sum() * mult + cur_out["gross_value"].sum()
     st.info(
         f"**{today.strftime('%b %Y')} projection:** "
         f"{mtd_units:,} units so far ({data_days} of {days_in_month} days) "
-        f"→ **~{round(mtd_units * mult):,} units** projected | "
-        f"{fmt_inr(mtd_rev)} revenue so far → **~{fmt_inr(mtd_rev * mult)}** projected"
+        f"→ **~{proj_units:,} units** projected | "
+        f"{fmt_inr(mtd_rev)} revenue so far → **~{fmt_inr(proj_rev)}** projected"
     )
 
     velocity_snapshot(filtered_raw)
@@ -575,7 +586,7 @@ def tab_trends(fdf: pd.DataFrame, net_mode: bool):
         for ch in channels:
             vals   = [_ch_val(ch, p, metric) for p in periods]
             avg    = _nanavg(vals[1:])
-            m_proj = vals[0] * mult if project else vals[0]
+            m_proj = vals[0] if (not project or ch in OUTRIGHT_CHANNELS) else vals[0] * mult
             rows.append({
                 "Channel": ch,
                 col_m:   fmt_fn(m_proj),
@@ -588,7 +599,11 @@ def tab_trends(fdf: pd.DataFrame, net_mode: bool):
             })
         totals = [_total_val(p, metric) for p in periods]
         t_avg  = _nanavg(totals[1:])
-        t_proj = totals[0] * mult if project else totals[0]
+        if project and metric not in ("asp", "cart_size"):
+            out_total = sum(_ch_val(ch, periods[0], metric) for ch in channels if ch in OUTRIGHT_CHANNELS)
+            t_proj    = (totals[0] - out_total) * mult + out_total
+        else:
+            t_proj = totals[0]
         rows.append({
             "Channel": "TOTAL",
             col_m:   fmt_fn(t_proj),
@@ -663,8 +678,17 @@ def tab_channel(fdf: pd.DataFrame, net_mode: bool):
     mult = _cur_mult()
     pm   = [_period_metrics(cdf, cur_period - i) for i in range(4)]
     M_raw, M1, M2, M3 = pm
-    # Project current month: scale counts/revenue; asp and aov are ratios — don't scale
-    M   = {k: (v * mult if k not in ("asp", "aov") else v) for k, v in M_raw.items()}
+    # Outright channels are billed by PO — exclude them from projection, keep actuals
+    cdf_reg = cdf[~cdf["channel_name"].isin(OUTRIGHT_CHANNELS)]
+    cdf_out = cdf[cdf["channel_name"].isin(OUTRIGHT_CHANNELS)]
+    M_reg   = _period_metrics(cdf_reg, cur_period)
+    M_out   = _period_metrics(cdf_out, cur_period)
+    M = {}
+    for k in M_raw:
+        if k in ("asp", "aov"):
+            M[k] = M_raw[k]
+        else:
+            M[k] = M_reg[k] * mult + M_out[k]
     avg = {k: (M1[k] + M2[k] + M3[k]) / 3 for k in M}
 
     def _fmt(key, val) -> str:
