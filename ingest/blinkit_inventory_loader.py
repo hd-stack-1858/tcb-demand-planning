@@ -53,6 +53,13 @@ WH_SOH_NAME_TO_CODE = {
     'Pune P3 - Feeder Warehouse':'BLK_WH_4572',
     'Chennai C5 - Feeder':       'BLK_WH_3262',
     'Noida N1 - Feeder':         'BLK_WH_2576',
+    'Nagpur N1 - Feeder':        'BLK_WH_2468',
+    'Rajpura R2 - Feeder Warehouse': 'BLK_WH_4571',
+    'Jaipur J3 - Feeder':        'BLK_WH_3200',
+    'Coimbatore C1 - Feeder':    'BLK_WH_2681',
+    'Lucknow L4':                'BLK_WH_1206',
+    'Kolkata K4 - Feeder':       'BLK_WH_2015',
+    'Kolkata K6 - Feeder Warehouse': 'BLK_WH_4842',
     # Farukhnagar SR: closed — its SOH is merged into Faridabad below
     'Farukhnagar - SR':          'BLK_WH_5096',  # redirect to Faridabad
 }
@@ -225,6 +232,23 @@ def load_file(filepath: Path, dry_run: bool = False):
         print(f'    [WARN] Unknown WH names: {sorted(skipped_wh)}')
     if skipped_sku:
         print(f'    [WARN] Unknown Item IDs: {sorted(skipped_sku)}')
+
+    if (skipped_wh or skipped_sku) and not dry_run:
+        try:
+            from automation.email_sender import send_alert
+            lines = [f'Blinkit SOH loader ({snap_date}): unmapped rows were skipped — stock for these is silently missing from blinkit_inventory_snapshots until mapped.', '']
+            if skipped_wh:
+                lines.append(f'Unknown WH names ({len(skipped_wh)}): {sorted(skipped_wh)}')
+                lines.append('  -> add to WH_SOH_NAME_TO_CODE in ingest/blinkit_inventory_loader.py')
+            if skipped_sku:
+                lines.append(f'Unknown Item IDs ({len(skipped_sku)}): {sorted(skipped_sku)}')
+                lines.append('  -> add to sku_channel_ids (platform_pid_additional) for the BLK channel')
+            send_alert(
+                subject=f'⚠️ Blinkit SOH loader — unmapped WH/SKU rows ({snap_date})',
+                body='\n'.join(lines),
+            )
+        except Exception as exc:
+            print(f'    [WARN] Could not send unmapped-rows alert: {exc}')
 
     if dry_run:
         print('    DRY RUN — no writes')
