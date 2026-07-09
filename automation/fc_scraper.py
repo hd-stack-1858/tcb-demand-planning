@@ -395,6 +395,15 @@ def _process_one_order(context, gear_icon, order_id: str) -> tuple[list[Path], d
                          order_id, ", ".join(all_texts))
             raise ValueError(f"Could not read any SKU for order {order_id}")
 
+        # Group by SKU: FC's Configure Order table sometimes renders multiple units of
+        # the same SKU as separate rows (each parsed as qty=1) instead of one row with
+        # qty=N. Without this, each extra row is a duplicate DB write attempt that gets
+        # silently dropped as "already_recorded" — undercounting the real quantity.
+        grouped: dict[str, int] = {}
+        for it in order_items:
+            grouped[it["sku_id"]] = grouped.get(it["sku_id"], 0) + it["qty"]
+        order_items = [{"sku_id": sku, "qty": qty} for sku, qty in grouped.items()]
+
         # Compute shipment dims: sum weight across all items × qty, share L/B/H from primary SKU
         primary_sku = order_items[0]["sku_id"]
         primary_dims = _get_dims(primary_sku)
