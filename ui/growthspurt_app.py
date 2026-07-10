@@ -2495,21 +2495,29 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
             bk_trend = _project_col(bk_trend, "quantity", _cur_mult())
             month_order = bk_trend.sort_values("month_dt")["Month"].unique().tolist()
 
-            all_bk_cities = sorted(blinkit_geo["city"].unique().tolist())
-            sel_bk_cities = st.multiselect(
-                "Cities to show",
-                options=all_bk_cities,
-                default=all_bk_cities,
-                key="bk_city_sel_dd",
+            # Top 10 cities by total units over the shown period; everything
+            # else clubbed into a single "Others" line so the chart stays
+            # readable regardless of how many cities are active.
+            top10_cities = (
+                bk_trend.groupby("city")["quantity"].sum()
+                .sort_values(ascending=False)
+                .head(10)
+                .index.tolist()
             )
-            bk_plot = bk_trend[bk_trend["city"].isin(sel_bk_cities)] if sel_bk_cities else bk_trend
+            bk_plot = bk_trend.copy()
+            bk_plot["city"] = bk_plot["city"].where(bk_plot["city"].isin(top10_cities), "Others")
+            bk_plot = (
+                bk_plot.groupby(["Month", "month_dt", "city"])["quantity"].sum()
+                .reset_index()
+            )
+            city_order = top10_cities + (["Others"] if "Others" in bk_plot["city"].values else [])
 
             fig_bk = px.line(
                 bk_plot,
                 x="Month", y="quantity", color="city",
                 markers=True,
                 labels={"quantity": "Units", "city": "City"},
-                category_orders={"Month": month_order},
+                category_orders={"Month": month_order, "city": city_order},
             )
             fig_bk.update_layout(
                 xaxis_title=None, yaxis_title="Units",
