@@ -628,3 +628,4 @@ Items explicitly decided to skip for now but worth revisiting:
 | `automation/vignesh_monitor.py` | 🔲 Phase H2 |
 | `tcb/forecasting.py` | ✅ Phase D — Blinkit ADS model + growth model; VELOCITY_BASE + USER_FINAL; Forecast tab in growthspurt_app.py |
 | `tcb/reorder.py` | 🔲 Phase E |
+| `ui/growthspurt_app.py` — Launch Status "Total Sellable Inventory" column | 🔲 PENDING (2026-07-11) — City + Serving WH columns are live and stable; the 3rd column (SOH sellable stock per city, for expansion "quick win" decisions) triggered repeated unreproducible prod segfaults even after exact-pinning pandas/numpy/pyarrow, reverted for now. See memory `feedback_dependency_pinning.md` and `blinkit_replen_system.md` before retrying — check Streamlit Cloud's resource-usage graphs first to rule in/out a memory-limit cause. |
