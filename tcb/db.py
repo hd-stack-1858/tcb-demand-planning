@@ -143,7 +143,7 @@ def get_orders_raw(start_date: str | None = None, end_date: str | None = None) -
 def get_blinkit_city_ds(sku_id: str) -> list[dict]:
     """
     For a given SKU, return one row per Blinkit dark store with:
-      location_id, name, city, status (from eligibility, or 'no_data' if absent)
+      location_id, name, city, parent_location_id, status (from eligibility, or 'no_data' if absent)
     Used by the Blinkit Deepdive dashboard tab.
     """
     db = get_client()
@@ -151,7 +151,7 @@ def get_blinkit_city_ds(sku_id: str) -> list[dict]:
     # All active Blinkit DS with city
     ds_rows = (
         db.table("partner_locations")
-        .select("location_id, name, city")
+        .select("location_id, name, city, parent_location_id")
         .eq("channel_id", 4)
         .eq("location_type", "DARKSTORE")
         .eq("is_active", True)

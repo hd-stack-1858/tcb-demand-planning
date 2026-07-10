@@ -1824,6 +1824,20 @@ def _load_wh_list() -> list:
 
 
 @st.cache_data(ttl=300)
+def _load_all_wh_names() -> dict:
+    """location_id -> name for ALL Blinkit WH rows, including deactivated ones —
+    used for display labels (e.g. Launch Status' Serving WH column), where a DS
+    can still point at a since-deactivated WH and should show its real name."""
+    db = get_client()
+    rows = (db.table("partner_locations")
+              .select("location_id,name")
+              .eq("channel_id", 4)
+              .eq("location_type", "WH")
+              .execute().data)
+    return {r["location_id"]: r["name"] for r in rows}
+
+
+@st.cache_data(ttl=300)
 def _load_all_ds_raw() -> list:
     db = get_client()
     return (db.table("partner_locations")
@@ -2020,13 +2034,24 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
 
     active_ds_ids = tuple(sorted(active_rows["location_id"].unique().tolist()))
     stock_flags   = _load_latest_stock_flags(selected_sku, active_ds_ids)
+    wh_names      = _load_all_wh_names()
+
+    def _serving_wh(grp: pd.DataFrame) -> str:
+        """Comma-separated, sorted list of distinct WH names serving this
+        city's DS group — a city can legitimately sit under 2+ WHs."""
+        whs = sorted({
+            wh_names.get(pid, f"location_id={pid}")
+            for pid in grp["parent_location_id"].dropna().unique()
+        })
+        return ", ".join(whs) if whs else "—"
 
     with_stock, no_stock = [], []
     for city, grp in active_rows.groupby("city"):
         loc_ids   = grp["location_id"].tolist()
         cnt       = len(loc_ids)
         has_stock = any(stock_flags.get(lid, False) for lid in loc_ids)
-        (with_stock if has_stock else no_stock).append((city, cnt))
+        row = (city, cnt, _serving_wh(grp))
+        (with_stock if has_stock else no_stock).append(row)
     with_stock.sort(key=lambda x: -x[1])
     no_stock.sort(key=lambda x: -x[1])
 
@@ -2037,14 +2062,17 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
     launched_cities   = set(active_rows["city"].unique().tolist())
     not_launched_pool = launch_awaited_rows[~launch_awaited_rows["city"].isin(launched_cities)]
     not_launched = sorted(
-        ((city, len(grp)) for city, grp in not_launched_pool.groupby("city")),
+        ((city, len(grp), _serving_wh(grp)) for city, grp in not_launched_pool.groupby("city")),
         key=lambda x: -x[1],
     )
 
-    def _city_count_df(pairs: list[tuple]) -> pd.DataFrame:
-        if not pairs:
-            return pd.DataFrame({"City": ["— none —"]})
-        return pd.DataFrame({"City": [f"{city} ({cnt})" for city, cnt in pairs]})
+    def _city_count_df(rows: list[tuple]) -> pd.DataFrame:
+        if not rows:
+            return pd.DataFrame({"City": ["— none —"], "Serving WH": [""]})
+        return pd.DataFrame({
+            "City":       [f"{city} ({cnt})" for city, cnt, _ in rows],
+            "Serving WH": [wh for _, _, wh in rows],
+        })
 
     col_a, col_b, col_c = st.columns(3)
     with col_a:
