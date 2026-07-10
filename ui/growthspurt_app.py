@@ -1843,31 +1843,6 @@ def _load_all_wh_names() -> dict:
     return {r["location_id"]: r["name"] for r in rows}
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _load_wh_sellable_stock(sku_id: str) -> dict:
-    """location_id (WH) -> total_sellable units for this SKU, from the latest
-    SOH snapshot. Used by Launch Status to surface "quick win" opportunities —
-    a WH already holding sellable stock for a city that isn't launched yet
-    means a launch action alone (no shipment needed) could unlock sales.
-    Explicit int() cast — never pass a raw DB value straight into a numeric
-    column downstream without knowing its exact type."""
-    db = get_client()
-    snap = (db.table("blinkit_inventory_snapshots")
-              .select("snapshot_date")
-              .order("snapshot_date", desc=True)
-              .limit(1)
-              .execute().data)
-    if not snap:
-        return {}
-    latest_snap = snap[0]["snapshot_date"]
-    rows = (db.table("blinkit_inventory_snapshots")
-              .select("location_id,total_sellable")
-              .eq("snapshot_date", latest_snap)
-              .eq("sku_id", sku_id)
-              .execute().data)
-    return {r["location_id"]: int(r.get("total_sellable") or 0) for r in rows}
-
-
 @st.cache_data(ttl=300)
 def _load_all_ds_raw() -> list:
     db = get_client()
@@ -2073,26 +2048,22 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
     active_ds_ids = tuple(sorted(active_rows["location_id"].unique().tolist()))
     stock_flags   = _load_latest_stock_flags(selected_sku, active_ds_ids)
     wh_names      = _load_all_wh_names()
-    wh_stock      = _load_wh_sellable_stock(selected_sku)
 
-    def _serving_wh_and_stock(grp: pd.DataFrame) -> tuple[str, int]:
-        """(comma-separated distinct WH names, total SOH sellable stock summed
-        across those WHs) for this city's DS group — a city can legitimately
-        sit under 2+ WHs. The stock total is a "quick win" signal: stock
-        already sitting at the serving WH(s) that a launch action alone could
-        unlock, no shipment needed."""
-        parent_ids = grp["parent_location_id"].dropna().unique()
-        whs = sorted({wh_names.get(pid, f"location_id={pid}") for pid in parent_ids})
-        total_stock = int(sum(wh_stock.get(pid, 0) for pid in parent_ids))
-        return (", ".join(whs) if whs else "—", total_stock)
+    def _serving_wh(grp: pd.DataFrame) -> str:
+        """Comma-separated, sorted list of distinct WH names serving this
+        city's DS group — a city can legitimately sit under 2+ WHs."""
+        whs = sorted({
+            wh_names.get(pid, f"location_id={pid}")
+            for pid in grp["parent_location_id"].dropna().unique()
+        })
+        return ", ".join(whs) if whs else "—"
 
     with_stock, no_stock = [], []
     for city, grp in active_rows.groupby("city"):
         loc_ids   = grp["location_id"].tolist()
         cnt       = len(loc_ids)
         has_stock = any(stock_flags.get(lid, False) for lid in loc_ids)
-        wh_str, stock_total = _serving_wh_and_stock(grp)
-        row = (city, cnt, wh_str, stock_total)
+        row = (city, cnt, _serving_wh(grp))
         (with_stock if has_stock else no_stock).append(row)
     with_stock.sort(key=lambda x: -x[1])
     no_stock.sort(key=lambda x: -x[1])
@@ -2104,27 +2075,16 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
     launched_cities   = set(active_rows["city"].unique().tolist())
     not_launched_pool = launch_awaited_rows[~launch_awaited_rows["city"].isin(launched_cities)]
     not_launched = sorted(
-        (
-            (city, len(grp), *_serving_wh_and_stock(grp))
-            for city, grp in not_launched_pool.groupby("city")
-        ),
+        ((city, len(grp), _serving_wh(grp)) for city, grp in not_launched_pool.groupby("city")),
         key=lambda x: -x[1],
     )
 
     def _city_count_df(rows: list[tuple]) -> pd.DataFrame:
-        # "Total Sellable Inventory" is built as a plain string in BOTH the
-        # empty and populated branches — same as City/Serving WH, which are
-        # already proven stable in prod. A prior version left it as a raw int
-        # column (string in the empty branch, int in the populated one) right
-        # before an unreproducible native crash on this exact tab; making
-        # every column here a uniform string type is a cheap, low-risk way to
-        # rule that out as a contributing factor.
         if not rows:
-            return pd.DataFrame({"City": ["— none —"], "Serving WH": [""], "Total Sellable Inventory": [""]})
+            return pd.DataFrame({"City": ["— none —"], "Serving WH": [""]})
         return pd.DataFrame({
-            "City":       [f"{city} ({cnt})" for city, cnt, _, _ in rows],
-            "Serving WH": [wh for _, _, wh, _ in rows],
-            "Total Sellable Inventory": [str(stock) for _, _, _, stock in rows],
+            "City":       [f"{city} ({cnt})" for city, cnt, _ in rows],
+            "Serving WH": [wh for _, _, wh in rows],
         })
 
     col_a, col_b, col_c = st.columns(3)
