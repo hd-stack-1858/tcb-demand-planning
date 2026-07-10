@@ -2028,7 +2028,14 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
         "(unlike the top-15-only counts and chart above)."
     )
 
-    df_city = df[df["city"].notna() & (df["city"] != "")]
+    df_city = df[df["city"].notna() & (df["city"] != "")].copy()
+    if "parent_location_id" not in df_city.columns:
+        # _load_city_ds() is st.cache_data-keyed on ITS OWN source code, not on
+        # get_blinkit_city_ds()'s (a different file) -- so a cache entry from
+        # before this column was added can outlive the deploy for its 5-min TTL
+        # and come back missing it. Degrade gracefully instead of crashing the
+        # whole tab; resolves itself once the cache naturally expires.
+        df_city["parent_location_id"] = None
     active_rows          = df_city[df_city["status"] == "active"]
     launch_awaited_rows  = df_city[df_city["status"] == "launch_awaited"]
 
