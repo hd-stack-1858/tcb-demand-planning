@@ -2495,16 +2495,30 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
             bk_trend = _project_col(bk_trend, "quantity", _cur_mult())
             month_order = bk_trend.sort_values("month_dt")["Month"].unique().tolist()
 
-            # Top 10 cities by total units over the shown period; everything
+            # Merge NCR cities into one "NCR" line for THIS CHART ONLY — the
+            # left-hand table keeps them separate, showing actual per-city
+            # data. Collapsing 4 cities into 1 also frees up more top-10
+            # slots for other cities to appear individually.
+            _NCR_CITIES_BK = {"New Delhi", "Gurgaon", "Faridabad", "Ghaziabad"}
+            bk_trend_ncr = bk_trend.copy()
+            bk_trend_ncr["city"] = bk_trend_ncr["city"].where(
+                ~bk_trend_ncr["city"].isin(_NCR_CITIES_BK), "NCR"
+            )
+            bk_trend_ncr = (
+                bk_trend_ncr.groupby(["month_dt", "Month", "city"])["quantity"].sum()
+                .reset_index()
+            )
+
+            # Top 10 (NCR now counts as one entrant) by total units; everything
             # else clubbed into a single "Others" line so the chart stays
             # readable regardless of how many cities are active.
             top10_cities = (
-                bk_trend.groupby("city")["quantity"].sum()
+                bk_trend_ncr.groupby("city")["quantity"].sum()
                 .sort_values(ascending=False)
                 .head(10)
                 .index.tolist()
             )
-            bk_plot = bk_trend.copy()
+            bk_plot = bk_trend_ncr.copy()
             bk_plot["city"] = bk_plot["city"].where(bk_plot["city"].isin(top10_cities), "Others")
             bk_plot = (
                 # month_dt (an actual datetime) must be the FIRST groupby key —
