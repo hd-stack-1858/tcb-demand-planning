@@ -31,6 +31,9 @@ import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from ingest.blinkit_wh_resolver import build_wh_name_lookup, resolve_wh_code
+
 # ── Environment ────────────────────────────────────────────────────────────────
 env = os.environ.get('TCB_ENV', 'prod')
 load_dotenv('.env' if env == 'prod' else '.env.dev')
@@ -65,36 +68,6 @@ def match_remark(remark: str) -> str | None:
         if all(kw in r for kw in keywords):
             return status
     return None
-
-# Performance file "Serving warehouse" → partner_locations code (all 20 active WHs)
-WH_PERF_TO_CODE = {
-    'Ahmedabad A2 - Feeder':       'BLK_WH_2470',
-    'Bengaluru B3 - Feeder':       'BLK_WH_1873',
-    'Bengaluru B3':                'BLK_WH_1873',
-    'Bengaluru B5 - Feeder':       'BLK_WH_5397',
-    'Chennai C5 - Feeder':         'BLK_WH_3262',
-    'Coimbatore C1 - Feeder':      'BLK_WH_2681',
-    'Faridabad - Feeder':          'BLK_WH_5096',
-    'Guwahati G1 - Feeder':        'BLK_WH_3213',
-    'Hyderabad H3 - Feeder':       'BLK_WH_3201',
-    'Jaipur J3 - Feeder':          'BLK_WH_3200',
-    'Kolkata K4 - Feeder':         'BLK_WH_2015',
-    'Kolkata K6 - Feeder':         'BLK_WH_4842',
-    'Kundli - Feeder':             'BLK_WH_2010',
-    'Kundli Feeder':               'BLK_WH_2010',
-    'Lucknow L4':                  'BLK_WH_1206',
-    'Super Store Lucknow L4':      'BLK_WH_1206',
-    'Mumbai M10 - Feeder':         'BLK_WH_2123',
-    'Nagpur N1 - Feeder':          'BLK_WH_2468',
-    'Noida N1 - Feeder':           'BLK_WH_2576',
-    'Patna P1 - Feeder':           'BLK_WH_2960',
-    'Pune P3 - Feeder':            'BLK_WH_4572',
-    'Pune P3 - Feeder Warehouse':  'BLK_WH_4572',
-    'Rajpura R2 - Feeder':         'BLK_WH_4571',
-    'Rajpura R2 - Feeder Warehouse': 'BLK_WH_4571',
-    'Visakhapatnam V1 - Feeder':   'BLK_WH_2670',
-}
-
 
 # ── Lookup caches (built once per run) ────────────────────────────────────────
 
@@ -225,11 +198,6 @@ def load_file(filepath: Path) -> pd.DataFrame | None:
     return df
 
 
-def normalize_wh_name(name: str) -> str | None:
-    """Map performance 'Serving warehouse' to partner_locations code. None if unknown."""
-    return WH_PERF_TO_CODE.get(name)
-
-
 _ES_RE = re.compile(r'\bES(\d+)\s*$', re.IGNORECASE)
 
 
@@ -248,13 +216,21 @@ def _ds_code(name: str) -> str:
 
 def scan_ds_from_files(files: list[Path]) -> tuple[dict[str, str], dict[str, str], set[str]]:
     """
-    Quick 3-column scan of all performance CSVs.
+    Quick column scan of all performance CSVs.
     Returns:
-      ds_to_wh_name: {ds_name → serving_wh_name}  (latest WH per DS name wins)
-      ds_to_city:    {ds_name → delivery_city}     (latest city per DS name wins)
+      ds_to_wh_name: {ds_name → serving_wh_name}  (winner = row with the latest
+                      actual Date value for that DS — NOT file/row order. A
+                      single day's file can legitimately contain a DS under two
+                      different Serving warehouse values at once, e.g. mid-transition
+                      reassignment: confirmed live with the Mumbai M10→M12 cutover,
+                      where some SKU rows still say M10 on the same download day
+                      while others already say M12. Row order in the file is
+                      arbitrary for this — only the Date column tells you which
+                      assignment is actually current.)
+      ds_to_city:    {ds_name → delivery_city}     (same precedence as above)
       latest_ds:     set of DS names in the chronologically latest file
     """
-    all_pairs:  list[tuple[str, str, str, str]] = []   # (filename, ds_name, wh_name, city)
+    all_pairs:  list[tuple[str, str, str, str, str]] = []   # (filename, ds_name, wh_name, city, date_str)
     for fpath in files:
         try:
             hdr = pd.read_csv(fpath, nrows=0)
@@ -264,7 +240,7 @@ def scan_ds_from_files(files: list[Path]) -> tuple[dict[str, str], dict[str, str
             col_names = set(hdr.columns)
             city_col = 'City' if 'City' in col_names else (
                        'Delivery City' if 'Delivery City' in col_names else None)
-            cols = ['Darkstore name', 'Serving warehouse']
+            cols = ['Darkstore name', 'Serving warehouse', 'Date']
             if city_col:
                 cols.append(city_col)
             df = pd.read_csv(fpath, usecols=cols, low_memory=False)
@@ -272,11 +248,13 @@ def scan_ds_from_files(files: list[Path]) -> tuple[dict[str, str], dict[str, str
             df = df.dropna(subset=['Darkstore name', 'Serving warehouse'])
             for _, row in df.iterrows():
                 city = str(row.get(city_col, '') or '').strip() if city_col else ''
+                date_str = str(row.get('Date', '') or '').strip()
                 all_pairs.append((
                     fpath.name,
                     str(row['Darkstore name']).strip(),
                     str(row['Serving warehouse']).strip(),
                     city,
+                    date_str,
                 ))
         except Exception:
             continue
@@ -288,15 +266,63 @@ def scan_ds_from_files(files: list[Path]) -> tuple[dict[str, str], dict[str, str
     latest_file = sorted({p[0] for p in all_pairs})[-1]
     latest_ds   = {p[1] for p in all_pairs if p[0] == latest_file}
 
-    # ds_name → WH name and city (latest file wins, then alphabetically last)
+    # ds_name → WH name and city: sort by (filename, Date string) so the row with
+    # the actual latest date wins per DS — cross-file ties fall back to filename,
+    # intra-file ties (same DS, same date, conflicting WH — genuine data issue)
+    # fall back to whichever row pandas read last, same as before.
+    # Date strings are fixed-width ISO ("YYYY-MM-DD HH:MM:SS +0000 UTC"), so
+    # lexicographic sort matches chronological order.
     ds_to_wh:   dict[str, str] = {}
     ds_to_city: dict[str, str] = {}
-    for fname, ds, wh, city in sorted(all_pairs, key=lambda x: x[0]):
+    for fname, ds, wh, city, date_str in sorted(all_pairs, key=lambda x: (x[0], x[4])):
         ds_to_wh[ds] = wh
         if city:
             ds_to_city[ds] = city
 
     return ds_to_wh, ds_to_city, latest_ds
+
+
+def ensure_whs_exist(wh_names: set[str]) -> tuple[dict, list[str]]:
+    """
+    Auto-create any WH mentioned by the performance file's 'Serving warehouse'
+    column that isn't already in partner_locations.
+
+    Existence is checked by RESOLVED CODE, not raw name — a name is only "new"
+    if resolve_wh_code() maps it to a code with no existing location_id.
+    Checking by literal name string would create a duplicate row (sharing the
+    SAME code as an existing row) for any known WH_MANUAL_OVERRIDES alias whose
+    partner_locations.name is still the older/other variant — e.g. "Bengaluru
+    B3 - Feeder" (performance file's string) vs. the existing row's stored name
+    "Bengaluru B3" (pre-migration-024). Both resolve to code BLK_WH_1873, so
+    the alias must be recognized as already existing, not inserted again.
+
+    The performance file is the "mother file" — a WH must never be silently
+    dropped just because it wasn't pre-seeded in WH_MANUAL_OVERRIDES. Must be
+    called (and its returned wh_lookup used) BEFORE refresh_ds_master, so DS
+    under a brand-new WH get linked in the same run instead of the next one.
+
+    Returns (rebuilt wh_lookup {code: location_id}, list of newly created WH names).
+    """
+    name_lookup = build_wh_name_lookup(sb)
+    wh_lookup   = build_wh_location_lookup()
+
+    new_names = sorted(
+        wh_name for wh_name in wh_names
+        if resolve_wh_code(wh_name, name_lookup) not in wh_lookup
+    )
+
+    if new_names:
+        new_rows = [{
+            'channel_id':    4,
+            'location_type': 'WH',
+            'name':          wh_name,
+            'code':          resolve_wh_code(wh_name, name_lookup),
+            'is_active':     True,
+        } for wh_name in new_names]
+        sb.table('partner_locations').insert(new_rows).execute()
+        print(f'  [NEW WH] Auto-created {len(new_names)} warehouse(s): {new_names}')
+
+    return build_wh_location_lookup(), new_names
 
 
 def refresh_ds_master(ds_to_wh_name: dict[str, str], wh_lookup: dict,
@@ -315,6 +341,7 @@ def refresh_ds_master(ds_to_wh_name: dict[str, str], wh_lookup: dict,
         if r.get('code')
     }
 
+    name_lookup = build_wh_name_lookup(sb)
     new_rows:  list[dict] = []
     skipped_wh = set()
 
@@ -323,12 +350,12 @@ def refresh_ds_master(ds_to_wh_name: dict[str, str], wh_lookup: dict,
         if ds_lookup.get(ds_name.lower()) or ds_lookup.get(_bare_name(ds_name)):
             continue
 
-        wh_code = WH_PERF_TO_CODE.get(wh_name)
-        if not wh_code:
-            skipped_wh.add(wh_name)
-            continue
+        wh_code = resolve_wh_code(wh_name, name_lookup)
         wh_id = wh_lookup.get(wh_code)
         if not wh_id:
+            # Should not normally happen — ensure_whs_exist() runs before this
+            # and guarantees every WH the file mentions already has a row.
+            skipped_wh.add(wh_name)
             continue
 
         code = _ds_code(ds_name)
@@ -356,8 +383,8 @@ def refresh_ds_master(ds_to_wh_name: dict[str, str], wh_lookup: dict,
         inserted += len(new_rows[i:i + CHUNK])
 
     if skipped_wh:
-        print(f'  [WARN] Pass 0a: {len(skipped_wh)} WH names not in WH_PERF_TO_CODE (DS skipped): '
-              f'{sorted(skipped_wh)}')
+        print(f'  [WARN] Pass 0a: {len(skipped_wh)} WH row(s) unexpectedly still missing after '
+              f'ensure_whs_exist() — DS skipped, investigate: {sorted(skipped_wh)}')
     return inserted
 
 
@@ -430,18 +457,20 @@ def update_is_active(latest_ds_names: set[str], ds_lookup: dict,
 # ── Pass 0: refresh WH-DS mapping ────────────────────────────────────────────
 
 def update_wh_ds_mapping(df: pd.DataFrame, ds_lookup: dict,
-                         wh_lookup: dict, ds_parent_lookup: dict) -> int:
+                         wh_lookup: dict, ds_parent_lookup: dict) -> dict:
     """
     For every DS in the file, check if its Serving warehouse matches
     partner_locations.parent_location_id. Update if it has changed.
-    The performance file is the source of truth for WH-DS assignments.
+    The performance file is the source of truth for WH-DS assignments —
+    every WH the file mentions is "ours" by construction (ensure_whs_exist()
+    runs before this and guarantees a row exists for each one).
+    Returns {'remapped': int, 'unknown_ds': set, 'unknown_wh': set}.
     """
-    our_whs = set(WH_PERF_TO_CODE.keys())
+    name_lookup = build_wh_name_lookup(sb)
 
     # One row per (DS name, Serving warehouse) — take the most recent date
     mapping = (
-        df[df['Serving warehouse'].isin(our_whs)]
-        [['Darkstore name', 'Serving warehouse', 'data_date']]
+        df[['Darkstore name', 'Serving warehouse', 'data_date']]
         .dropna(subset=['Darkstore name', 'Serving warehouse'])
         .sort_values('data_date', ascending=False)
         .drop_duplicates(subset=['Darkstore name'])   # latest WH per DS
@@ -460,13 +489,11 @@ def update_wh_ds_mapping(df: pd.DataFrame, ds_lookup: dict,
             unknown_ds.add(raw_ds)
             continue
 
-        wh_code = WH_PERF_TO_CODE.get(wh_name)
-        if not wh_code:
-            unknown_wh.add(wh_name)
-            continue
-
+        wh_code = resolve_wh_code(wh_name, name_lookup)
         new_parent = wh_lookup.get(wh_code)
         if not new_parent:
+            # Should not normally happen — ensure_whs_exist() runs before Pass 0.
+            unknown_wh.add(wh_name)
             continue
 
         current_parent = ds_parent_lookup.get(ds_id)
@@ -482,18 +509,26 @@ def update_wh_ds_mapping(df: pd.DataFrame, ds_lookup: dict,
 
     if unknown_ds:
         print(f'  [WARN] Pass 0: {len(unknown_ds)} DS not in partner_locations (skipped remap)')
-    return updated
+    if unknown_wh:
+        print(f'  [WARN] Pass 0: {len(unknown_wh)} WH row(s) unexpectedly missing (skipped remap): '
+              f'{sorted(unknown_wh)}')
+    return {'remapped': updated, 'unknown_ds': unknown_ds, 'unknown_wh': unknown_wh}
 
 
 # ── Pass 1: update DS-SKU eligibility ─────────────────────────────────────────
 
-def update_eligibility(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict):
+def update_eligibility(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict) -> dict:
     """
     Determine each DS-SKU's status from its LATEST data_date in this file.
 
     Y on latest date  → status = 'active'   (resets stale non-active status)
     N on latest date  → status = remark rule (closed / low_sales / launched / etc.)
-    N with no remark  → skip (no actionable status)
+    N with no remark  → skip (no actionable status) — counted as unclassified_n
+
+    Returns {'count', 'fresh_pairs', 'unknown_sku', 'unknown_ds', 'unknown_remarks',
+    'unclassified_n'}. fresh_pairs is every (location_id, sku_id) actually classified
+    this run (any status) — used by propagate_darkstore_closed() so it never
+    overwrites a pair that has its own fresh, current-day signal.
     """
     item_col   = 'Item ID'
     remark_col = 'Darkstore remark'
@@ -509,6 +544,7 @@ def update_eligibility(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict):
     unknown_ds      = set()
     unknown_sku     = set()
     unknown_remarks = set()
+    unclassified_n  = 0
 
     for _, row in latest_per_pair.iterrows():
         sku_id = sku_lookup.get(str(row[item_col]))
@@ -544,6 +580,7 @@ def update_eligibility(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict):
             else:
                 if remarks_s:
                     print(f'  [WARN] Unclassified N-row (blank DS remark), Remarks: {remarks_s!r}')
+                unclassified_n += 1
                 continue  # no actionable status
 
         records.append({
@@ -569,26 +606,33 @@ def update_eligibility(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict):
         print(f'  [WARN] {len(unknown_remarks)} remark(s) matched no rule — add to REMARK_RULES if needed:')
         for r in sorted(unknown_remarks):
             print(f'    {r!r}')
+    if unclassified_n:
+        print(f'  [WARN] {unclassified_n} unclassified N-row(s) (blank remark, no FE-movement text) — no status written')
 
-    return len(records)
+    return {
+        'count':          len(records),
+        'fresh_pairs':    {(r['location_id'], r['sku_id']) for r in records},
+        'unknown_sku':    unknown_sku,
+        'unknown_ds':     unknown_ds,
+        'unknown_remarks': unknown_remarks,
+        'unclassified_n': unclassified_n,
+    }
 
 
 # ── Pass 2b: upsert into blinkit_performance_detail ───────────────────────────
 
-def upsert_detail(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict):
+def upsert_detail(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict) -> dict:
     """
     Load Y-rows into blinkit_performance_detail.
     Uses inventory_available (Column Q) as the DS-level OOS signal.
     Runs in parallel with upsert_ads() during migration period.
+    Every WH the file mentions is now "ours" by construction — no WH filter.
+    Returns {'inserted', 'skipped', 'unknown_ds', 'trigger2_count'}.
     """
-    our_whs = set(WH_PERF_TO_CODE.keys())
-    y_rows  = df[
-        (df['Considered for assessment (Y/N)'] == 'Y') &
-        (df['Serving warehouse'].isin(our_whs))
-    ].copy()
+    y_rows = df[df['Considered for assessment (Y/N)'] == 'Y'].copy()
 
     if y_rows.empty:
-        return 0, 0
+        return {'inserted': 0, 'skipped': 0, 'unknown_ds': set(), 'trigger2_count': 0}
 
     inserted  = 0
     skipped   = 0
@@ -655,21 +699,35 @@ def upsert_detail(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict):
               f'but total_orders>0. Orders placed despite Column Q flagging inventory unavailable '
               f'— Column Q may have a data quality issue. Check these rows.')
 
-    return inserted, skipped
+    return {
+        'inserted':       inserted,
+        'skipped':        skipped,
+        'unknown_ds':     unknown_ds,
+        'trigger2_count': len(t2_check),
+    }
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def propagate_darkstore_closed() -> tuple[int, int]:
+def propagate_darkstore_closed(fresh_pairs: set[tuple] | None = None) -> tuple[int, int]:
     """
     Physical store closure is permanent and affects all SKUs.
     Pass A: update existing non-closed rows for closed DS → darkstore_closed.
     Pass B: insert rows for SKUs that were never deployed to a now-closed DS
             (these have no eligibility row at all, so Pass A misses them).
+
     Only propagates to DS with ZERO active rows — a DS with any active row has
-    reopened and must not be overwritten.
+    reopened and must not be overwritten. Additionally, never overwrites a
+    (location_id, sku_id) pair present in fresh_pairs — every pair that
+    update_eligibility() actually classified (ANY status, not just active)
+    from the file(s) just processed this run. A sibling SKU freshly showing
+    launch_awaited/ds_choked/etc. today means the store is clearly still
+    operating, so that pair must be left alone rather than blanket-flipped
+    to darkstore_closed just because another SKU there got a closed remark.
+
     Returns (rows_updated, rows_inserted).
     """
+    fresh_pairs = fresh_pairs or set()
     CHUNK = 100
 
     # Find all DS that have at least one darkstore_closed row
@@ -691,17 +749,31 @@ def propagate_darkstore_closed() -> tuple[int, int]:
     if not closed_ds_ids:
         return 0, 0
 
-    # Pass A: update existing rows that are not yet darkstore_closed
+    # Pass A: update existing non-closed rows, EXCLUDING any pair in fresh_pairs.
+    # Fetch the explicit target rows first (rather than a blanket update) so we
+    # can subtract fresh_pairs before writing anything.
     updated = 0
     for i in range(0, len(closed_ds_ids), CHUNK):
         chunk = closed_ds_ids[i:i + CHUNK]
-        result = (sb.table('blinkit_ds_sku_eligibility')
-                    .update({'status': 'darkstore_closed',
-                             'last_remark': 'store has been closed (propagated from sibling SKU)'})
-                    .in_('location_id', chunk)
-                    .neq('status', 'darkstore_closed')
-                    .execute())
-        updated += len(result.data) if result.data else 0
+        candidates = (sb.table('blinkit_ds_sku_eligibility')
+                        .select('location_id,sku_id')
+                        .in_('location_id', chunk)
+                        .neq('status', 'darkstore_closed')
+                        .execute().data)
+        by_location: dict[int, list[str]] = {}
+        for r in candidates:
+            pair = (r['location_id'], r['sku_id'])
+            if pair in fresh_pairs:
+                continue
+            by_location.setdefault(r['location_id'], []).append(r['sku_id'])
+        for loc_id, sku_ids in by_location.items():
+            result = (sb.table('blinkit_ds_sku_eligibility')
+                        .update({'status': 'darkstore_closed',
+                                 'last_remark': 'store has been closed (propagated from sibling SKU)'})
+                        .eq('location_id', loc_id)
+                        .in_('sku_id', sku_ids)
+                        .execute())
+            updated += len(result.data) if result.data else 0
 
     # Pass B: insert rows for SKUs with NO record at all for these closed DS
     all_sku_ids = [r['sku_id'] for r in
@@ -718,7 +790,7 @@ def propagate_darkstore_closed() -> tuple[int, int]:
         for r in ex:
             existing.add((r['location_id'], r['sku_id']))
 
-    # Build missing pairs
+    # Build missing pairs — also excluding anything freshly classified this run
     today_str = date.today().isoformat()
     to_insert = [
         {'location_id': ds_id, 'sku_id': sku_id,
@@ -727,7 +799,7 @@ def propagate_darkstore_closed() -> tuple[int, int]:
          'updated_date': today_str}
         for ds_id in closed_ds_ids
         for sku_id in all_sku_ids
-        if (ds_id, sku_id) not in existing
+        if (ds_id, sku_id) not in existing and (ds_id, sku_id) not in fresh_pairs
     ]
 
     inserted = 0
@@ -742,36 +814,121 @@ def propagate_darkstore_closed() -> tuple[int, int]:
 
 
 def process_file(filepath: Path, sku_lookup: dict, ds_lookup: dict,
-                 wh_lookup: dict, ds_parent_lookup: dict):
+                 wh_lookup: dict, ds_parent_lookup: dict) -> dict | None:
+    """
+    Runs Pass 0 / 1 / 2b for one file and returns a merged report dict:
+      {file, total_rows, pass0, pass1, pass2b}
+    Returns None if the file isn't a valid performance detail CSV.
+    pass1['fresh_pairs'] should be threaded into propagate_darkstore_closed().
+    """
     print(f'\n  Loading: {filepath.name}')
     df = load_file(filepath)
     if df is None:
-        return
+        return None
     print(f'    Rows in file: {len(df):,}')
 
     # Pass 0: refresh WH-DS mapping
-    remapped = update_wh_ds_mapping(df, ds_lookup, wh_lookup, ds_parent_lookup)
-    print(f'    Pass 0 (WH-DS remap): {remapped} DS parent_location_id updated')
+    pass0 = update_wh_ds_mapping(df, ds_lookup, wh_lookup, ds_parent_lookup)
+    print(f"    Pass 0 (WH-DS remap): {pass0['remapped']} DS parent_location_id updated")
 
     # Pass 1: eligibility
-    elig_count = update_eligibility(df, sku_lookup, ds_lookup)
-    print(f'    Pass 1 (eligibility): {elig_count} status rows upserted')
+    pass1 = update_eligibility(df, sku_lookup, ds_lookup)
+    print(f"    Pass 1 (eligibility): {pass1['count']} status rows upserted")
 
     # Pass 2b: detail table (Column Q as OOS signal)
-    ins2, skip2 = upsert_detail(df, sku_lookup, ds_lookup)
-    print(f'    Pass 2b (detail):     {ins2} rows upserted, {skip2} skipped')
+    pass2b = upsert_detail(df, sku_lookup, ds_lookup)
+    print(f"    Pass 2b (detail):     {pass2b['inserted']} rows upserted, {pass2b['skipped']} skipped")
+
+    return {
+        'file':       filepath.name,
+        'total_rows': len(df),
+        'pass0':      pass0,
+        'pass1':      pass1,
+        'pass2b':     pass2b,
+    }
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Blinkit performance detail loader')
-    parser.add_argument('--file', help='Load a single CSV file')
-    parser.add_argument('--dry-run', action='store_true', help='Parse only, no DB writes')
-    args = parser.parse_args()
+def _is_active_sync_safe(latest_ds_names: set[str], all_blinkit_ds_ids: set[int]) -> bool:
+    """
+    Guard against update_is_active() mass-deactivating real DS off a truncated
+    or corrupted download. Heuristic: the file's own DS count must be at least
+    half of all currently-known Blinkit DS — a genuine daily file always
+    covers the large majority of the DS network, so a sharp drop signals a
+    bad file rather than a real mass closure. Not a trailing-average check
+    (no history table for that yet) — a first-pass sanity floor.
+    """
+    if not all_blinkit_ds_ids:
+        return True
+    return len(latest_ds_names) >= 0.5 * len(all_blinkit_ds_ids)
 
-    print(f'Environment: {env}')
-    if args.dry_run:
-        print('DRY RUN — no DB writes')
 
+def summarize_reports(file_reports: list[dict], new_whs: list[str],
+                      vanished_trigger1: set, is_active_result: tuple[int, int] | None,
+                      is_active_skipped: bool) -> str | None:
+    """
+    Build a human-readable alert body from this run's file_reports + side
+    findings. Returns None if there's nothing worth alerting on — a clean
+    run should stay silent, same as the dashboard's Data Quality Alerts.
+    """
+    lines: list[str] = []
+
+    if new_whs:
+        lines.append(f'New warehouse(s) auto-created from the performance file: {new_whs}')
+
+    unknown_sku: set = set()
+    unknown_ds: set = set()
+    unknown_remarks: set = set()
+    unknown_wh: set = set()
+    unclassified_n = 0
+    trigger2_count = 0
+    for r in file_reports:
+        unknown_sku     |= r['pass1']['unknown_sku']
+        unknown_ds      |= r['pass0']['unknown_ds'] | r['pass1']['unknown_ds'] | r['pass2b']['unknown_ds']
+        unknown_remarks |= r['pass1']['unknown_remarks']
+        unknown_wh      |= r['pass0']['unknown_wh']
+        unclassified_n  += r['pass1']['unclassified_n']
+        trigger2_count  += r['pass2b']['trigger2_count']
+
+    if unknown_wh:
+        lines.append(f'WH row(s) unexpectedly still missing after ensure_whs_exist() '
+                     f'(investigate): {sorted(unknown_wh)}')
+    if unknown_sku:
+        lines.append(f'Unknown Item IDs (not in sku_channel_ids): {sorted(unknown_sku)}')
+    if unknown_ds:
+        lines.append(f'Unknown dark store name(s) (not in partner_locations): {len(unknown_ds)}')
+    if unknown_remarks:
+        lines.append(f'Remark text(s) matched no rule (add to REMARK_RULES): {sorted(unknown_remarks)}')
+    if unclassified_n:
+        lines.append(f'{unclassified_n} unclassified N-row(s) (blank remark, no FE-movement text) — no status written')
+    if trigger2_count:
+        lines.append(f'Trigger 2 — Column Q integrity: {trigger2_count} row(s) with inventory_available=False but total_orders>0')
+    if vanished_trigger1:
+        lines.append(f'Trigger 1 — Vanished-Y: {len(vanished_trigger1)} DS-SKU pair(s) active in DB but absent from latest file')
+    if is_active_skipped:
+        lines.append('is_active sync SKIPPED this run — latest file DS count looked anomalously low vs. known DS (possible truncated/bad download). Investigate before next run.')
+    elif is_active_result:
+        activated, deactivated = is_active_result
+        if deactivated:
+            lines.append(f'is_active sync: {activated} active, {deactivated} deactivated (absent from latest file)')
+
+    if not lines:
+        return None
+    return '\n'.join(lines)
+
+
+def run_pipeline(files: list[Path], dry_run: bool = False) -> dict:
+    """
+    Full pipeline for a given set of performance detail files: builds its own
+    lookups, runs Pass 0a/0/1/2b per file, then propagate_darkstore_closed,
+    the is_active sync (gated by a truncated-file sanity check), Trigger 1,
+    and sends one alert email if anything unclassified/new was found.
+
+    Shared by main() (CLI — full-folder or --file) and the daily scraper's
+    ingest() (always a single freshly-downloaded file) so both entry points
+    get identical self-healing behavior instead of drifting apart.
+
+    Returns a summary dict for the caller to print/inspect.
+    """
     print('Building lookup tables...')
     sku_lookup       = build_sku_lookup()
     ds_lookup        = build_ds_location_lookup()
@@ -781,21 +938,16 @@ def main():
     print(f'  Dark stores: {len(ds_lookup)}')
     print(f'  Warehouses:  {len(wh_lookup)}')
 
-    if args.file:
-        files = [Path(args.file)]
-    else:
-        # Scan both manual (user-downloaded) and auto (scraper-downloaded) dirs
-        manual = sorted(DETAIL_DIR_MAN.glob('*.csv')) if DETAIL_DIR_MAN.exists() else []
-        auto   = sorted(DETAIL_DIR_AUTO.glob('*.csv')) if DETAIL_DIR_AUTO.exists() else []
-        # Deduplicate by filename — prefer manual copy if same name in both
-        seen   = {f.name for f in manual}
-        files  = manual + [f for f in auto if f.name not in seen]
-        files  = sorted(files, key=lambda f: f.name)
+    new_whs: list[str] = []
+    latest_ds: set[str] = set()
 
-    # Pass 0a: seed missing DS from performance files into partner_locations
-    if not args.dry_run:
-        print('\nPass 0a: refreshing DS master from performance files...')
+    # Pass 0a: seed missing WH + DS from performance files into partner_locations
+    if not dry_run:
+        print('\nPass 0a: refreshing WH + DS master from performance files...')
         ds_to_wh_name, ds_to_city, latest_ds = scan_ds_from_files(files)
+
+        wh_lookup, new_whs = ensure_whs_exist(set(ds_to_wh_name.values()))
+
         new_ds_count = refresh_ds_master(ds_to_wh_name, wh_lookup, ds_lookup,
                                          ds_to_city=ds_to_city)
         if new_ds_count:
@@ -810,51 +962,113 @@ def main():
         print(f'  City backfill: {city_updated} DS city values updated')
 
     print(f'\nFiles to process: {len(files)}')
-    total_ins = 0
+    file_reports: list[dict] = []
+    all_fresh_pairs: set = set()
     for f in files:
-        if not args.dry_run:
-            process_file(f, sku_lookup, ds_lookup, wh_lookup, ds_parent_lookup)
+        if not dry_run:
+            report = process_file(f, sku_lookup, ds_lookup, wh_lookup, ds_parent_lookup)
+            if report:
+                file_reports.append(report)
+                all_fresh_pairs |= report['pass1']['fresh_pairs']
         else:
             df = load_file(f)
             if df is None:
                 continue
-            our_whs = set(WH_PERF_TO_CODE.keys())
-            y_rows = df[
-                (df['Considered for assessment (Y/N)'] == 'Y') &
-                (df['Serving warehouse'].isin(our_whs))
-            ]
-            print(f'  {f.name}: {len(df):,} rows total, {len(y_rows):,} Y-rows for our WHs')
+            y_rows = df[df['Considered for assessment (Y/N)'] == 'Y']
+            print(f'  {f.name}: {len(df):,} rows total, {len(y_rows):,} Y-rows')
 
-    # Pass 1b: propagate darkstore_closed to all SKUs for physically closed DS
-    if not args.dry_run:
-        prop_updated, prop_inserted = propagate_darkstore_closed()
+    # Pass 1b: propagate darkstore_closed to all SKUs for physically closed DS,
+    # never overwriting a pair with its own fresh signal from this run
+    prop_updated = prop_inserted = 0
+    if not dry_run:
+        prop_updated, prop_inserted = propagate_darkstore_closed(all_fresh_pairs)
         print(f'\nPass 1b (propagate closed): {prop_updated} rows updated, {prop_inserted} rows inserted to darkstore_closed')
 
-    # Pass 0a post-step: sync is_active for all Blinkit DS based on latest file
-    if not args.dry_run and not args.file:
-        print('\nPass 0a (post): syncing is_active for all Blinkit DS...')
-        # Refresh lookup after all inserts above
+    # Pass 0a post-step: sync is_active for all Blinkit DS based on latest file,
+    # gated by a sanity check against a truncated/bad download
+    is_active_result = None
+    is_active_skipped = False
+    if not dry_run:
         ds_lookup_final = build_ds_location_lookup()
         all_blinkit_ds_ids = set(ds_lookup_final.values())
-        activated, deactivated = update_is_active(latest_ds, ds_lookup_final, all_blinkit_ds_ids)
-        print(f'  Active: {activated} | Deactivated: {deactivated}')
+        if _is_active_sync_safe(latest_ds, all_blinkit_ds_ids):
+            print('\nPass 0a (post): syncing is_active for all Blinkit DS...')
+            is_active_result = update_is_active(latest_ds, ds_lookup_final, all_blinkit_ds_ids)
+            print(f'  Active: {is_active_result[0]} | Deactivated: {is_active_result[1]}')
+        else:
+            is_active_skipped = True
+            print(f'\n[WARN] Pass 0a (post): SKIPPED is_active sync — latest file has only '
+                  f'{len(latest_ds)} DS vs {len(all_blinkit_ds_ids)} known (looks like a bad/truncated file).')
 
     # Trigger 1: DS that are active in DB but absent from the latest file entirely
     # (vanished-Y DS — went active then dropped without going through N first)
-    if not args.dry_run:
-        _check_trigger1_vanished_y(files, sku_lookup, ds_lookup)
+    vanished_trigger1: set = set()
+    if not dry_run:
+        vanished_trigger1 = _check_trigger1_vanished_y(files, sku_lookup, ds_lookup)
+
+    # Alert if anything unclassified/new was found this run — stays silent when clean
+    alert_sent = False
+    if not dry_run:
+        alert_body = summarize_reports(file_reports, new_whs, vanished_trigger1,
+                                       is_active_result, is_active_skipped)
+        if alert_body:
+            try:
+                from automation.email_sender import send_alert
+                send_alert(
+                    subject=f'⚠️ Blinkit performance loader — anomalies found ({date.today().isoformat()})',
+                    body=alert_body,
+                )
+                alert_sent = True
+            except Exception as exc:
+                print(f'  [WARN] Could not send anomaly alert: {exc}')
 
     print('\nDone.')
 
+    return {
+        'file_reports':      file_reports,
+        'new_whs':           new_whs,
+        'prop_updated':      prop_updated,
+        'prop_inserted':     prop_inserted,
+        'is_active_result':  is_active_result,
+        'is_active_skipped': is_active_skipped,
+        'vanished_trigger1': vanished_trigger1,
+        'alert_sent':        alert_sent,
+    }
 
-def _check_trigger1_vanished_y(files: list[Path], sku_lookup: dict, ds_lookup: dict):
+
+def main():
+    parser = argparse.ArgumentParser(description='Blinkit performance detail loader')
+    parser.add_argument('--file', help='Load a single CSV file')
+    parser.add_argument('--dry-run', action='store_true', help='Parse only, no DB writes')
+    args = parser.parse_args()
+
+    print(f'Environment: {env}')
+    if args.dry_run:
+        print('DRY RUN — no DB writes')
+
+    if args.file:
+        files = [Path(args.file)]
+    else:
+        # Scan both manual (user-downloaded) and auto (scraper-downloaded) dirs
+        manual = sorted(DETAIL_DIR_MAN.glob('*.csv')) if DETAIL_DIR_MAN.exists() else []
+        auto   = sorted(DETAIL_DIR_AUTO.glob('*.csv')) if DETAIL_DIR_AUTO.exists() else []
+        # Deduplicate by filename — prefer manual copy if same name in both
+        seen   = {f.name for f in manual}
+        files  = manual + [f for f in auto if f.name not in seen]
+        files  = sorted(files, key=lambda f: f.name)
+
+    run_pipeline(files, dry_run=args.dry_run)
+
+
+def _check_trigger1_vanished_y(files: list[Path], sku_lookup: dict, ds_lookup: dict) -> set:
     """
     Trigger 1: Alert if any DS-SKU pair is status='active' in DB
     but completely absent from the latest performance file.
     These DS were selling (Y) then vanished without going through N — raise with Blinkit.
+    Returns the vanished (location_id, sku_id) set (empty if none / on any parse failure).
     """
     if not files:
-        return
+        return set()
 
     latest_file = max(files, key=lambda f: f.stat().st_mtime)
 
@@ -862,13 +1076,13 @@ def _check_trigger1_vanished_y(files: list[Path], sku_lookup: dict, ds_lookup: d
         hdr = pd.read_csv(latest_file, nrows=0)
         hdr.columns = [c.strip() for c in hdr.columns]
         if not REQUIRED_COLS.issubset(set(hdr.columns)):
-            return
+            return set()
         df = pd.read_csv(latest_file,
                          usecols=['Item ID', 'Darkstore name'],
                          low_memory=False)
         df.columns = [c.strip() for c in df.columns]
     except Exception:
-        return
+        return set()
 
     df = df.dropna(subset=['Item ID', 'Darkstore name'])
 
@@ -907,6 +1121,8 @@ def _check_trigger1_vanished_y(files: list[Path], sku_lookup: dict, ds_lookup: d
             print(f'    location_id={ds_id}, sku_id={sku_id}')
         if len(vanished) > 20:
             print(f'    ... and {len(vanished) - 20} more')
+
+    return vanished
 
 
 if __name__ == '__main__':

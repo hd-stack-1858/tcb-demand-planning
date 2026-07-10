@@ -2088,6 +2088,86 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
                 f"Raise with Blinkit."
             )
 
+        # Trigger 3: Orphaned WH stock (risk flag, not a certainty — Blinkit gives
+        # no DS-level inventory quantity anywhere; SOH is WH-aggregate only, and
+        # performance detail only has a per-DS Y/N flag). Checked across ALL SKUs,
+        # not just the one selected above, since a WH can be affected regardless
+        # of which SKU tab is currently open.
+        snap_date_rows = (
+            db.table("blinkit_inventory_snapshots")
+            .select("snapshot_date")
+            .order("snapshot_date", desc=True)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if snap_date_rows:
+            latest_snap = snap_date_rows[0]["snapshot_date"]
+            soh_rows = (
+                db.table("blinkit_inventory_snapshots")
+                .select("location_id, total_sellable")
+                .eq("snapshot_date", latest_snap)
+                .execute()
+                .data
+            )
+            wh_stock: dict = {}
+            for r in soh_rows:
+                wh_stock[r["location_id"]] = wh_stock.get(r["location_id"], 0) + (r.get("total_sellable") or 0)
+            stocked_wh_ids = [wid for wid, qty in wh_stock.items() if qty > 0]
+
+            if stocked_wh_ids:
+                wh_names = {
+                    r["location_id"]: r["name"]
+                    for r in db.table("partner_locations").select("location_id, name")
+                                .in_("location_id", stocked_wh_ids).execute().data
+                }
+                # Join via the DS network (parent_location_id), NOT partner_locations.name
+                # vs. blinkit_performance_detail.serving_wh — those two are known to
+                # disagree for several WHs (e.g. "Bengaluru B3" vs. "Bengaluru B3 - Feeder";
+                # migration 024 renamed some but not all WH rows), which would otherwise
+                # make this trigger fire false positives for perfectly healthy WHs.
+                all_ds = (
+                    db.table("partner_locations")
+                    .select("location_id, parent_location_id")
+                    .eq("location_type", "DARKSTORE")
+                    .in_("parent_location_id", stocked_wh_ids)
+                    .execute()
+                    .data
+                )
+                ds_by_wh: dict = {}
+                for d in all_ds:
+                    ds_by_wh.setdefault(d["parent_location_id"], []).append(d["location_id"])
+
+                cutoff = (date.today() - timedelta(days=15)).isoformat()
+                orphaned = []
+                for wid in stocked_wh_ids:
+                    wh_name = wh_names.get(wid, f"location_id={wid}")
+                    ds_ids = ds_by_wh.get(wid, [])
+                    if not ds_ids:
+                        orphaned.append((wh_name, wh_stock[wid]))
+                        continue
+                    recent = (
+                        db.table("blinkit_performance_detail")
+                        .select("data_date")
+                        .in_("location_id", ds_ids)
+                        .gte("data_date", cutoff)
+                        .limit(1)
+                        .execute()
+                        .data
+                    )
+                    if not recent:
+                        orphaned.append((wh_name, wh_stock[wid]))
+
+                if orphaned:
+                    orphaned_str = ", ".join(f"{name} ({int(qty)} units)" for name, qty in sorted(orphaned))
+                    st.warning(
+                        f"**Trigger 3 — Orphaned WH stock (risk flag):** {len(orphaned)} warehouse(s) "
+                        f"show nonzero sellable stock in the latest SOH snapshot ({latest_snap}) but "
+                        f"zero dark stores with current performance data in the last 15 days: "
+                        f"{orphaned_str}. Blinkit gives no DS-level inventory quantity anywhere, so "
+                        f"this can't be proven as stranded — but it's worth confirming directly with Blinkit."
+                    )
+
     except Exception as exc:
         st.error(f"Data quality check failed: {exc}")
 

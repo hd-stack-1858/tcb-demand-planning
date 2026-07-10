@@ -33,6 +33,9 @@ import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from ingest.blinkit_wh_resolver import build_wh_name_lookup, resolve_wh_code
+
 # ── Environment ────────────────────────────────────────────────────────────────
 env = os.environ.get('TCB_ENV', 'prod')
 load_dotenv('.env' if env == 'prod' else '.env.dev')
@@ -40,29 +43,12 @@ sb = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_KEY'])
 
 SOH_DIR = Path('data/blinkit/auto/inventory/SOH')
 
-# SOH warehouse name → partner_locations code
-# SOH name takes precedence; performance_name alias is for the loader, not stored.
-WH_SOH_NAME_TO_CODE = {
-    'Bengaluru B3':              'BLK_WH_1873',
-    'Bengaluru B5 - Feeder':     'BLK_WH_5397',
-    'Hyderabad H3 - Feeder':     'BLK_WH_3201',
-    'Kundli Feeder':             'BLK_WH_2010',
-    'Kundli - Feeder':           'BLK_WH_2010',
-    'Faridabad - Feeder':        'BLK_WH_5096',
-    'Mumbai M10 - Feeder':       'BLK_WH_2123',
-    'Pune P3 - Feeder Warehouse':'BLK_WH_4572',
-    'Chennai C5 - Feeder':       'BLK_WH_3262',
-    'Noida N1 - Feeder':         'BLK_WH_2576',
-    'Nagpur N1 - Feeder':        'BLK_WH_2468',
-    'Rajpura R2 - Feeder Warehouse': 'BLK_WH_4571',
-    'Jaipur J3 - Feeder':        'BLK_WH_3200',
-    'Coimbatore C1 - Feeder':    'BLK_WH_2681',
-    'Lucknow L4':                'BLK_WH_1206',
-    'Kolkata K4 - Feeder':       'BLK_WH_2015',
-    'Kolkata K6 - Feeder Warehouse': 'BLK_WH_4842',
-    # Farukhnagar SR: closed — its SOH is merged into Faridabad below
-    'Farukhnagar - SR':          'BLK_WH_5096',  # redirect to Faridabad
-}
+# WH name → code resolution now goes through ingest/blinkit_wh_resolver.py
+# (shared with the performance loader and replenishment engine). This loader
+# does NOT auto-create new WH rows itself — the performance detail report is
+# the "mother file" for that; a WH name this loader doesn't recognize means
+# it hasn't shown up in performance data yet either, and gets alerted below
+# rather than silently dropped.
 
 # Columns to extract from SOH (after 3-row header parse)
 # Names are exact matches to row-2 sub-headers in the Blinkit SOH Excel.
@@ -155,8 +141,9 @@ def load_file(filepath: Path, dry_run: bool = False):
     print(f'    Snapshot date: {snap_date}')
     print(f'    Rows parsed:   {len(df)}')
 
-    sku_lookup = build_sku_lookup()
-    wh_lookup  = build_wh_lookup()
+    sku_lookup  = build_sku_lookup()
+    wh_lookup   = build_wh_lookup()
+    name_lookup = build_wh_name_lookup(sb)
 
     # Farukhnagar accumulator: merge into Faridabad
     farukhnagar_rows: dict[str, dict] = {}  # sku_id → partial row
@@ -168,10 +155,14 @@ def load_file(filepath: Path, dry_run: bool = False):
         wh_name = str(row[COL_WH_NAME]).strip()
         item_id = str(row[COL_ITEM_ID]).strip()
 
-        wh_code = WH_SOH_NAME_TO_CODE.get(wh_name)
-        if not wh_code:
+        # Do NOT auto-create WH rows here — the performance detail report is
+        # the "mother file" for that (ensure_whs_exist there). A name absent
+        # from name_lookup means no WH row exists yet anywhere; skip + alert
+        # rather than silently drop it.
+        if wh_name not in name_lookup:
             skipped_wh.add(wh_name)
             continue
+        wh_code = resolve_wh_code(wh_name, name_lookup)
 
         sku_id = sku_lookup.get(item_id)
         if not sku_id:
@@ -239,7 +230,10 @@ def load_file(filepath: Path, dry_run: bool = False):
             lines = [f'Blinkit SOH loader ({snap_date}): unmapped rows were skipped — stock for these is silently missing from blinkit_inventory_snapshots until mapped.', '']
             if skipped_wh:
                 lines.append(f'Unknown WH names ({len(skipped_wh)}): {sorted(skipped_wh)}')
-                lines.append('  -> add to WH_SOH_NAME_TO_CODE in ingest/blinkit_inventory_loader.py')
+                lines.append('  -> not yet in partner_locations. If this is a genuinely new WH, run '
+                             'the performance loader on a recent file first (it auto-creates WH rows); '
+                             'if the name is just a variant/alias, add it to WH_MANUAL_OVERRIDES in '
+                             'ingest/blinkit_wh_resolver.py')
             if skipped_sku:
                 lines.append(f'Unknown Item IDs ({len(skipped_sku)}): {sorted(skipped_sku)}')
                 lines.append('  -> add to sku_channel_ids (platform_pid_additional) for the BLK channel')

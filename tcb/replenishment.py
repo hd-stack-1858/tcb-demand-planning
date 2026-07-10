@@ -39,6 +39,7 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 from tcb.blinkit_ads import compute_blinkit_ads
+from ingest.blinkit_wh_resolver import build_wh_name_lookup, resolve_wh_code
 
 # ── Environment ────────────────────────────────────────────────────────────────
 env = os.environ.get('TCB_ENV', 'prod')
@@ -74,35 +75,9 @@ OUTPUT_DIR       = Path('data/blinkit/auto/replenishment')
 BLINKIT_CHANNEL_ID   = 4
 BLINKIT_CHANNEL_CODE = 'BLK'
 
-# Performance file "Serving warehouse" label → partner_locations code.
-# Covers all 20 active WHs (some have suffix variations in the CSV).
-_PERF_WH_TO_CODE: dict[str, str] = {
-    'Ahmedabad A2 - Feeder':       'BLK_WH_2470',
-    'Bengaluru B3 - Feeder':       'BLK_WH_1873',
-    'Bengaluru B3':                'BLK_WH_1873',
-    'Bengaluru B5 - Feeder':       'BLK_WH_5397',
-    'Chennai C5 - Feeder':         'BLK_WH_3262',
-    'Coimbatore C1 - Feeder':      'BLK_WH_2681',
-    'Faridabad - Feeder':          'BLK_WH_5096',
-    'Guwahati G1 - Feeder':        'BLK_WH_3213',
-    'Hyderabad H3 - Feeder':       'BLK_WH_3201',
-    'Jaipur J3 - Feeder':          'BLK_WH_3200',
-    'Kolkata K4 - Feeder':         'BLK_WH_2015',
-    'Kolkata K6 - Feeder':         'BLK_WH_4842',
-    'Kundli - Feeder':             'BLK_WH_2010',
-    'Kundli Feeder':               'BLK_WH_2010',
-    'Lucknow L4':                  'BLK_WH_1206',
-    'Super Store Lucknow L4':      'BLK_WH_1206',
-    'Mumbai M10 - Feeder':         'BLK_WH_2123',
-    'Nagpur N1 - Feeder':          'BLK_WH_2468',
-    'Noida N1 - Feeder':           'BLK_WH_2576',
-    'Patna P1 - Feeder':           'BLK_WH_2960',
-    'Pune P3 - Feeder':            'BLK_WH_4572',
-    'Pune P3 - Feeder Warehouse':  'BLK_WH_4572',
-    'Rajpura R2 - Feeder':         'BLK_WH_4571',
-    'Rajpura R2 - Feeder Warehouse': 'BLK_WH_4571',
-    'Visakhapatnam V1 - Feeder':   'BLK_WH_2670',
-}
+# WH name → code resolution now goes through ingest/blinkit_wh_resolver.py,
+# shared with the performance and SOH loaders (was a separately-maintained
+# duplicate dict here — see docs/plans/humble-questing-graham.md).
 
 _PERF_DETAIL_DIRS = [
     Path('data/blinkit/manual/product_performance/detail'),
@@ -134,7 +109,8 @@ def load_perf_wh_sku_universe(wh_df: pd.DataFrame,
     Reads the 'Item ID' and 'Serving warehouse' columns only — does NOT require
     DS to be seeded in partner_locations, so all WHs in the file appear.
     """
-    code_to_id = wh_df.set_index('code')['location_id'].to_dict()
+    code_to_id  = wh_df.set_index('code')['location_id'].to_dict()
+    name_lookup = build_wh_name_lookup(sb)
     universe: set[tuple] = set()
 
     for d in _PERF_DETAIL_DIRS:
@@ -152,7 +128,7 @@ def load_perf_wh_sku_universe(wh_df: pd.DataFrame,
                 df = df.dropna()
                 for item_id, wh_name in zip(df['Item ID'], df['Serving warehouse']):
                     sku_id = item_to_sku.get(str(item_id).strip())
-                    code   = _PERF_WH_TO_CODE.get(str(wh_name).strip())
+                    code   = resolve_wh_code(str(wh_name).strip(), name_lookup)
                     if sku_id and code:
                         wh_id = code_to_id.get(code)
                         if wh_id:
@@ -230,7 +206,8 @@ def load_perf_ds_active_y(wh_df: pd.DataFrame,
     Returns count of active DS per (wh_location_id, sku_id) from that file.
     This is the independent CSV-based signal for the non-tautological check.
     """
-    code_to_id = wh_df.set_index('code')['location_id'].to_dict()
+    code_to_id  = wh_df.set_index('code')['location_id'].to_dict()
+    name_lookup = build_wh_name_lookup(sb)
 
     all_files: list[Path] = []
     for d in _PERF_DETAIL_DIRS:
@@ -281,7 +258,7 @@ def load_perf_ds_active_y(wh_df: pd.DataFrame,
         if str(row['Considered for assessment (Y/N)']).strip() != 'Y':
             continue
         sku_id  = item_to_sku.get(str(row['Item ID']).strip())
-        wh_code = _PERF_WH_TO_CODE.get(str(row['Serving warehouse']).strip())
+        wh_code = resolve_wh_code(str(row['Serving warehouse']).strip(), name_lookup)
         if not sku_id or not wh_code:
             continue
         wh_id = code_to_id.get(wh_code)

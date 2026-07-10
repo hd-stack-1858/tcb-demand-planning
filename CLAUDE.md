@@ -205,7 +205,7 @@ Result: each DELIVERED order is attributed to a specific WH → consume that WH'
 | BLK_WH_2576 | Noida N1 - Feeder | Noida/UP |
 | BLK_WH_3201 | Hyderabad H3 | Hyderabad + surrounding AP/Telangana |
 
-Full 20-WH mapping lives in `_PERF_WH_TO_CODE` dict in `tcb/replenishment.py`.
+WH name → code resolution lives in `ingest/blinkit_wh_resolver.py` (`WH_MANUAL_OVERRIDES`, shared by the performance loader, SOH loader, and replenishment engine). New WHs are auto-created from the performance detail file — see `docs/plans/humble-questing-graham.md`.
 
 ---
 
