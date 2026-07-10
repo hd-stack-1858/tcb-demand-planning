@@ -2361,6 +2361,15 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
         closed_ds_ids_wh   = has_dark_closed_ids - active_ds_ids_wh
         ds_closed_count    = len(closed_ds_ids_wh)
 
+        # Skip WHs with no live DS presence at all (every DS closed, or none
+        # exist) — same principle as Farukhnagar, which never appears here
+        # because it's flagged is_active=False on the WH row itself. These
+        # WHs (e.g. Chennai C5, fully wound down per Blinkit) don't have that
+        # DB flag set yet, but showing them clutters the table with nothing
+        # actionable — Total DS == DS Closed means zero open dark stores.
+        if len(w_ds) == ds_closed_count:
+            continue
+
         # Not-closed DS: every DS that is NOT in closed_ds_ids_wh.
         # Includes active, launch_awaited, sku_moved_out, etc. — any status
         # except a confirmed-closed store.  City (N) shows how these distribute.
