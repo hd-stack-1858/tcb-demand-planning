@@ -1852,6 +1852,46 @@ def _load_all_elig() -> list:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _load_latest_stock_flags(sku_id: str, location_ids: tuple, days_back: int = 20) -> dict:
+    """
+    For each given DS (location_id), return whether it currently has stock —
+    the inventory_available flag from its most recent blinkit_performance_detail
+    row for this SKU within the last `days_back` days. A DS with no row at all
+    in that window (nothing recent to go on) is treated as no-stock — the
+    conservative default, since we can't confirm availability either way.
+    location_ids must be a tuple (not list/set) so st.cache_data can hash it.
+    """
+    if not location_ids:
+        return {}
+    db = get_client()
+    cutoff = (date.today() - timedelta(days=days_back)).isoformat()
+    rows, offset, page_size = [], 0, 1000
+    while True:
+        batch = (
+            db.table("blinkit_performance_detail")
+            .select("location_id,data_date,inventory_available")
+            .eq("sku_id", sku_id)
+            .in_("location_id", list(location_ids))
+            .gte("data_date", cutoff)
+            .order("data_date", desc=True)
+            .range(offset, offset + page_size - 1)
+            .execute()
+            .data
+        )
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+
+    latest: dict = {}
+    for r in rows:
+        loc_id = r["location_id"]
+        if loc_id not in latest:  # first occurrence = latest, since sorted desc
+            latest[loc_id] = bool(r["inventory_available"])
+    return latest
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def _load_blinkit_fc_month1(month1_str: str) -> "pd.DataFrame":
     db = get_client()
     rows = (
@@ -1929,6 +1969,10 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
     c6.metric("Not launched",        not_launch)
     c7.metric("Choked",              choked)
     c8.metric("Active",              active_us)
+    st.caption(
+        "These counts and the bar chart below cover only the top 15 cities by dark store count. "
+        "\"Launch Status\" further down covers **all** cities, so its totals will be larger."
+    )
 
     fig = go.Figure()
     for key, label, color in _STATUS_META:
@@ -1962,6 +2006,56 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
         paper_bgcolor="rgba(0,0,0,0)",
     )
     st.plotly_chart(fig, use_container_width=True)
+
+    # ── Launch Status ──────────────────────────────────────────────────────────
+    st.markdown("#### Launch Status")
+    st.caption(
+        "Per-city launch state for this SKU, for expansion decisions — covers **all** cities "
+        "(unlike the top-15-only counts and chart above)."
+    )
+
+    df_city = df[df["city"].notna() & (df["city"] != "")]
+    active_rows          = df_city[df_city["status"] == "active"]
+    launch_awaited_rows  = df_city[df_city["status"] == "launch_awaited"]
+
+    active_ds_ids = tuple(sorted(active_rows["location_id"].unique().tolist()))
+    stock_flags   = _load_latest_stock_flags(selected_sku, active_ds_ids)
+
+    with_stock, no_stock = [], []
+    for city, grp in active_rows.groupby("city"):
+        loc_ids   = grp["location_id"].tolist()
+        cnt       = len(loc_ids)
+        has_stock = any(stock_flags.get(lid, False) for lid in loc_ids)
+        (with_stock if has_stock else no_stock).append((city, cnt))
+    with_stock.sort(key=lambda x: -x[1])
+    no_stock.sort(key=lambda x: -x[1])
+
+    # Not launched: city has launch_awaited DS AND zero active DS for this SKU.
+    # A city with ANY active DS counts as launched — even if some other DS
+    # there are still pending launch — so "launched" always takes priority
+    # over "not launched" for the same city.
+    launched_cities   = set(active_rows["city"].unique().tolist())
+    not_launched_pool = launch_awaited_rows[~launch_awaited_rows["city"].isin(launched_cities)]
+    not_launched = sorted(
+        ((city, len(grp)) for city, grp in not_launched_pool.groupby("city")),
+        key=lambda x: -x[1],
+    )
+
+    def _city_count_df(pairs: list[tuple]) -> pd.DataFrame:
+        if not pairs:
+            return pd.DataFrame({"City": ["— none —"]})
+        return pd.DataFrame({"City": [f"{city} ({cnt})" for city, cnt in pairs]})
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.markdown(f"**Cities Launched with stock** ({len(with_stock)})")
+        st.dataframe(_city_count_df(with_stock), use_container_width=True, hide_index=True)
+    with col_b:
+        st.markdown(f"**Cities Launched but no stock** ({len(no_stock)})")
+        st.dataframe(_city_count_df(no_stock), use_container_width=True, hide_index=True)
+    with col_c:
+        st.markdown(f"**Cities not Launched** ({len(not_launched)})")
+        st.dataframe(_city_count_df(not_launched), use_container_width=True, hide_index=True)
 
     # ── Inventory Health table ─────────────────────────────────────────────────
     st.markdown("#### Inventory Health")
