@@ -2518,6 +2518,12 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
                 markers=True,
                 labels={"quantity": "Units", "city": "City"},
                 category_orders={"Month": month_order, "city": city_order},
+                # Plotly's default qualitative palette only has 10 colors and
+                # wraps around — with top-10 + "Others" (11 categories), the
+                # 11th line silently reused the 1st city's color, making two
+                # different cities' lines look like one tangled line. Dark24
+                # has enough distinct colors to cover 11 without repeating.
+                color_discrete_sequence=px.colors.qualitative.Dark24,
             )
             fig_bk.update_layout(
                 xaxis_title=None, yaxis_title="Units",
