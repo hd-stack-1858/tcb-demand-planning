@@ -2507,8 +2507,14 @@ def tab_blinkit_deepdive(fdf: pd.DataFrame, net_mode: bool) -> None:
             bk_plot = bk_trend.copy()
             bk_plot["city"] = bk_plot["city"].where(bk_plot["city"].isin(top10_cities), "Others")
             bk_plot = (
-                bk_plot.groupby(["Month", "month_dt", "city"])["quantity"].sum()
+                # month_dt (an actual datetime) must be the FIRST groupby key —
+                # grouping by the "Month" string label first sorts rows
+                # alphabetically ("Apr" < "Dec" < "Feb"...), and px.line() draws
+                # each line by connecting dataframe rows in order, not by axis
+                # position — that's what caused the zigzagging lines.
+                bk_plot.groupby(["month_dt", "Month", "city"])["quantity"].sum()
                 .reset_index()
+                .sort_values("month_dt")
             )
             city_order = top10_cities + (["Others"] if "Others" in bk_plot["city"].values else [])
 
