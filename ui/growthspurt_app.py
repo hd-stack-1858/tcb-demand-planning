@@ -1758,6 +1758,12 @@ _STATUS_COLOR = {k: col for k, _, col in _STATUS_META}
 
 @st.cache_data(ttl=300)
 def _load_city_ds(sku_id: str) -> pd.DataFrame:
+    # Columns: location_id, name, city, parent_location_id, status.
+    # NOTE: st.cache_data hashes THIS function's own bytecode, not the
+    # bytecode of get_blinkit_city_ds() in tcb/db.py that it calls — so
+    # changing a column there does NOT bust a cache entry created before
+    # that change. If you add/remove a column on the tcb.db side again,
+    # touch this docstring/comment too so the cache key actually changes.
     rows = get_blinkit_city_ds(sku_id)
     if not rows:
         return pd.DataFrame()
