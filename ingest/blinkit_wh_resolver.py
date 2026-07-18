@@ -42,6 +42,7 @@ WH_MANUAL_OVERRIDES: dict[str, str] = {
     'Lucknow L4':                     'BLK_WH_1206',
     'Super Store Lucknow L4':         'BLK_WH_1206',
     'Mumbai M10 - Feeder':            'BLK_WH_2123',
+    'Mumbai M12 - Feeder Warehouse':  'BLK_WH_8AFFA200',
     'Nagpur N1 - Feeder':             'BLK_WH_2468',
     'Noida N1 - Feeder':              'BLK_WH_2576',
     'Patna P1 - Feeder':              'BLK_WH_2960',
