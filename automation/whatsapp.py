@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 import requests
@@ -42,6 +43,8 @@ logger = logging.getLogger(__name__)
 _API_BASE   = "https://graph.facebook.com/v20.0"
 _TEMPLATE   = "daily_sales_brief"   # must match Meta-approved template name
 _LANG_CODE  = "en"
+_MAX_ATTEMPTS   = 3   # transient 5xx errors (e.g. Meta's "is_transient":true OAuthException) are worth retrying
+_RETRY_DELAY_S  = 3
 
 
 def _get_config() -> tuple[str, str, list[str]]:
@@ -112,7 +115,17 @@ def send_daily_brief(message_text: str, dry_run: bool = False) -> list[dict]:
                 ],
             },
         }
-        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        resp = None
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            if resp.status_code < 500:
+                break
+            logger.warning(
+                "WhatsApp send to %s got %d (attempt %d/%d): %s",
+                recipient, resp.status_code, attempt, _MAX_ATTEMPTS, resp.text,
+            )
+            if attempt < _MAX_ATTEMPTS:
+                time.sleep(_RETRY_DELAY_S)
         try:
             resp.raise_for_status()
         except requests.HTTPError as exc:

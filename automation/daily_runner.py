@@ -147,10 +147,30 @@ def _send_whatsapp(amazon_result: dict, blinkit_result: dict, dry_run: bool) -> 
         import requests as _req
         if isinstance(exc, _req.exceptions.HTTPError):
             logger.error("WhatsApp API error (already logged above): %s", exc)
+            _alert_whatsapp_failure(str(exc))
         else:
             logger.warning("WhatsApp not configured — skipping send.\n%s", exc)
     except Exception as exc:
         logger.error("WhatsApp send failed: %s", exc)
+        _alert_whatsapp_failure(str(exc))
+
+
+def _alert_whatsapp_failure(detail: str) -> None:
+    """Email alert for a WhatsApp send failure — the send already retries transient 5xx errors, so a failure here means retries were exhausted or a non-retryable error occurred."""
+    try:
+        from automation.email_sender import send_alert
+        today = date.today().strftime("%d-%b")
+        log = f"automation/logs/daily_runner_{date.today().strftime('%Y%m%d')}.log"
+        send_alert(
+            subject=f"⚠️ WhatsApp Briefing — Send Failed ({today})",
+            body=(
+                f"WhatsApp daily briefing failed to send (retries exhausted).\n\n"
+                f"Detail: {detail}\n\n"
+                f"Log: {log}"
+            ),
+        )
+    except Exception as exc:
+        logger.warning("Could not send WhatsApp-failure alert email: %s", exc)
 
 
 def _run_soh() -> dict:
