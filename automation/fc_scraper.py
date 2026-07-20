@@ -17,7 +17,7 @@ Flow per run:
        i. Click "Print Invoice" -> download PDF
        j. Click "Print Address" -> download PDF
        k. Close configure tab
-  4. Email all downloaded PDFs (Invoice + Packing Slip for each order) to Himanshu + Dilwar
+  4. Email all downloaded PDFs (Invoice + Packing Slip for each order) to Himanshu + Dilwar + Meet
 
 Self-healing: orders already processed disappear from Pending Orders, so re-running
 the same schedule slot is always safe.
@@ -29,6 +29,7 @@ Required .env vars:
   SMTP_PASSWORD     Gmail App Password
   EMAIL_HIMANSHU    Himanshu's email
   EMAIL_DILWAR      Dilwar's email
+  EMAIL_MEET        Meet's email
 
 Setup:
   1. Run `python automation/fc_auth.py` once to save session
@@ -877,12 +878,13 @@ def run(dry_run: bool = False, headed: bool = False, no_email: bool = False) -> 
         r for r in [
             os.environ.get("EMAIL_HIMANSHU", "").strip(),
             os.environ.get("EMAIL_DILWAR", "").strip(),
+            os.environ.get("EMAIL_MEET", "").strip(),
         ]
         if r
     ]
 
     if not recipients:
-        logger.warning("No email recipients. Set EMAIL_HIMANSHU / EMAIL_DILWAR in .env")
+        logger.warning("No email recipients. Set EMAIL_HIMANSHU / EMAIL_DILWAR / EMAIL_MEET in .env")
     else:
         n     = result["orders_processed"]
         today = date.today().strftime("%d-%b-%Y")

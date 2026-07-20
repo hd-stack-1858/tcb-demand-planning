@@ -8,7 +8,7 @@ Flow each run:
        - If any: select all → ACCEPT → orders move to "Orders to be shipped"
   3. Navigate to Orders to be Shipped:
        - If any: select all → BRANDING CHALLAN → PDF downloads
-  4. Email PDF to Himanshu + Dilwar
+  4. Email PDF to Himanshu + Dilwar + Meet
 
 Clean no-op if no orders found. Self-healing: orders stuck in "Orders to be
 shipped" from a failed run are picked up on the next run automatically.
@@ -20,6 +20,7 @@ Required .env vars:
   SMTP_PASSWORD     Gmail App Password for SMTP_SENDER
   EMAIL_HIMANSHU    Himanshu's email
   EMAIL_DILWAR      Dilwar's email
+  EMAIL_MEET        Meet's email
 
 Usage:
   python automation/fnp_scraper.py              # normal run
@@ -1101,12 +1102,13 @@ def _run_once(dry_run: bool = False, headed: bool = False, no_email: bool = Fals
         r for r in [
             os.environ.get("EMAIL_HIMANSHU", "").strip(),
             os.environ.get("EMAIL_DILWAR", "").strip(),
+            os.environ.get("EMAIL_MEET", "").strip(),
         ]
         if r
     ]
 
     if not recipients:
-        logger.warning("No email recipients set. Add EMAIL_HIMANSHU / EMAIL_DILWAR to .env")
+        logger.warning("No email recipients set. Add EMAIL_HIMANSHU / EMAIL_DILWAR / EMAIL_MEET to .env")
     else:
         gap   = result.get("challan_gap", 0)
         n     = result["ship_count"] if result["ship_count"] > 0 else result["allocated_accepted"]
