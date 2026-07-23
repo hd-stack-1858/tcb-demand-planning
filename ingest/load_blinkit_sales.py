@@ -1,16 +1,9 @@
 """Load Blinkit daily / MTD sales Excel files into the orders table.
 
-Sales report columns (row 1 header, row 2+ data):
-  0  S.No.              10  Supply City        20  CESS(%)
-  1  Order Id           11  Supply State       21  Quantity
-  2  Order Date         12  Supply State GST   22  MRP (Rs)
-  3  Item Id            13  Customer City      23  Selling Price (Rs)
-  4  Product Name       14  Customer State     24  IGST Value
-  5  Brand Name         15  Order Status       25  CGST Value
-  6  UPC                16  HSN Code           26  SGST Value
-  7  Variant Desc       17  IGST(%)            27  CESS Value
-  8  App Mapping        18  CGST(%)            28  Total Tax
-  9  Business Cat       19  SGST(%)            29  Total Gross Bill Amount
+Columns are looked up by header name (row 1), not fixed position — Blinkit
+has changed the export at least once already (2026-07-23: the 'S.No.' column
+was dropped, shifting every other column left by one, which silently broke
+a hardcoded-position parser). Column order/count is not something we control.
 
 Usage:
   python ingest/load_blinkit_sales.py --file <path.xlsx> [--env dev|prod] [--dry-run]
@@ -53,34 +46,62 @@ def _parse_date(val) -> date:
     raise ValueError(f"Cannot parse date: {val!r}")
 
 
-def _build_row(raw: tuple, source_file: str) -> dict | None:
+_REQUIRED_COLS = [
+    "Order Id", "Order Date", "Item Id", "Quantity",
+    "MRP (Rs)", "Selling Price (Rs)", "Total Gross Bill Amount",
+    "Supply State", "Customer City", "Customer State",
+]
+
+
+def _header_index(header_row: tuple) -> dict[str, int]:
+    """Map column name -> position from the header row (row 1)."""
+    idx = {str(v).strip(): i for i, v in enumerate(header_row) if v is not None}
+    missing = [c for c in _REQUIRED_COLS if c not in idx]
+    if missing:
+        raise RuntimeError(
+            f"Blinkit sales report is missing expected column(s): {missing}. "
+            f"Header found: {header_row}"
+        )
+    return idx
+
+
+def _build_row(raw: tuple, col: dict[str, int], source_file: str) -> dict | None:
     """Build an orders dict from one raw sales-report row. Returns None to skip."""
-    if raw[0] is None:
+    order_id_val = raw[col["Order Id"]]
+    if order_id_val is None:
         return None
 
     try:
-        order_date = _parse_date(raw[2])
+        order_date = _parse_date(raw[col["Order Date"]])
     except ValueError:
         return None
 
-    if not raw[3]:
+    item_id = raw[col["Item Id"]]
+    if not item_id:
         return None
 
-    sku_id = resolve_blinkit_sku(int(raw[3]), order_date)
+    sku_id = resolve_blinkit_sku(int(item_id), order_date)
     if sku_id is None:
         return None
 
-    mrp = float(raw[22]) if raw[22] is not None else None
-    sp  = float(raw[23]) if raw[23] is not None else None
-    gv  = float(raw[29]) if raw[29] is not None else None
-    qty = int(raw[21])   if raw[21] is not None else 1
+    mrp_raw = raw[col["MRP (Rs)"]]
+    sp_raw  = raw[col["Selling Price (Rs)"]]
+    gv_raw  = raw[col["Total Gross Bill Amount"]]
+    qty_raw = raw[col["Quantity"]]
+
+    mrp = float(mrp_raw) if mrp_raw is not None else None
+    sp  = float(sp_raw)  if sp_raw  is not None else None
+    gv  = float(gv_raw)  if gv_raw  is not None else None
+    qty = int(qty_raw)   if qty_raw is not None else 1
 
     discount_pct = None
     if mrp and sp and mrp > 0:
         discount_pct = round((mrp - sp) / mrp * 100, 2)
 
+    supply_state = raw[col["Supply State"]]
+
     return {
-        "order_id":          f"BLK-{raw[1]}-{sku_id}",
+        "order_id":          f"BLK-{order_id_val}-{sku_id}",
         "channel_id":        BLK_CHANNEL_ID,
         "order_date":        order_date.isoformat(),
         "sku_id":            sku_id,
@@ -89,12 +110,12 @@ def _build_row(raw: tuple, source_file: str) -> dict | None:
         "selling_price":     sp,
         "gross_value":       gv,
         "discount_pct":      discount_pct,
-        "supply_state":      str(raw[11]).strip() if raw[11] else None,
-        "city":              raw[13],
-        "state":             raw[14],
+        "supply_state":      str(supply_state).strip() if supply_state else None,
+        "city":              raw[col["Customer City"]],
+        "state":             raw[col["Customer State"]],
         "fulfillment_type":  "SOR",
         "status":            "FULFILLED",
-        "platform_order_id": str(raw[1]),
+        "platform_order_id": str(order_id_val),
         "source_file":       source_file,
     }
 
@@ -105,21 +126,44 @@ def load_file(filepath: Path, db, dry_run: bool = False) -> tuple[int, int]:
     Uses ignore_duplicates=False so any field changes on re-load propagate.
     lot_cogs_finalized is not in the Blinkit row dict and is therefore not
     touched by the upsert.
+
+    Loaded with read_only=False: a read-only load trusts the file's <dimension>
+    tag to bound row/column iteration, and a Blinkit export on 2026-07-23
+    ("sales_summary.xlsx") had a corrupted dimension tag (declared 1x1) despite
+    holding 233 real rows — read-only mode silently returned 0 rows with no
+    error. Full parsing reads actual row/cell data regardless of that tag.
     """
-    wb = openpyxl.load_workbook(str(filepath), read_only=True, data_only=True)
+    wb = openpyxl.load_workbook(str(filepath), data_only=True)
     ws = wb.active
+
+    rows_iter = ws.iter_rows(min_row=1, values_only=True)
+    header = next(rows_iter, None)
+    if header is None:
+        wb.close()
+        return 0, 0
+    col = _header_index(header)
 
     to_upsert: list[dict] = []
     skipped = 0
+    total_rows = 0
 
-    for raw in ws.iter_rows(min_row=2, values_only=True):
-        row = _build_row(raw, filepath.name)
+    for raw in rows_iter:
+        total_rows += 1
+        row = _build_row(raw, col, filepath.name)
         if row is None:
             skipped += 1
         else:
             to_upsert.append(row)
 
     wb.close()
+
+    if total_rows > 0 and not to_upsert:
+        raise RuntimeError(
+            f"{filepath.name}: all {total_rows} row(s) were skipped by the parser — "
+            f"the file's format likely doesn't match what this loader expects "
+            f"(wrong report downloaded, columns reordered, etc). Refusing to silently "
+            f"report 0 sales."
+        )
 
     if dry_run or not to_upsert:
         return len(to_upsert), skipped
