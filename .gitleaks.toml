@@ -1,0 +1,9 @@
+title = "TCB Demand Planning gitleaks config"
+
+[extend]
+useDefault = true
+
+# Amazon India marketplace ID — public SP-API constant, not a secret.
+# See automation/amazon_sp_api.py and https://developer-docs.amazon.com/sp-api/docs/marketplace-ids
+[allowlist]
+regexes = ['''A21TJRUUN4KGV''']
