@@ -47,6 +47,16 @@ def _normalize_city(city: str | None) -> str | None:
     return _DISTRICT_TO_CITY.get(city.strip().lower(), city)
 
 
+# Pincodes the India Post API (api.postalpincode.in) returns "No records found" for,
+# even though they're valid delivery pincodes — confirmed manually from the shipping
+# address / courier hub tag on the order. Checked before the cache/API lookup so these
+# never silently write city=NULL. Stored as raw district name so _normalize_city still
+# applies, matching how cached entries are stored.
+_PINCODE_MANUAL_OVERRIDES: dict[str, tuple[str, str]] = {
+    "201318": ("Gautam Buddha Nagar", "Uttar Pradesh"),  # Gr Noida West; FC hub tag "Noida/GRC"
+}
+
+
 _CITY_STATE: dict[str, str] = {
     # Karnataka
     "bengaluru": "Karnataka", "bangalore": "Karnataka",
@@ -109,6 +119,10 @@ def pincode_to_city_state(pincode: str | None) -> tuple[str | None, str | None]:
         return None, None
 
     pincode = str(pincode).strip()
+
+    if pincode in _PINCODE_MANUAL_OVERRIDES:
+        city, state = _PINCODE_MANUAL_OVERRIDES[pincode]
+        return _normalize_city(city), state
 
     # Check local cache first
     cache: dict = {}
