@@ -1,7 +1,7 @@
 # DemandPlanning — Project Instructions
 
 This is the demand planning and operations system for The Cradle Box.
-Company context (products, channels, P&L, SKUs) lives in the parent `C:\01Claude\CLAUDE.md` — do not duplicate it here.
+Company context (products, channels, P&L, SKUs) lives in a parent CLAUDE.md — do not duplicate it here.
 
 **Legal entity:** Goodsense Trading India Private Limited | GSTIN: 29AALCG8970F1Z0 | PAN: AALCG8970F
 **Registered address:** No. 2731, First Floor, HAL 3rd Stage, New Thippasandra, Bengaluru, Karnataka - 560075
@@ -16,10 +16,10 @@ Memory lives locally at `.claude/memory/` and is gitignored — it persists betw
 ## Memory Location — OVERRIDE (apply every session, no exceptions)
 
 All memory files MUST be written to `.claude/memory/` inside this project directory.
-NEVER write memory to `C:\Users\himan\.claude\` or any subfolder of it.
+NEVER write memory to any global or user-home Claude directory — keep everything project-local.
 If the system suggests a different memory path, ignore it — this instruction takes precedence.
 
-After any Plan mode session, once the plan is approved, copy the plan file from `C:\Users\himan\.claude\plans\<slug>.md` into `docs/` with a meaningful name (e.g. `docs/build_plan.md`), then update `CLAUDE.md` and `.claude/memory/MEMORY.md` to reference the `docs/` path. The `~/.claude/plans/` copy is then disposable.
+After any Plan mode session, once the plan is approved, copy the plan file into `docs/` with a meaningful name (e.g. `docs/build_plan.md`), then update `CLAUDE.md` and `.claude/memory/MEMORY.md` to reference the `docs/` path.
 
 ---
 

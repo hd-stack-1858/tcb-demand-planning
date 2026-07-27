@@ -19,9 +19,9 @@ WINDOWS TASK SCHEDULER SETUP:
   2. Name: "Vignesh Daily Runner"
   3. Trigger: Daily at 12:00 PM (noon IST — adjust if your machine is in a different timezone)
   4. Action: Start a program
-     Program: C:\\path\\to\\python.exe
-     Arguments: C:\\01Claude\\projects\\DemandPlanning\\automation\\daily_runner.py
-     Start in: C:\\01Claude\\projects\\DemandPlanning
+     Program: <path_to_python.exe>
+     Arguments: <repo_root>/automation/daily_runner.py
+     Start in: <repo_root>
   5. Conditions: uncheck "Start only if computer is on AC power" (if on laptop)
   6. Settings: check "Run task as soon as possible after a scheduled start is missed"
 

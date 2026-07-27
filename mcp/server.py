@@ -13,7 +13,7 @@ Register in claude_desktop_config.json:
       "mcpServers": {
         "vignesh": {
           "command": "python",
-          "args": ["C:\\\\01Claude\\\\projects\\\\DemandPlanning\\\\mcp\\\\server.py"]
+          "args": ["<repo_root>/mcp/server.py"]
         }
       }
     }
