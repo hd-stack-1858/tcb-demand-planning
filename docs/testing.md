@@ -10,12 +10,12 @@ for issue [#6](https://github.com/hd-stack-1858/tcb-demand-planning/issues/6).
 
 | File | Lines | What it covers |
 |---|---|---|
-| `tests/conftest.py` | 117 | Shared fixtures (below) |
-| `tests/test_phase_a.py` | ~299 | Drop-ship sale capture, COGS lots, MRP/state enrichment (`tcb.inventory`, `tcb.geo`) — ~24 tests |
-| `tests/test_phase_b.py` | ~171 | Blinkit sell-out ingestion (`ingest.utils`, `ingest.load_blinkit_sales`, `ingest.load_blinkit_payout`) — ~13 tests |
-| `tests/test_secret_scan.py` | 37 | Unrelated — checks `.gitleaks.toml`/CI workflow presence and runs `gitleaks` against history. No DB interaction. |
+| `tests/conftest.py` | 116 | Shared fixtures (below) |
+| `tests/test_phase_a.py` | ~299 | Drop-ship sale capture, COGS lots, MRP/state enrichment (`tcb.inventory`, `tcb.geo`) — 23 tests |
+| `tests/test_phase_b.py` | ~171 | Blinkit sell-out ingestion (`ingest.utils`, `ingest.load_blinkit_sales`, `ingest.load_blinkit_payout`) — 12 tests |
+| `tests/test_secret_scan.py` | 36 | Unrelated — checks `.gitleaks.toml`/CI workflow presence and runs `gitleaks` against history. No DB interaction. |
 
-`test_phase_b.py` has 7 of its 13 tests gated by `skipif` on local Excel fixture files
+`test_phase_b.py` has 6 of its 12 tests gated by `skipif` on local Excel fixture files
 (`blinkit_reports/sales/*.xlsx`, `blinkit_reports/payout sheets/*`) that are gitignored and
 absent on any fresh checkout — **these silently skip in CI or on a new machine**, giving no real
 coverage signal there today.
@@ -124,7 +124,9 @@ the CI-setup follow-up issue below, not done here.
 
 ## 4. Next Steps
 
-Five follow-up issues, each blocked by this one via native GitHub issue dependencies:
+Five follow-up issues, each blocked by this one via native GitHub issue dependencies (follow-up
+4 is additionally blocked by #18, the feature-flag system — it can't start until both #6 and #18
+have landed, since its rollout depends on the flag mechanism):
 
 1. **Pure-logic unit tests** — `tcb/replenishment.py`, `blinkit_wh_resolver.py`, `match_remark()`. Narrows issue #10.
 2. **`tcb/inventory.py` integration tests** — against the local Supabase stack, covering the 18 untested public functions in 3.2. Narrows issue #10.
