@@ -45,7 +45,14 @@ def send_with_attachments(
     attachments: list[Path],
     dry_run: bool = False,
 ) -> None:
-    """Post a comment with one or more file attachments to the configured channel."""
+    """Post a comment with one or more file attachments to the configured channel.
+
+    Note: Slack's upload API has no batch-complete endpoint, so each file in
+    `attachments` is posted as its own separate message carrying the same
+    `comment` text — not one message with N files attached. Only single-file
+    callers exist today (run_blinkit_report.py); multi-file callers should be
+    aware the channel will show N messages, not one.
+    """
     token, channel_id = _get_credentials()
 
     if dry_run:

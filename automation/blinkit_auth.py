@@ -24,7 +24,6 @@ from __future__ import annotations
 import os
 import sys
 import time
-import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
