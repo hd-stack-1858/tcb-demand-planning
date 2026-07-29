@@ -64,7 +64,7 @@ not just a Docker verification pass.
 
 ## Deploying to Cloud Run (manual steps used for `tcb-blinkit-report`)
 
-Not yet on a schedule (see [#45](https://github.com/hd-stack-1858/tcb-demand-planning/issues/45)) — this is how the current proof-of-concept job was actually set up, standalone GCP project (`adroitandroidworks` — see [#44](https://github.com/hd-stack-1858/tcb-demand-planning/issues/44) for the eventual move to TCB's real GCP org):
+Standalone GCP project (`adroitandroidworks` — see [#44](https://github.com/hd-stack-1858/tcb-demand-planning/issues/44) for the eventual move to TCB's real GCP org). This is how the job was actually set up:
 
 ```bash
 # Build for linux/amd64 (Cloud Run's default arch — matters on Apple Silicon)
@@ -101,3 +101,15 @@ gcloud run jobs execute tcb-blinkit-report --project=adroitandroidworks --region
   - Bad `SUPABASE_KEY` → clean `401 Unauthorized` from Supabase, caught by `run_blinkit_report.py`'s generic exception handler, **Slack alert sent**, exit code 1.
   - Corrupted/expired Blinkit session (cookies overwritten with garbage, then restored from a backup afterward) → `BlinkitSessionExpired` raised, **Slack alert sent** with a distinct message, exit code 2 — correctly distinguished from the generic-error case.
   - In both cases, Cloud Run reports the execution as failed (non-zero exit) — nothing here can silently succeed while actually broken.
+
+## Scheduling ([#52](https://github.com/hd-stack-1858/tcb-demand-planning/issues/52))
+
+Matches the existing local Windows Task Scheduler run (12:01 IST daily) so Himanshu can compare the cloud report against the local one, side by side, before any real cutover ([#53](https://github.com/hd-stack-1858/tcb-demand-planning/issues/53)). Deliberately still `--dry-run` — the scrape (and therefore the report file) is identical either way; only the DB-write step is gated on `--dry-run`.
+
+```bash
+PROJECT_ID=adroitandroidworks REGION=asia-south1 ./scripts/setup_blinkit_scheduler.sh
+```
+
+Wires a Cloud Scheduler job (`tcb-blinkit-report-daily`, cron `31 6 * * *` = 12:01 IST, no DST in India) that calls the Cloud Run Jobs Admin API's `:run` endpoint via OAuth, authenticated as the job's own runtime service account (granted `roles/run.invoker` on itself by the script). Safe to re-run — enabling an already-enabled API, an already-held IAM role, and updating an existing Scheduler job are all idempotent.
+
+Verified live: `gcloud scheduler jobs run tcb-blinkit-report-daily ...` triggered a real execution — real report, real Slack post, exit 0.
