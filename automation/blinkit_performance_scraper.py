@@ -11,7 +11,7 @@ Usage:
     python automation/blinkit_performance_scraper.py --headed       # visible browser (debug)
     python automation/blinkit_performance_scraper.py --dry-run      # download only, skip ingest
 
-Session auth: relies on .blinkit_session/state.json saved by blinkit_auth.py.
+Session auth: relies on the Supabase-stored session (portal_sessions) saved by blinkit_auth.py.
 If session is expired, raises BlinkitSessionExpired (exit code 2 → WhatsApp alert).
 
 Navigation flow (Blinkit seller portal — verified against live UI):
@@ -50,7 +50,6 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
 PORTAL_URL   = 'https://seller.blinkit.com'
-SESSION_FILE = Path(__file__).parent.parent / '.blinkit_session' / 'state.json'
 DOWNLOAD_DIR = Path(__file__).parent.parent / 'data' / 'blinkit' / 'auto' / 'product_performance' / 'detail'
 
 
@@ -69,7 +68,7 @@ def _is_login_page(page) -> bool:
         return False
 
 
-def _new_browser_context(playwright, headed: bool) -> tuple:
+def _new_browser_context(playwright, headed: bool, session_state: dict) -> tuple:
     try:
         browser = playwright.chromium.launch(
             channel='chrome',
@@ -84,7 +83,7 @@ def _new_browser_context(playwright, headed: bool) -> tuple:
             args=['--disable-blink-features=AutomationControlled'],
         )
     ctx = browser.new_context(
-        storage_state=str(SESSION_FILE),
+        storage_state=session_state,
         accept_downloads=True,
         user_agent=(
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -217,16 +216,19 @@ def scrape(headed: bool = False) -> Path:
     Returns Path to the saved CSV file.
     Raises BlinkitSessionExpired if session is stale.
     """
-    if not SESSION_FILE.exists():
+    from tcb.session_store import load_session, save_session
+
+    session_state = load_session('blinkit')
+    if session_state is None:
         raise FileNotFoundError(
-            f'No saved session at {SESSION_FILE}.\n'
+            'No saved Blinkit session in Supabase (portal_sessions).\n'
             'Run: python automation/blinkit_auth.py'
         )
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as p:
-        browser, ctx = _new_browser_context(p, headed)
+        browser, ctx = _new_browser_context(p, headed, session_state)
         page = ctx.new_page()
 
         # ── Step 1: Load portal, verify session ──────────────────────────────
@@ -456,8 +458,8 @@ def scrape(headed: bool = False) -> Path:
         download.save_as(str(dest))
         logger.info('Saved: %s', dest)
 
-        ctx.storage_state(path=str(SESSION_FILE))
-        logger.info('Session refreshed: %s', SESSION_FILE)
+        save_session('blinkit', ctx.storage_state())
+        logger.info('Session refreshed in Supabase (portal_sessions)')
         browser.close()
 
     return dest

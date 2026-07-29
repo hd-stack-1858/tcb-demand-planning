@@ -8,6 +8,11 @@ from pathlib import Path
 
 import pytest
 
+# Doesn't touch the DB directly, but tests/conftest.py's autouse fixture
+# still requires dev credentials to collect this file — see docs/testing.md
+# "Known limitation" for the fix (move under tests/unit/).
+pytestmark = pytest.mark.integration
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 

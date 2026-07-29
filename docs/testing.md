@@ -14,6 +14,8 @@ for issue [#6](https://github.com/hd-stack-1858/tcb-demand-planning/issues/6).
 | `tests/test_phase_a.py` | ~299 | Drop-ship sale capture, COGS lots, MRP/state enrichment (`tcb.inventory`, `tcb.geo`) — 23 tests |
 | `tests/test_phase_b.py` | ~171 | Blinkit sell-out ingestion (`ingest.utils`, `ingest.load_blinkit_sales`, `ingest.load_blinkit_payout`) — 12 tests |
 | `tests/test_secret_scan.py` | 36 | Unrelated — checks `.gitleaks.toml`/CI workflow presence and runs `gitleaks` against history. No DB interaction. |
+| `tests/unit/*.py` | ~230 | Added by [#33](https://github.com/hd-stack-1858/tcb-demand-planning/issues/33) — pure-logic unit tests for `tcb/session_store.py` and the Blinkit/FirstCry auth+scraper session wiring. Everything mocked (Playwright, Supabase client) — zero DB, zero network, zero credentials. See 2.1 below — this is the first concrete instance of that strategy. |
+| `tests/test_session_store.py` | ~65 | Added by #33 — real dev-DB round-trip for `tcb/session_store.py`'s `portal_sessions` table. Same shared-dev-project limitation as `test_phase_a.py`/`test_phase_b.py` (see 2.2/2.3) — not yet migrated to the local Supabase stack. |
 
 `test_phase_b.py` has 6 of its 12 tests gated by `skipif` on local Excel fixture files
 (`blinkit_reports/sales/*.xlsx`, `blinkit_reports/payout sheets/*`) that are gitignored and
@@ -44,8 +46,8 @@ COGS-dependent test in the session will fail confusingly.
 
 ### 1.4 What blocks a clean checkout from running tests at all
 
-- `pytest` is not declared in `requirements.txt` — nor is `pytest-mock`, `freezegun`, or any other test dependency. There's no `pytest.ini`/`pyproject.toml`/`setup.cfg` either. Whatever machine currently runs these tests has `pytest` installed out-of-band.
-- No CI workflow runs the test suite at all today. The only workflow, `.github/workflows/secret-scan.yml`, runs `gitleaks` on every PR — nothing invokes `pytest`.
+- **Partially resolved by #33**: `requirements-dev.txt` (`-r requirements.txt` + `pytest`, `psycopg2-binary`, `playwright`) and `pytest.ini` (registers `unit`/`integration` markers) now exist. `scripts/run_tests.sh unit|integration|all` sets up a venv and runs the right tier — same script works on a local machine, in CI, or in a throwaway sandbox.
+- **Still open**: no CI workflow invokes `pytest` yet (only `.github/workflows/secret-scan.yml` exists, running `gitleaks`). Wiring `scripts/run_tests.sh unit` into CI is a small remaining piece of [#26](https://github.com/hd-stack-1858/tcb-demand-planning/issues/26) — safe to run unconditionally since it needs no credentials. The `integration` tier still requires `.env.dev` and still hits the shared dev project directly (see 2.2) — the ephemeral local Supabase stack #26 describes is not built.
 
 ## 2. Isolation Strategy
 
@@ -56,6 +58,14 @@ Two different problems need two different answers — neither should be forced i
 Anything that doesn't need a database (see 3.1) gets real unit tests with `unittest.mock`/
 `pytest-mock` at whatever external boundary it touches (HTTP calls, retry loops). These are
 fast, safe, and should run on every PR without qualification.
+
+**Implemented for the first time in #33**: `tests/unit/` mocks the Supabase client for
+`tcb/session_store.py` and mocks Playwright entirely (a `MagicMock` context manager standing in
+for `sync_playwright()`) for the Blinkit/FirstCry auth scripts and scrapers — no browser, no
+network. `tests/unit/conftest.py` overrides the root `conftest.py`'s autouse `seed_dev_cogs`
+fixture (which otherwise forces a live dev-DB connection for every test in the tree) so this
+subtree genuinely needs zero credentials. This is the pattern future unit-test follow-ups
+(3.1's gap table) should copy.
 
 ### 2.2 DB-dependent behavior → ephemeral local Supabase stack, not the shared dev project
 

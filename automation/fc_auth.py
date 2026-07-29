@@ -9,7 +9,7 @@ What it does:
   2. Fills email + password
   3. Waits for you to click the reCAPTCHA checkbox in the browser
   4. Clicks Login
-  5. Saves the full browser session to .fc_session/state.json
+  5. Saves the full browser session to Supabase (portal_sessions)
 
 After this, fc_scraper.py loads that session every day — no reCAPTCHA needed
 until the session expires (typically several weeks).
@@ -30,10 +30,11 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 load_dotenv(Path(__file__).parent.parent / ".env")
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-PORTAL_URL   = "https://in-vcom.brainbees.com/#/"
-SESSION_DIR  = Path(__file__).parent.parent / ".fc_session"
-SESSION_FILE = SESSION_DIR / "state.json"
+from tcb.session_store import save_session
+
+PORTAL_URL = "https://in-vcom.brainbees.com/#/"
 
 
 def run() -> None:
@@ -43,13 +44,11 @@ def run() -> None:
         print("ERROR: FC_USERNAME and FC_PASSWORD must be set in .env")
         sys.exit(1)
 
-    SESSION_DIR.mkdir(exist_ok=True)
-
     print(f"\n{'='*55}")
     print("  First Cry One-Time Authentication")
     print(f"{'='*55}")
     print(f"  Email: {username}")
-    print(f"  Session will be saved to: {SESSION_FILE}")
+    print("  Session will be saved to Supabase (portal_sessions)")
     print(f"{'='*55}\n")
 
     with sync_playwright() as p:
@@ -117,8 +116,8 @@ def run() -> None:
 
         # ── Step 6: Save session ──────────────────────────────────────────────
         print("\nSaving session...")
-        ctx.storage_state(path=str(SESSION_FILE))
-        print(f"\n  Session saved to {SESSION_FILE}")
+        save_session("fc", ctx.storage_state())
+        print("\n  Session saved to Supabase (portal_sessions).")
         print("  The daily scraper will use this until the session expires.\n")
 
         browser.close()
