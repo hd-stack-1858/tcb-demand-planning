@@ -1,0 +1,15 @@
+# Never bake credentials into an image layer
+.env
+.env.dev
+
+# Data stays on a mounted volume, not baked into the image
+data/
+
+# Local/dev-only cruft
+.git/
+.venv-test/
+.claude/
+__pycache__/
+*.pyc
+automation/logs/
+tests/

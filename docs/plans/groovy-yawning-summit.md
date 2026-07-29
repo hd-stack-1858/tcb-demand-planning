@@ -22,7 +22,7 @@ Out of scope for this session (confirmed with Himanshu): K1c (daily lot-vs-SOH m
 
 `setup/migrations/024_blinkit_wh_name_sync.sql` renames 5 `partner_locations.name` rows so they exactly match `serving_wh` strings in performance detail. G2c's WH lookup depends on this exact match.
 
-1. Run `python setup/sync_dev_to_prod.py` first (mandatory per CLAUDE.md DB workflow — dev may have drifted).
+1. Run `python setup/sync_dev_with_prod.py` first (mandatory per CLAUDE.md DB workflow — dev may have drifted). Renamed from `sync_dev_to_prod.py` — the old name had the sync direction backwards.
 2. Apply migration 024 to dev via psycopg2 (`DEV_DB_URL` in `.env.dev`).
 3. Verify: query dev `partner_locations` for the 5 renamed rows, confirm names now match the `Serving warehouse` strings seen in the latest performance CSV.
 4. Leave the migration file as-is for Himanshu to run on prod manually (per dev-first workflow — do not touch prod DDL).

@@ -79,7 +79,6 @@ logger = logging.getLogger(__name__)
 
 PORTAL_URL        = "https://in-vcom.brainbees.com/#/"
 PENDING_ORDERS_URL = "https://in-vcom.brainbees.com/#/ordermanagement/pendingorders"
-SESSION_FILE      = Path(__file__).parent.parent / ".fc_session" / "state.json"
 DOWNLOAD_DIR = Path(__file__).parent.parent / "data" / "firstcry" / "auto"  # scraper writes invoices/packing slips here
 DIMS_FILE    = Path(__file__).parent / "fc_dimensions.json"
 
@@ -682,9 +681,12 @@ def run(dry_run: bool = False, headed: bool = False, no_email: bool = False) -> 
         "order_details": [],
     }
 
-    if not SESSION_FILE.exists():
+    from tcb.session_store import load_session
+
+    session_state = load_session("fc")
+    if session_state is None:
         raise FileNotFoundError(
-            f"No saved session at {SESSION_FILE}.\n"
+            "No saved FirstCry session in Supabase (portal_sessions).\n"
             "Run: python automation/fc_auth.py"
         )
 
@@ -697,7 +699,7 @@ def run(dry_run: bool = False, headed: bool = False, no_email: bool = False) -> 
             slow_mo=300 if headed else 100,
         )
         ctx  = browser.new_context(
-            storage_state=str(SESSION_FILE),
+            storage_state=session_state,
             accept_downloads=True,
             viewport={"width": 1280, "height": 900},
         )

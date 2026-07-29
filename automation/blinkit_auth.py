@@ -10,7 +10,7 @@ What it does:
   3. Enters your phone number in the login modal
   4. Clicks "Send OTP" — waits for you to enter the OTP in the browser
   5. Detects successful login
-  6. Saves the full browser session (cookies + storage) to .blinkit_session/state.json
+  6. Saves the full browser session (cookies + storage) to Supabase (portal_sessions)
 
 After this, blinkit_scraper.py loads that saved session every day — no OTP needed
 until the session expires (typically several weeks).
@@ -30,10 +30,11 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 load_dotenv(Path(__file__).parent.parent / ".env")
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-PORTAL_URL   = "https://seller.blinkit.com"
-SESSION_DIR  = Path(__file__).parent.parent / ".blinkit_session"
-SESSION_FILE = SESSION_DIR / "state.json"
+from tcb.session_store import save_session
+
+PORTAL_URL = "https://seller.blinkit.com"
 
 OTP_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes to enter OTP
 
@@ -44,13 +45,11 @@ def run() -> None:
         print("ERROR: BLINKIT_USERNAME not set in .env")
         sys.exit(1)
 
-    SESSION_DIR.mkdir(exist_ok=True)
-
     print(f"\n{'='*55}")
     print("  Blinkit One-Time Authentication")
     print(f"{'='*55}")
     print(f"  Phone: {phone}")
-    print(f"  Session will be saved to: {SESSION_FILE}")
+    print("  Session will be saved to Supabase (portal_sessions)")
     print(f"{'='*55}\n")
 
     with sync_playwright() as p:
@@ -161,8 +160,8 @@ def run() -> None:
 
         # ── Step 6: Save session ──────────────────────────────────────────────
         print("\nSaving session...")
-        ctx.storage_state(path=str(SESSION_FILE))
-        print(f"\n  Session saved to {SESSION_FILE}")
+        save_session("blinkit", ctx.storage_state())
+        print("\n  Session saved to Supabase (portal_sessions).")
         print("  The daily scraper will use this until the session expires.")
         print("  When it expires, just run this script again.\n")
 

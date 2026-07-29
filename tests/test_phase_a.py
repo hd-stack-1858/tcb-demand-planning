@@ -13,6 +13,8 @@ from tcb.inventory import (
 )
 from tcb.geo import city_to_state
 
+pytestmark = pytest.mark.integration
+
 TEST_SKU     = "TCB011"
 DS_CHANNEL   = 6   # First Cry — DROP_SHIP
 BULK_CHANNEL = 2   # Amazon FBA — FBA (→ TRANSFER_OUT)
