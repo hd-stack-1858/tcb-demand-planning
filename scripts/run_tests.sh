@@ -3,7 +3,7 @@
 # Creates/reuses a venv, installs deps, and runs pytest with a chosen tier.
 #
 # Usage:
-#   ./scripts/run_tests.sh unit          # no credentials needed — runs anywhere
+#   ./scripts/run_tests.sh unit          # + integration_mocked — no credentials needed, runs anywhere
 #   ./scripts/run_tests.sh integration   # requires .env.dev (real dev Supabase)
 #   ./scripts/run_tests.sh all           # both tiers
 #
@@ -31,7 +31,8 @@ fi
 
 case "$TIER" in
   unit)
-    "$VENV_DIR/bin/python3" -m pytest tests/unit -m unit -v
+    "$VENV_DIR/bin/python3" -m pytest tests/unit tests/integration_mocked \
+      -m "unit or integration_mocked" -v
     ;;
   integration)
     if [ ! -f .env.dev ]; then
