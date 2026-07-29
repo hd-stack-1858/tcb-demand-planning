@@ -21,7 +21,7 @@ jobs:
           python scripts/check_local_paths.py . \
             --exclude .env .env.dev .env.example \
             --exclude .claude/ .agy/ data/ .venv/ __pycache__/ \
-            --exclude .git scripts/ tests/ docs/
+            --exclude .git scripts/ tests/ docs/local_setup.md
 
   unit-tests:
     runs-on: ubuntu-latest

@@ -142,7 +142,7 @@ The CI pipeline enforces that no hardcoded local filesystem paths (`/Users/...`,
 python scripts/check_local_paths.py . \
   --exclude .env .env.dev .env.example \
   --exclude .claude/ .agy/ data/ .venv/ __pycache__/ \
-  --exclude .git scripts/ tests/
+  --exclude .git scripts/ tests/ docs/local_setup.md
 ```
 
 If you need a local path (e.g., for a scraper config), keep it in `.env.dev` — it's gitignored.

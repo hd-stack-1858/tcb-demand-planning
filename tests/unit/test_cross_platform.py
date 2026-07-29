@@ -65,6 +65,11 @@ class TestHardcodedPathsDetected:
         assert result.returncode == 1
         assert "src/main.py" in result.stdout
 
+    def test_windows_single_backslash_path(self, tmp_path):
+        result = _run(tmp_path, {"src/main.py": 'PATH = "C:\\01Claude\\projects"\n'})
+        assert result.returncode == 1
+        assert "src/main.py" in result.stdout
+
     def test_multiple_violations_single_file(self, tmp_path):
         content = 'a = "/Users/one"\nb = "C:\\\\Users\\\\two"\n'
         result = _run(tmp_path, {"multi.py": content})

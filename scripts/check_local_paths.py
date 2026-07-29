@@ -23,7 +23,7 @@ _PATH_PATTERNS = [
     re.compile(r"C:\\\\Users"),       # Windows home (escaped backslashes)
     re.compile(r"C:\\Users"),         # Windows home (single backslash)
     re.compile(r"C:/Users"),          # Windows home (forward slash)
-    re.compile(r"C:\\\\[A-Za-z0-9]"),  # Windows paths like C:\01Claude\, C:\Projects\, etc.
+    re.compile(r"C:\\+[A-Za-z0-9]"),   # Windows paths like C:\01Claude\, C:\Projects\, etc.
     re.compile(r"C:/[A-Za-z0-9]"),     # Windows paths with forward slashes
 ]
 
