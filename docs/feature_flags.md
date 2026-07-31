@@ -76,6 +76,11 @@ else:
 To prevent slamming the Supabase DB on every Streamlit rerun or scraper loop, `is_enabled` caches lookups in memory for **60 seconds**.
 * A flag state flip in the database will be reflected in-app within a maximum of 60 seconds without restarting the service.
 
+#### Decoupled Cache Design Trade-offs
+Instead of caching per Streamlit session (using `st.session_state`), we use a thread-safe, python-native global memory cache:
+* **Decoupled Architecture**: This module is used by both Streamlit apps and headless background cron scripts/scrapers (which run outside of Streamlit and do not have Streamlit packages installed). A global cache ensures the system runs anywhere with zero dependencies.
+* **Global Visibility**: Flag changes in the database apply globally to all running app sessions within the 60s TTL, rather than requiring individual users to reload or rebuild their local session states.
+
 ### Failsafes
 * If a flag does not exist in the database, `is_enabled` returns `False`.
 * If the database is offline, queries time out, or query syntax fails, `is_enabled` catches the exception, logs a warning, and returns `False`.
