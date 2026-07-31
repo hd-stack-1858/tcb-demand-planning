@@ -36,6 +36,9 @@ CREATE TABLE feature_flags (
 | **`prod_test`** | `True` | `True` | `True` if user whitelisted | Whitelisted production testing (BETA). |
 | **`on`** | `True` | `True` | `True` | Fully released to everyone. |
 
+> [!NOTE]
+> When setting a flag to `prod_test` in the production database, you must also populate the `allowed_users` column with a list of whitelisted user email addresses (e.g. `'{user1@example.com, user2@example.com}'`). If `allowed_users` is left empty, the flag will effectively evaluate to `False` for all production users.
+
 ---
 
 ## Checking Flags in Code
