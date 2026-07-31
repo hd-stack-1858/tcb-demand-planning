@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ingest.utils import resolve_blinkit_sku, get_sku_cogs_at_date
 
+pytestmark = pytest.mark.integration
+
 # Sales file paths
 _SALES_DIR = Path("blinkit_reports/sales")
 _JAN_FILE  = _SALES_DIR / "sales-report_January 2026.xlsx"

@@ -230,11 +230,11 @@ See `docs/build_plan.md` for full detail and scope per phase. (`docs/build_plan_
 
 Follow this exact sequence for **any** work that touches DB schema or data:
 
-### Step 1 — Sync dev to prod before starting
+### Step 1 — Sync dev from prod before starting
 ```
-python setup/sync_dev_to_prod.py
+python setup/sync_dev_with_prod.py
 ```
-Always run this first. Dev may have drifted from prod (stale stock values, missing rows, schema gaps). Syncing ensures dev is a faithful copy of prod before any new work begins.
+Always run this first. Dev may have drifted from prod (stale stock values, missing rows, schema gaps). This pulls schema + data from prod into dev (dev is overwritten, prod is untouched) so dev is a faithful copy of prod before any new work begins.
 
 ### Step 2 — Make all schema changes in dev first
 - New tables, columns, constraints, indexes → apply to dev via psycopg2 (see [[feedback-dev-db-direct-access]])
