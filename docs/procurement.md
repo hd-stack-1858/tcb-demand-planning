@@ -7,6 +7,11 @@ This is the storage layer; the business-logic layers that read and write it
 are built in follow-up issues (#67 L0 pure functions, #68 L1 repo CRUD,
 #59 GRN posting, #61 debit notes).
 
+Companion docs: [`procurement_workflow.md`](procurement_workflow.md) (how the
+module is used, for operator review) and
+[`procurement_design.md`](procurement_design.md) (why the schema is shaped the
+way it is).
+
 ---
 
 ## Overview
