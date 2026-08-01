@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -35,6 +36,35 @@ TABLE = "schema_migrations"
 
 class MigrationError(Exception):
     pass
+
+
+_SEQUENCE_RE = re.compile(r"^\d+[a-z]*")
+
+
+def _sequence_token(filename: str) -> str:
+    """Leading sequence token of a migration filename — digits plus an optional
+    letter suffix: `006_add_x.sql` -> `006`, `006b_drop_y.sql` -> `006b`."""
+    m = _SEQUENCE_RE.match(filename)
+    return m.group(0) if m else filename
+
+
+def check_duplicate_sequences(files: list[Path]) -> None:
+    """Raise MigrationError if two migration files share a sequence token.
+
+    Convention is `NNN_description.sql`, with `NNNb_description.sql` as the
+    letter-suffixed form for a second file that would otherwise share NNN. Two
+    files with the same token make apply order ambiguous, so fail loudly before
+    any migration runs.
+    """
+    seen: dict[str, str] = {}
+    for f in files:
+        seq = _sequence_token(f.name)
+        if seq in seen:
+            raise MigrationError(
+                f"duplicate migration sequence '{seq}': {seen[seq]} and {f.name} "
+                "share it — rename one to a unique sequence (e.g. 006b_...)"
+            )
+        seen[seq] = f.name
 
 
 def get_db_url() -> str:
@@ -68,7 +98,9 @@ def migrations_table_exists(conn) -> bool:
 
 
 def list_migrations(migrations_dir: Path) -> list[Path]:
-    return sorted(migrations_dir.glob("*.sql"))
+    files = sorted(migrations_dir.glob("*.sql"))
+    check_duplicate_sequences(files)
+    return files
 
 
 def applied_filenames(conn) -> set[str]:
