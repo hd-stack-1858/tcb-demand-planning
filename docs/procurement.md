@@ -13,31 +13,12 @@ way it is).
 
 ---
 
-## Tables added
-
-| Piece | Tables |
-|---|---|
-| Item ↔ supplier terms | `item_suppliers` (+ `suppliers` extension) |
-| Goods receipt | `goods_receipts`, `goods_receipt_items` |
-| Vendor invoices | `vendor_invoices`, `vendor_invoice_items` |
-| PO ↔ invoice join | `po_invoice_allocations` |
-| Debit notes | `debit_notes`, `debit_note_items` |
-| Advance ledger | `vendor_advances`, `vendor_advance_allocations` |
-| PO extension | `purchase_orders` + `purchase_orders.status` |
-
-All monetary values are `NUMERIC` (₹ INR). All tables use `SERIAL` surrogate
-PKs named after the entity (`*_id`), matching the existing schema style.
-
-> [!NOTE]
-> `vendor_invoices` / `vendor_invoice_items` are **distinct** from the
-> existing customer-facing `invoices` / `invoice_items` tables (migration 01).
-> "vendor invoice" = money we owe a supplier; "invoice" = money a customer
-> channel owes us. Do not cross-reference them.
-
----
-
 ## Key decisions & invariants
 
+- **`vendor_invoices` / `vendor_invoice_items` are distinct from the existing
+  customer-facing `invoices` / `invoice_items` tables (migration 01).** "vendor
+  invoice" = money we owe a supplier; "invoice" = money a customer channel owes
+  us. Do not cross-reference them.
 - **Validation lives in L0, not DB CHECKs.** MOQ > 0, lead_time > 0,
   advance 0–100% are business rules enforced in `tcb/procurement.py` (#67),
   where they can return meaningful errors and be tested without a DB. DB
