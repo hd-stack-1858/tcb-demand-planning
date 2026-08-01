@@ -62,6 +62,12 @@ def _upsert_lot(db, sku_id, channel_id, partner_location_id, assembled_at, unit_
         db.table("sku_cogs_lots").insert(data).execute()
 
 
+# Sentinel for _consume_lots_fifo: consume from ALL locations in the channel
+# (no partner_location_id filter). Used by return_sku() tier-2 fallback.
+# Callers that pass None still get the IS NULL filter (OWN_WH / finalize paths).
+_POOL_ALL = object()
+
+
 def _consume_lots_fifo(db, sku_id, channel_id, qty, partner_location_id=None):
     """
     FIFO-consume qty units from lots at (sku_id, channel_id[, partner_location_id]).
@@ -69,6 +75,12 @@ def _consume_lots_fifo(db, sku_id, channel_id, qty, partner_location_id=None):
     Returns (plan, weighted_avg_cogs).
       plan = [{"lot_id", "assembled_at", "unit_cogs", "qty"}, ...]
     Raises ValueError if available lot qty < qty requested.
+
+    partner_location_id=None   → filter to lots WHERE partner_location_id IS NULL
+                                  (OWN_WH lots; existing callers unaffected)
+    partner_location_id=<id>   → filter to that specific location (tier-1)
+    partner_location_id=_POOL_ALL → no location filter; all lots in the channel
+                                    (tier-2 fallback for return_sku)
     """
     q = (db.table("sku_cogs_lots")
            .select("lot_id, assembled_at, unit_cogs, qty_remaining")
@@ -76,7 +88,9 @@ def _consume_lots_fifo(db, sku_id, channel_id, qty, partner_location_id=None):
            .eq("channel_id", channel_id)
            .gt("qty_remaining", 0)
            .order("assembled_at"))
-    if partner_location_id is None:
+    if partner_location_id is _POOL_ALL:
+        pass  # no location filter — consume from any lot in the channel
+    elif partner_location_id is None:
         q = q.is_("partner_location_id", "null")
     else:
         q = q.eq("partner_location_id", partner_location_id)
@@ -949,15 +963,36 @@ def return_sku(sku_id, qty, from_channel_id,
     is_transfer_channel = ch["business_model"] in ("FBA", "SOR", "OUTRIGHT")
 
     if is_transfer_channel:
+        plan = None
+        # Tier-1: location-specific FIFO (K1a behaviour — exact WH match).
         try:
             plan, unit_cogs = _consume_lots_fifo(
                 db, sku_id, from_channel_id, qty,
-                partner_location_id=partner_location_id
+                partner_location_id=partner_location_id,
             )
+        except ValueError:
+            pass
+
+        # Tier-2: channel-wide pool — all locations.
+        # Handles recalls/returns where the caller doesn't know (or didn't pass)
+        # the specific WH. Mirrors the tier-2 fallback in consume_sor_sale().
+        # Bug #102/#104: before this, the except branch went straight to fallback
+        # COGS without decrementing the partner lot.
+        if plan is None:
+            try:
+                plan, unit_cogs = _consume_lots_fifo(
+                    db, sku_id, from_channel_id, qty,
+                    partner_location_id=_POOL_ALL,
+                )
+            except ValueError:
+                plan = None
+
+        if plan is not None:
             for p in plan:
                 _upsert_lot(db, sku_id, own_wh_id, None,
                             p["assembled_at"], p["unit_cogs"], p["qty"])
-        except ValueError:
+        else:
+            # Both tiers exhausted — pre-migration / lot-gap fallback.
             unit_cogs = _get_sku_cogs_fallback(sku_id, db)
             _upsert_lot(db, sku_id, own_wh_id, None, date.today(), unit_cogs, qty)
     else:
