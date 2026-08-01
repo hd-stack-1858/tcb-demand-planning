@@ -45,17 +45,11 @@ class TestAdvanceDuePercent:
         (10000,  Decimal("0"),   Decimal("0.00")),
         (333,    Decimal("10"),  Decimal("33.30")),  # rounding: 33.3 → 33.30
         (1,      Decimal("50"),  Decimal("0.50")),
-        (99.99,  Decimal("33"),  Decimal("32.997").quantize(Decimal("0.01"))),
+        (99.99,  Decimal("33"),  Decimal("33.00")),   # 99.99 × 0.33 = 32.9967 → 33.00
     ])
     def test_percent_calculation(self, po_value, pct, expected):
         terms = {"advance_type": "percent", "advance_value": pct}
-        result = advance_due(terms, po_value)
-        # Re-compute expected with same ROUND_HALF_UP logic
-        from decimal import ROUND_HALF_UP
-        expected = (Decimal(str(po_value)) * (pct / Decimal("100"))).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
-        assert result == expected
+        assert advance_due(terms, po_value) == expected
 
     def test_percent_accepts_float_po_value(self):
         terms = {"advance_type": "percent", "advance_value": Decimal("20")}
