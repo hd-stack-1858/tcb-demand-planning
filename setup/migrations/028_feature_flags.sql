@@ -1,5 +1,6 @@
 -- Migration: Create feature_flags table supporting multi-stage lifecycle
--- 027_feature_flags.sql
+-- 028_feature_flags.sql
+
 
 CREATE TABLE IF NOT EXISTS feature_flags (
     flag_key TEXT PRIMARY KEY,
