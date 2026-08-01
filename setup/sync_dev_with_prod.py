@@ -508,8 +508,9 @@ def main():
     # Phase 0: apply pending migrations from setup/migrations/*.sql (tracked in
     # schema_migrations) before the legacy hardcoded DDL below. Migrations are
     # the forward path for schema changes; the phase1_schema() DDL block is
-    # being retired in a follow-up (issue #41). Abort if they can't be applied —
+    # being retired in a follow-up (issue #107). Abort if they can't be applied —
     # running the legacy DDL against an unknown migration state is unsafe.
+    sys.path.insert(0, str(Path(__file__).parent))
     from apply_migrations import run_migrations
     if run_migrations(dry_run=DRY) != 0:
         print("\nAborting sync: pending migrations could not be applied.", file=sys.stderr)

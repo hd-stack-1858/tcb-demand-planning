@@ -11,7 +11,7 @@ Connection: reads `TCB_TEST_DB_URL` env var, falling back to `DEV_DB_URL` in
 in environments without a configured dev DB.
 
 Run:
-    python -m pytest tests/test_migrations_runner.py -m integration -q
+    python -m pytest tests/migrations/test_migrations_runner.py -m integration -q
 """
 import os
 import sys
@@ -41,23 +41,12 @@ def _db_url() -> str:
     return dev.get("DEV_DB_URL", "")
 
 
-def _parse_url(url: str) -> dict:
-    s = url[len("postgresql://"):]
-    ui, hi = s.rsplit("@", 1)
-    user, pw = ui.split(":", 1)
-    hp, db = hi.rsplit("/", 1)
-    host, port = hp.rsplit(":", 1)
-    # Supabase requires SSL; local Postgres (validation) does not.
-    sslmode = "require" if host not in ("localhost", "127.0.0.1") else "prefer"
-    return dict(host=host, port=int(port), dbname=db, user=user, password=pw, sslmode=sslmode)
-
-
 @pytest.fixture()
 def conn():
     url = _db_url()
     if not url:
         pytest.skip("No DB URL — set TCB_TEST_DB_URL or DEV_DB_URL in .env.dev")
-    conn = psycopg2.connect(**_parse_url(url))
+    conn = psycopg2.connect(url)
     yield conn
     conn.close()
 

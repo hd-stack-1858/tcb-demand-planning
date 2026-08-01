@@ -45,18 +45,7 @@ def get_db_url() -> str:
     return dev.get("DEV_DB_URL", "")
 
 
-def parse_url(url: str) -> dict:
-    s = url[len("postgresql://"):]
-    ui, hi = s.rsplit("@", 1)
-    user, pw = ui.split(":", 1)
-    hp, db = hi.rsplit("/", 1)
-    host, port = hp.rsplit(":", 1)
-    sslmode = "require" if host not in ("localhost", "127.0.0.1") else "prefer"
-    return dict(host=host, port=int(port), dbname=db, user=user, password=pw, sslmode=sslmode)
 
-
-def connect(url: str):
-    return psycopg2.connect(**parse_url(url))
 
 
 def ensure_migrations_table(conn) -> None:
@@ -184,7 +173,7 @@ def run_migrations(
         print("ERROR: no DB URL — set TCB_TEST_DB_URL or DEV_DB_URL in .env.dev", file=sys.stderr)
         return 1
 
-    conn = connect(url)
+    conn = psycopg2.connect(url)
     try:
         if status:
             return print_status(conn, MIGRATIONS_DIR)
