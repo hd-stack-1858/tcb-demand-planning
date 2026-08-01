@@ -560,6 +560,17 @@ Scope confirmed with Himanshu: build G2c (WH-level Blinkit COGS finalization —
 
 Verified during planning: all 1997 current BLK FULFILLED orders have `quantity=1` (order count = unit count, simplifies the join); 0 orders currently pending finalization (clean start, no backlog to catch up).
 
+### #103 — `finalize_blk_cogs()` correctness fix (done Aug-2026)
+
+Two root causes fixed in `tcb/inventory.py` (issue #103, test-cmd: `python -m pytest tests/test_blk_cogs_finalize.py -q`):
+
+1. **`lot_id` was never honored.** The pending query selected only `order_id, sku_id, quantity, supply_state, state` — no `lot_id`. Any order still flagged `lot_cogs_finalized=False` got FIFO-re-consumed on the next run, even one already stamped with a lot_id. Fix: an order with a resolvable `lot_id` takes COGS straight from that lot's `unit_cogs` (stamped `cogs`, `lot_id`, `lot_cogs_finalized=True` in one update) with NO further consumption. A stale/missing lot row falls through to normal FIFO consumption.
+2. **Customer-state proxy for tier-1.** `s_state = order["supply_state"] or order["state"]` fed a customer delivery state into tier-1 state-level FIFO — the cross-state drift K1a forbids. Fix: `s_state = order["supply_state"] or None`; a NULL supply_state falls to the tier-2 channel pool. Matches the behavior the k1a audit already documented (~5% NULL supply_state orders).
+
+`finalize_blk_cogs()` also gained an optional `order_ids` scoping param so integration tests can target a dedicated dev order instead of sweeping real BLK orders (a full sweep on shared dev consumes real lots and marks real orders finalized).
+
+Regression tests: `tests/test_blk_cogs_finalize.py` (integration, dev DB) + `tests/unit/test_blk_cogs_finalize_unit.py` (mocked, CI-safe).
+
 ### K — Why before Phase E
 Phase E computes `days_cover = lot qty_remaining / daily_velocity`. Overstated lots → reorder triggers fire late → OOS. Lot data must be trustworthy before reorder automation goes live.
 
