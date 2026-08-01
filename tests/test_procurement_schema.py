@@ -414,3 +414,27 @@ class TestPurchaseOrders:
         defs = " ".join(check_constraint_defs(conn, "purchase_orders"))
         for v in ("DRAFT", "SENT", "CONFIRMED", "PARTIAL", "RECEIVED", "CANCELLED", "CLOSED"):
             assert v in defs, f"purchase_orders status CHECK missing '{v}'"
+
+    def test_base_columns(self, conn):
+        """Skeleton restored by 029 — base columns from 01_create_tables.sql."""
+        require_column(conn, "purchase_orders", "po_id", "integer")
+        require_column(conn, "purchase_orders", "po_number", "text")
+        require_column(conn, "purchase_orders", "supplier_id", "integer")
+        require_column(conn, "purchase_orders", "status", "text")
+        require_column(conn, "purchase_orders", "updated_at", "timestamp with time zone")
+
+
+class TestPurchaseOrderItems:
+    """Skeleton restored by 029 (recreated from 01_create_tables.sql)."""
+
+    def test_base_columns(self, conn):
+        require_column(conn, "purchase_order_items", "poi_id", "integer")
+        require_column(conn, "purchase_order_items", "po_id", "integer")
+        require_column(conn, "purchase_order_items", "item_id", "integer")
+        require_column(conn, "purchase_order_items", "quantity_ordered", "integer")
+        require_column(conn, "purchase_order_items", "updated_at", "timestamp with time zone")
+
+    def test_fks(self, conn):
+        targets = {cols for cols, _ in fk_targets(conn, "purchase_order_items")}
+        assert ("po_id",) in targets
+        assert ("item_id",) in targets

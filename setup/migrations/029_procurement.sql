@@ -19,14 +19,55 @@
 --     #89 (CA input) and belongs to a later epic (#59/#61).
 --   * Business validation (MOQ > 0, lead_time > 0, advance 0-100%) belongs in
 --     tcb/procurement.py (L0, #67), not DB CHECKs.
+--   * Transactional + idempotent (PV/Archie 2026-08-01): wrapped in BEGIN/COMMIT
+--     so a partial failure rolls back cleanly, and every ALTER uses IF NOT
+--     EXISTS so a re-run is safe. Prologue restores the PO skeleton below.
 --
 -- Renamed 028 -> 029 (2026-08-01): 028_feature_flags.sql already exists on dev.
 -- ============================================================================
 
+BEGIN;
+
+-- 0. purchase_orders / purchase_order_items — restore skeleton ---------------
+-- Both were empty Phase F skeletons dropped during the DB cleanup; 029 and its
+-- FKs reference them. Recreated verbatim from 01_create_tables.sql, plus the
+-- updated_at columns from 08_add_updated_at.sql. IF NOT EXISTS keeps this safe
+-- if a DB already has either table.
+CREATE TABLE IF NOT EXISTS purchase_orders (
+  po_id           SERIAL PRIMARY KEY,
+  po_number       TEXT UNIQUE,
+  supplier_id     INT NOT NULL REFERENCES suppliers(supplier_id),
+  created_date    DATE DEFAULT CURRENT_DATE,
+  expected_date   DATE,
+  received_date   DATE,
+  status          TEXT DEFAULT 'DRAFT' CHECK (status IN (
+                    'DRAFT','SENT','CONFIRMED','PARTIAL','RECEIVED','CANCELLED'
+                  )),
+  total_value     NUMERIC(10,2),
+  advance_paid    NUMERIC(10,2),
+  balance_due     NUMERIC(10,2),
+  notes           TEXT,
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS purchase_order_items (
+  poi_id              SERIAL PRIMARY KEY,
+  po_id               INT NOT NULL REFERENCES purchase_orders(po_id),
+  item_id             INT NOT NULL REFERENCES items(item_id),
+  quantity_ordered    INT NOT NULL,
+  cost_per_unit       NUMERIC(10,4),
+  line_total          NUMERIC(10,2),
+  quantity_received   INT DEFAULT 0,
+  batch_code_received TEXT,
+  notes               TEXT,
+  updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- 1. suppliers — advance terms ------------------------------------------------
 ALTER TABLE suppliers
-  ADD COLUMN advance_type  TEXT DEFAULT 'none' CHECK (advance_type IN ('none','percent','fixed')),
-  ADD COLUMN advance_value NUMERIC(10,2);
+  ADD COLUMN IF NOT EXISTS advance_type  TEXT DEFAULT 'none' CHECK (advance_type IN ('none','percent','fixed')),
+  ADD COLUMN IF NOT EXISTS advance_value NUMERIC(10,2);
 
 -- 2. item_suppliers -----------------------------------------------------------
 CREATE TABLE IF NOT EXISTS item_suppliers (
@@ -172,10 +213,10 @@ CREATE INDEX IF NOT EXISTS vendor_advance_allocations_po_id_idx ON vendor_advanc
 -- 12. purchase_orders — extension ---------------------------------------------
 -- advance_paid / balance_due deliberately left as-is (see header note).
 ALTER TABLE purchase_orders
-  ADD COLUMN terminal_date DATE,
-  ADD COLUMN advance_type  TEXT,
-  ADD COLUMN advance_value NUMERIC(10,2),
-  ADD COLUMN payment_terms TEXT;
+  ADD COLUMN IF NOT EXISTS terminal_date DATE,
+  ADD COLUMN IF NOT EXISTS advance_type  TEXT,
+  ADD COLUMN IF NOT EXISTS advance_value NUMERIC(10,2),
+  ADD COLUMN IF NOT EXISTS payment_terms TEXT;
 
 -- 13. purchase_orders.status — add CLOSED terminal state ----------------------
 -- Drop any existing CHECK on the status column by name lookup (Postgres
@@ -198,3 +239,5 @@ END $$;
 
 ALTER TABLE purchase_orders ADD CONSTRAINT purchase_orders_status_check
   CHECK (status IN ('DRAFT','SENT','CONFIRMED','PARTIAL','RECEIVED','CANCELLED','CLOSED'));
+
+COMMIT;

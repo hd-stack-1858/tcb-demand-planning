@@ -226,8 +226,6 @@ def phase1_schema():
         "demand_forecasts",             # legacy forecasting table
         "invoice_items",                # invoicing deferred
         "invoices",                     # invoicing deferred
-        "purchase_order_items",         # dropped prod this session
-        "purchase_orders",              # dropped prod this session
         "darkstore_inventory",          # dropped prod — migration 006
         "darkstore_sales",              # dropped prod — migration 006
         "amazon_fba_inventory",         # dropped prod — migration 007

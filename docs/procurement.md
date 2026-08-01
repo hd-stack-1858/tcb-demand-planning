@@ -69,3 +69,10 @@ cleanly when neither is configured.
    migration works against dev. Only then merge the PR.
 2. **Prod apply is human-only** (#69) — never run procurement DDL against prod
    from an agent.
+3. **Safety properties** (2026-08-01): migration 029 is wrapped in
+   `BEGIN`/`COMMIT` so a partial failure rolls back cleanly, every `ALTER` uses
+   `ADD COLUMN IF NOT EXISTS` so re-running is safe, and its prologue recreates
+   the `purchase_orders` / `purchase_order_items` skeleton (empty Phase F tables
+   dropped in the DB cleanup) so the FKs resolve against a fresh dev DB.
+   `setup/sync_dev_with_prod.py` no longer drops those two tables in its
+   stale-table sweep.
