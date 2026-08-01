@@ -135,6 +135,23 @@ def _upsert_rows(table: str, rows: list[dict], pk_col: str, label: str | None = 
 
 # ── DDL strings ───────────────────────────────────────────────────────────────
 
+# Stale tables dropped in phase 1b. purchase_orders / purchase_order_items are
+# deliberately NOT here: migration 029 restores them and ten procurement tables
+# FK to them, so re-dropping would silently destroy the module (PR #105).
+STALE_TABLES = [
+    "blinkit_ageing_snapshots",     # dropped prod — adds no replen value
+    "blinkit_performance_summary",  # dropped prod — not used in engine
+    "distribution_rules",           # legacy Blinkit distribution logic
+    "replenishment_recommendations",# legacy recommendation table
+    "demand_forecasts",             # legacy forecasting table
+    "invoice_items",                # invoicing deferred
+    "invoices",                     # invoicing deferred
+    "darkstore_inventory",          # dropped prod — migration 006
+    "darkstore_sales",              # dropped prod — migration 006
+    "amazon_fba_inventory",         # dropped prod — migration 007
+    "amazon_warehouses",            # dropped prod — migration 007
+]
+
 _BLINKIT_DS_ELIGIBILITY = """
 CREATE TABLE IF NOT EXISTS blinkit_ds_sku_eligibility (
     location_id   INTEGER NOT NULL REFERENCES partner_locations(location_id),
@@ -218,20 +235,7 @@ def phase1_schema():
         _sql(cur, f"DROP VIEW IF EXISTS {v} CASCADE", f"DROP VIEW {v}")
 
     print("\n=== Phase 1b: Drop stale tables ===")
-    stale = [
-        "blinkit_ageing_snapshots",     # dropped prod — adds no replen value
-        "blinkit_performance_summary",  # dropped prod — not used in engine
-        "distribution_rules",           # legacy Blinkit distribution logic
-        "replenishment_recommendations",# legacy recommendation table
-        "demand_forecasts",             # legacy forecasting table
-        "invoice_items",                # invoicing deferred
-        "invoices",                     # invoicing deferred
-        "darkstore_inventory",          # dropped prod — migration 006
-        "darkstore_sales",              # dropped prod — migration 006
-        "amazon_fba_inventory",         # dropped prod — migration 007
-        "amazon_warehouses",            # dropped prod — migration 007
-    ]
-    for t in stale:
+    for t in STALE_TABLES:
         _sql(cur, f"DROP TABLE IF EXISTS {t} CASCADE", f"DROP TABLE {t}")
 
     print("\n=== Phase 1c: Schema fixes ===")

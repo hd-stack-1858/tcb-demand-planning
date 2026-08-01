@@ -32,7 +32,9 @@ BEGIN;
 -- Both were empty Phase F skeletons dropped during the DB cleanup; 029 and its
 -- FKs reference them. Recreated verbatim from 01_create_tables.sql, plus the
 -- updated_at columns from 08_add_updated_at.sql. IF NOT EXISTS keeps this safe
--- if a DB already has either table.
+-- if a DB already has either table. The status CHECK is created in its final
+-- form (CLOSED included) so a freshly-created table needs no upgrade — section
+-- 13 only patches pre-existing tables that lack CLOSED (PR #105 review).
 CREATE TABLE IF NOT EXISTS purchase_orders (
   po_id           SERIAL PRIMARY KEY,
   po_number       TEXT UNIQUE,
@@ -41,7 +43,7 @@ CREATE TABLE IF NOT EXISTS purchase_orders (
   expected_date   DATE,
   received_date   DATE,
   status          TEXT DEFAULT 'DRAFT' CHECK (status IN (
-                    'DRAFT','SENT','CONFIRMED','PARTIAL','RECEIVED','CANCELLED'
+                    'DRAFT','SENT','CONFIRMED','PARTIAL','RECEIVED','CANCELLED','CLOSED'
                   )),
   total_value     NUMERIC(10,2),
   advance_paid    NUMERIC(10,2),
@@ -218,26 +220,32 @@ ALTER TABLE purchase_orders
   ADD COLUMN IF NOT EXISTS advance_value NUMERIC(10,2),
   ADD COLUMN IF NOT EXISTS payment_terms TEXT;
 
--- 13. purchase_orders.status — add CLOSED terminal state ----------------------
--- Drop any existing CHECK on the status column by name lookup (Postgres
--- auto-names an inline column CHECK `purchase_orders_status_check`, but resolve
--- it from pg_constraint rather than assuming) and re-add with CLOSED included.
+-- 13. purchase_orders.status — ensure CLOSED terminal state -------------------
+-- A table freshly created by the prologue already has CLOSED in its CHECK and
+-- is left untouched. A pre-existing table (created before 029, e.g. from
+-- 01_create_tables.sql) is upgraded by name lookup on the status column, since
+-- Postgres auto-names an inline column CHECK `purchase_orders_status_check`
+-- but the constraint is resolved from pg_constraint rather than assumed.
 DO $$
-DECLARE _con text;
+DECLARE
+  _con text;
+  _def text;
 BEGIN
-  SELECT c.conname INTO _con
+  SELECT c.conname, pg_get_constraintdef(c.oid) INTO _con, _def
     FROM pg_constraint c
     JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
    WHERE c.conrelid = 'purchase_orders'::regclass
      AND c.contype = 'c'
      AND a.attname = 'status'
    LIMIT 1;
-  IF _con IS NOT NULL THEN
-    EXECUTE format('ALTER TABLE purchase_orders DROP CONSTRAINT %I', _con);
+
+  IF _con IS NULL OR _def NOT LIKE '%CLOSED%' THEN
+    IF _con IS NOT NULL THEN
+      EXECUTE format('ALTER TABLE purchase_orders DROP CONSTRAINT %I', _con);
+    END IF;
+    ALTER TABLE purchase_orders ADD CONSTRAINT purchase_orders_status_check
+      CHECK (status IN ('DRAFT','SENT','CONFIRMED','PARTIAL','RECEIVED','CANCELLED','CLOSED'));
   END IF;
 END $$;
-
-ALTER TABLE purchase_orders ADD CONSTRAINT purchase_orders_status_check
-  CHECK (status IN ('DRAFT','SENT','CONFIRMED','PARTIAL','RECEIVED','CANCELLED','CLOSED'));
 
 COMMIT;

@@ -73,6 +73,10 @@ cleanly when neither is configured.
    `BEGIN`/`COMMIT` so a partial failure rolls back cleanly, every `ALTER` uses
    `ADD COLUMN IF NOT EXISTS` so re-running is safe, and its prologue recreates
    the `purchase_orders` / `purchase_order_items` skeleton (empty Phase F tables
-   dropped in the DB cleanup) so the FKs resolve against a fresh dev DB.
+   dropped in the DB cleanup) so the FKs resolve against a fresh dev DB. The
+   prologue defines the `purchase_orders.status` CHECK in its final form
+   (`CLOSED` included); section 13 upgrades a pre-existing table's CHECK only
+   when it lacks `CLOSED`, so the migration never creates, drops, and recreates
+   the same constraint.
    `setup/sync_dev_with_prod.py` no longer drops those two tables in its
    stale-table sweep.
