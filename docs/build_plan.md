@@ -541,6 +541,8 @@ The FnP CDA delivery report (`cda-export_*.xls`) is the authoritative source for
 ### K1a — Code Audit (Week 1)
 Audit all 5 lot consumption paths in `tcb/inventory.py`. Critical question: does `return_item()` for recalled Blinkit stock decrement the Blinkit lot? If not → code bug to fix before K1b.
 
+**v0.3 P0 fixes (#102/#104, 2026-08-01):** `return_sku()` for transfer channels (SOR/BLK) now uses a two-tier fallback: tier-1 = location-specific FIFO (K1a behavior preserved); tier-2 = channel-wide pool across all locations (new — handles recalls/returns where the WH is unknown). Only if both FIFO tiers are exhausted does it fall back to `_get_sku_cogs_fallback()`. Before this fix, any tier-1 miss went straight to fallback COGS without decrementing the partner lot (Bug A in k1a_blinkit_lot_audit.md). `_consume_lots_fifo()` gains a `_POOL_ALL` sentinel for the channel-wide mode; all existing callers pass `None` and are unaffected.
+
 ### K1b — One-Time Baseline Cleanup (Week 2)
 Generate dry-run diff (sellable only, 3-day cool-off, post-SOH orders backed out). Himanshu reviews row-by-row, signs off. Apply approved changes. Log to `lot_reconciliation_log` with `reason='ONE_TIME_CLEANUP'`.
 
