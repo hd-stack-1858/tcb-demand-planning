@@ -65,62 +65,84 @@ exec streamlit run "ui/${APP}" \
 
 ## Cloud Run deployment
 
-### Growth Spurt (Sales MIS) — `tcb-growthspurt`
+The deploy scripts accept an optional `ENV` parameter (`dev` | `staging` | `prod`, default `prod`).
+Each environment maps to a distinct Cloud Run service and a distinct set of Supabase secrets in Secret Manager:
 
-Service: `tcb-growthspurt`, region `asia-south1`, project `adroitandroidworks`
-(standalone project until #44 moves to the real TCB GCP org).
+| ENV | Growth Spurt service | TinySteps service | Supabase secrets |
+|-----|---------------------|-------------------|-----------------|
+| dev | `tcb-growthspurt-dev` | `tcb-tinysteps-dev` | `supabase-url-dev` / `supabase-key-dev` |
+| staging | `tcb-growthspurt-staging` | `tcb-tinysteps-staging` | `supabase-url-staging` / `supabase-key-staging` |
+| prod | `tcb-growthspurt` | `tcb-tinysteps` | `supabase-url` / `supabase-key` |
+
+### Growth Spurt (Sales MIS)
 
 ```bash
-./scripts/gcp/deploy_growthspurt.sh adroitandroidworks
+# Deploy to staging
+./scripts/gcp/deploy_growthspurt.sh PROJECT_ID staging
+
+# Deploy to prod (default)
+./scripts/gcp/deploy_growthspurt.sh PROJECT_ID
 ```
 
 The script builds `Dockerfile.webapp` for `linux/amd64`, pushes to Artifact
 Registry (`tcb-spike` repo), and deploys with:
 - `STREAMLIT_APP=growthspurt_app.py`
-- `--set-secrets SUPABASE_URL=supabase-url:latest,SUPABASE_KEY=supabase-key:latest`
+- `--set-secrets` wired to the env-specific secret names above
 - `--no-allow-unauthenticated` — IAM-invoker only until #117
 - `--min-instances=1` — keeps the app warm (Streamlit cold starts ~20–30 s)
 
 Smoke test once deployed:
 
 ```bash
-URL=$(gcloud run services describe tcb-growthspurt \
-  --project=adroitandroidworks --region=asia-south1 --format='value(status.url)')
+ENV=staging  # or prod
+SVC=tcb-growthspurt-staging  # or tcb-growthspurt for prod
+URL=$(gcloud run services describe ${SVC} \
+  --project=PROJECT_ID --region=asia-south1 --format='value(status.url)')
 curl -s -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
   "${URL}/_stcore/health"
 # Expected: ok
 ```
 
-### TinySteps (WMS) — `tcb-tinysteps`
-
-Service: `tcb-tinysteps`, region `asia-south1`, project `adroitandroidworks`
-(standalone project until #44 moves to the real TCB GCP org).
+### TinySteps (WMS)
 
 ```bash
-./scripts/gcp/deploy_tinysteps.sh adroitandroidworks
+# Deploy to staging
+./scripts/gcp/deploy_tinysteps.sh PROJECT_ID staging
+
+# Deploy to prod (default)
+./scripts/gcp/deploy_tinysteps.sh PROJECT_ID
 ```
 
-The script builds `Dockerfile.webapp` for `linux/amd64`, pushes to Artifact
-Registry (`tcb-spike` repo), and deploys with:
-- `STREAMLIT_APP=tinysteps_app.py`
-- `--set-secrets SUPABASE_URL=supabase-url:latest,SUPABASE_KEY=supabase-key:latest`
-- `--no-allow-unauthenticated` — IAM-invoker only until #117
-- `--min-instances=1` — keeps the app warm (Streamlit cold starts ~20–30 s)
+Same build + push + deploy flow as Growth Spurt, wired to `tinysteps_app.py` and the `tcb-tinysteps-*` services.
 
-Smoke test once deployed:
+### Secret Manager setup for staging
+
+Before deploying to staging for the first time, create the staging Supabase secrets in Secret Manager:
 
 ```bash
-URL=$(gcloud run services describe tcb-tinysteps \
-  --project=adroitandroidworks --region=asia-south1 --format='value(status.url)')
-curl -s -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
-  "${URL}/_stcore/health"
-# Expected: ok
+echo -n "https://YOUR_STAGING_REF.supabase.co" | \
+  gcloud secrets create supabase-url-staging --data-file=- --project=PROJECT_ID
+echo -n "YOUR_STAGING_SERVICE_ROLE_KEY" | \
+  gcloud secrets create supabase-key-staging --data-file=- --project=PROJECT_ID
+```
+
+Grant the Cloud Run service account access:
+
+```bash
+for SECRET in supabase-url-staging supabase-key-staging; do
+  gcloud secrets add-iam-policy-binding "${SECRET}" \
+    --member="serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+    --role="roles/secretmanager.secretAccessor" \
+    --project=PROJECT_ID
+done
 ```
 
 ### Consolidated parameterised scripts
 
 Issue #118 will consolidate the per-service deploy scripts into a shared
 helper. Until then, each service has its own script under `scripts/gcp/`.
+The `ENV` parameter is already the agreed interface — #118 will just refactor
+the internals.
 
 The app must stay IAM-locked (`--no-allow-unauthenticated`) until the
 auth gate (issue #117) is live — Cloud Run has no viewer-allowlist

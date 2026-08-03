@@ -1,28 +1,61 @@
 #!/usr/bin/env bash
 # Deploy TinySteps (ui/tinysteps_app.py) to Cloud Run — issue #115 (epic #113).
 #
-# Usage: ./scripts/gcp/deploy_tinysteps.sh PROJECT_ID
+# Usage: ./scripts/gcp/deploy_tinysteps.sh PROJECT_ID [ENV]
+#
+#   ENV — one of: dev | staging | prod (default: prod)
+#
+#   ENV       Service name             Image tag           Secrets
+#   -------   ----------------------   -----------------   ----------------------------
+#   dev       tcb-tinysteps-dev        tinysteps-dev       supabase-url-dev / supabase-key-dev
+#   staging   tcb-tinysteps-staging    tinysteps-stg       supabase-url-staging / supabase-key-staging
+#   prod      tcb-tinysteps            tinysteps           supabase-url / supabase-key
 #
 # Builds Dockerfile.webapp for linux/amd64, pushes to Artifact Registry, and
-# deploys (or updates) the tcb-tinysteps Cloud Run service.
+# deploys (or updates) the Cloud Run service for the given environment.
 #
 # Prerequisites:
 #   - gcloud authenticated with permission to push to AR and deploy Cloud Run
-#   - SUPABASE_URL and SUPABASE_KEY secrets exist in Secret Manager for PROJECT_ID
-#     (created by the automation job setup; re-create with:
-#      echo -n "VALUE" | gcloud secrets create supabase-url --data-file=- --project=PROJECT_ID)
+#   - Supabase secrets exist in Secret Manager for PROJECT_ID (env-specific names above).
+#     Create with: echo -n "VALUE" | gcloud secrets create supabase-url-staging \
+#       --data-file=- --project=PROJECT_ID
 #   - Docker installed and running
 #
 # Security: service is deployed --no-allow-unauthenticated (IAM-invoker only)
 # until the auth gate (issue #117) lands. Never remove this flag without #117.
 set -euo pipefail
 
-PROJECT_ID="${1:?Usage: deploy_tinysteps.sh PROJECT_ID}"
+PROJECT_ID="${1:?Usage: deploy_tinysteps.sh PROJECT_ID [ENV]}"
+ENV="${2:-prod}"
+
+case "${ENV}" in
+  dev)
+    SERVICE=tcb-tinysteps-dev
+    IMAGE_NAME=tinysteps-dev
+    SECRET_URL=supabase-url-dev
+    SECRET_KEY=supabase-key-dev
+    ;;
+  staging)
+    SERVICE=tcb-tinysteps-staging
+    IMAGE_NAME=tinysteps-stg
+    SECRET_URL=supabase-url-staging
+    SECRET_KEY=supabase-key-staging
+    ;;
+  prod)
+    SERVICE=tcb-tinysteps
+    IMAGE_NAME=tinysteps
+    SECRET_URL=supabase-url
+    SECRET_KEY=supabase-key
+    ;;
+  *)
+    echo "ERROR: ENV must be one of: dev | staging | prod (got: ${ENV})" >&2
+    exit 1
+    ;;
+esac
 
 REGION=asia-south1
 REPO=tcb-spike
-SERVICE=tcb-tinysteps
-IMAGE="asia-south1-docker.pkg.dev/${PROJECT_ID}/${REPO}/tinysteps:latest"
+IMAGE="asia-south1-docker.pkg.dev/${PROJECT_ID}/${REPO}/${IMAGE_NAME}:latest"
 
 # docker push can die with 'unexpected EOF' mid-large-layer over flaky
 # networks to Artifact Registry; completed layers are cached server-side, so
@@ -42,6 +75,7 @@ push_with_retry() {
   return 1
 }
 
+echo "==> Deploying TinySteps to env=${ENV}, service=${SERVICE}"
 echo "==> Building Dockerfile.webapp for linux/amd64 (Cloud Run arch)"
 docker build --platform linux/amd64 -f Dockerfile.webapp -t "${IMAGE}" .
 
@@ -56,7 +90,7 @@ gcloud run deploy "${SERVICE}" \
   --image="${IMAGE}" \
   --port=8080 \
   --set-env-vars=STREAMLIT_APP=tinysteps_app.py \
-  --set-secrets=SUPABASE_URL=supabase-url:latest,SUPABASE_KEY=supabase-key:latest \
+  --set-secrets="SUPABASE_URL=${SECRET_URL}:latest,SUPABASE_KEY=${SECRET_KEY}:latest" \
   --no-allow-unauthenticated \
   --min-instances=1 \
   --platform=managed
