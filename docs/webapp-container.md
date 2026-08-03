@@ -93,13 +93,34 @@ curl -s -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
 
 ### TinySteps (WMS) — `tcb-tinysteps`
 
-Deploy script lands in issue #115. Same pattern as Growth Spurt with
-`STREAMLIT_APP=tinysteps_app.py` and service name `tcb-tinysteps`.
+Service: `tcb-tinysteps`, region `asia-south1`, project `adroitandroidworks`
+(standalone project until #44 moves to the real TCB GCP org).
+
+```bash
+./scripts/gcp/deploy_tinysteps.sh adroitandroidworks
+```
+
+The script builds `Dockerfile.webapp` for `linux/amd64`, pushes to Artifact
+Registry (`tcb-spike` repo), and deploys with:
+- `STREAMLIT_APP=tinysteps_app.py`
+- `--set-secrets SUPABASE_URL=supabase-url:latest,SUPABASE_KEY=supabase-key:latest`
+- `--no-allow-unauthenticated` — IAM-invoker only until #117
+- `--min-instances=1` — keeps the app warm (Streamlit cold starts ~20–30 s)
+
+Smoke test once deployed:
+
+```bash
+URL=$(gcloud run services describe tcb-tinysteps \
+  --project=adroitandroidworks --region=asia-south1 --format='value(status.url)')
+curl -s -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+  "${URL}/_stcore/health"
+# Expected: ok
+```
 
 ### Consolidated parameterised scripts
 
-Issue #118 will consolidate both deploy scripts into a shared helper. Until
-then, each service has its own script under `scripts/gcp/`.
+Issue #118 will consolidate the per-service deploy scripts into a shared
+helper. Until then, each service has its own script under `scripts/gcp/`.
 
 The app must stay IAM-locked (`--no-allow-unauthenticated`) until the
 auth gate (issue #117) is live — Cloud Run has no viewer-allowlist
