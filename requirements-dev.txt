@@ -1,0 +1,9 @@
+-r requirements.txt
+pytest>=8.0.0
+psycopg2-binary>=2.9.0
+
+# playwright itself now comes from requirements.txt (it's a real production
+# dependency of automation/*.py, not test-only). Unit tests only need the
+# Python package importable (they mock sync_playwright itself) — the
+# `playwright install chromium` browser-binary download is NOT required for
+# unit tests, only for actually running a scraper end-to-end.

@@ -40,6 +40,12 @@ every push to `main` and every pull request, using `--fetch-depth: 0` so full hi
 available. **A finding fails the build** — this is the enforcement mechanism called for in the
 originating issue; there is no separate rotation automation.
 
+The action runs on the latest release major (`gitleaks/gitleaks-action@v3`, Node 24 runtime)
+and requires the `GITLEAKS_LICENSE` secret, which the workflow maps into the action's env via
+`GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}` — org repos need a gitleaks.io license.
+GitHub secrets are not auto-injected; if the mapping is ever removed, every scan fails with
+`missing gitleaks license` regardless of the secret existing in repo settings.
+
 ## If gitleaks reports a real finding
 
 1. Treat the credential as compromised — rotate it immediately, regardless of whether the repo

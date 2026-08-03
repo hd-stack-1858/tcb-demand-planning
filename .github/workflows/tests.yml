@@ -1,0 +1,17 @@
+name: Unit tests
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Run unit tests (mocked, no credentials needed)
+        run: ./scripts/run_tests.sh unit
