@@ -1,0 +1,14 @@
+# Dependencies for the Streamlit webapp images (Dockerfile.webapp).
+# Covers ui/growthspurt_app.py, ui/tinysteps_app.py, and the tcb/ + ingest/ modules
+# they import. Intentionally excludes scraper-only deps (playwright, pyarrow) to keep
+# the image small and prevent OOM during pip install on resource-constrained builders.
+#
+# Scraper container (Dockerfile) continues to use requirements.txt.
+supabase>=2.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+pandas>=2.0.0,<3.0.0
+openpyxl>=3.1.0
+streamlit==1.56.0
+python-dateutil>=2.8.0
+plotly>=5.18.0

@@ -237,9 +237,25 @@ python setup/sync_dev_with_prod.py
 Always run this first. Dev may have drifted from prod (stale stock values, missing rows, schema gaps). This pulls schema + data from prod into dev (dev is overwritten, prod is untouched) so dev is a faithful copy of prod before any new work begins.
 
 ### Step 2 — Make all schema changes in dev first
-- New tables, columns, constraints, indexes → apply to dev via psycopg2 (see [[feedback-dev-db-direct-access]])
-- Write the migration SQL in `setup/migrations/NNN_name.sql` (next sequential number)
+- Write the migration SQL in `setup/migrations/NNN_name.sql` (next sequential number, e.g. `030_my_change.sql`)
+- Apply it to dev with the migration runner:
+  ```
+  python setup/apply_migrations.py --dry-run   # show plan, no writes
+  python setup/apply_migrations.py             # apply pending migrations in order
+  ```
+  The runner tracks applied migrations in a `schema_migrations` table, so it's
+  safe to re-run and never double-applies. Migrations are the single source of
+  truth for schema changes going forward.
 - Test all code against dev (`TCB_ENV=dev`) until the feature works end-to-end
+
+> **First run on an existing dev DB:** dev already has migrations 001–028
+> applied by hand, so the runner must not re-execute them. Bootstrap the
+> tracking table once with:
+> ```
+> python setup/apply_migrations.py --baseline
+> ```
+> (`--baseline` records every current migration file as applied without running
+> it. Subsequent runs apply only genuinely new migrations.)
 
 ### Step 3 — Himanshu applies the migration to prod manually
 - Share the `setup/migrations/NNN_name.sql` file with Himanshu

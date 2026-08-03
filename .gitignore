@@ -27,6 +27,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.venv-test/
 
 # Streamlit local config
 .streamlit/secrets.toml

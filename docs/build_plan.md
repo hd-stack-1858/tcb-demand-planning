@@ -460,7 +460,7 @@ Replaces a 2-hour manual replenishment process across 6 browser tabs. Engine com
 - `distribution_rules` — empty, no code references
 - `replenishment_recommendations` — empty, no code references
 - `blinkit_ageing_snapshots` — empty, loader never built; ageing dropped from scope (see G6 above)
-- `purchase_orders` / `purchase_order_items` — empty Phase F skeleton; will recreate at Phase F build time
+- `purchase_orders` / `purchase_order_items` — empty Phase F skeleton; recreated by migration 029 (see `docs/procurement.md`)
 
 **Prod DB views dropped:**
 - `v_blinkit_reconciliation` — referenced `blinkit_locations` (dropped) + tables that never existed

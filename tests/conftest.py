@@ -15,16 +15,21 @@ from tcb.catalog import CATALOG_COGS
 
 @pytest.fixture(scope="session")
 def db():
-    return get_client()
+    try:
+        return get_client()
+    except EnvironmentError:
+        return None
 
 
 @pytest.fixture(scope="session")
 def own_wh_id(db):
+    if db is None:
+        pytest.skip("No DB connection — integration test skipped")
     return db.table("channels").select("channel_id").eq("code", "OWN_WH").single().execute().data["channel_id"]
 
 
 @pytest.fixture(scope="session", autouse=True)
-def seed_dev_cogs(db, own_wh_id):
+def seed_dev_cogs(db):
     """
     Ensure every active SKU has:
       1. At least one ASSEMBLY txn so fallback COGS lookups work.
@@ -32,7 +37,15 @@ def seed_dev_cogs(db, own_wh_id):
          hits zero on dev (where item_batches is empty).
     Skips any SKU that already has ASSEMBLY history or an open lot.
     Non-PYTEST_ reference keeps clean_test_orders from wiping it mid-session.
+    No-ops when SUPABASE credentials are not available (allows L0 pure-function
+    tests to run without a DB connection).
     """
+    if db is None:
+        yield
+        return
+
+    own_wh_id = db.table("channels").select("channel_id").eq("code", "OWN_WH").single().execute().data["channel_id"]
+
     # ── ASSEMBLY txns ────────────────────────────────────────────────────────
     existing_asm = {
         r["sku_id"]
