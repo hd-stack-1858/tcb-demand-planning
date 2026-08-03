@@ -24,12 +24,30 @@ REPO=tcb-spike
 SERVICE=tcb-tinysteps
 IMAGE="asia-south1-docker.pkg.dev/${PROJECT_ID}/${REPO}/tinysteps:latest"
 
+# docker push can die with 'unexpected EOF' mid-large-layer over flaky
+# networks to Artifact Registry; completed layers are cached server-side, so
+# a retry resumes rather than restarts. Retry up to 3 times with a short pause.
+push_with_retry() {
+  local image="$1" attempt=1
+  while [ "${attempt}" -le 3 ]; do
+    echo "==> docker push ${image} (attempt ${attempt}/3)"
+    if docker push "${image}"; then
+      return 0
+    fi
+    echo "    push failed; retrying in 5s..."
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+  echo "ERROR: docker push failed after 3 attempts" >&2
+  return 1
+}
+
 echo "==> Building Dockerfile.webapp for linux/amd64 (Cloud Run arch)"
 docker build --platform linux/amd64 -f Dockerfile.webapp -t "${IMAGE}" .
 
 echo "==> Pushing to Artifact Registry: ${IMAGE}"
 gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
-docker push "${IMAGE}"
+push_with_retry "${IMAGE}"
 
 echo "==> Deploying Cloud Run service: ${SERVICE}"
 gcloud run deploy "${SERVICE}" \
