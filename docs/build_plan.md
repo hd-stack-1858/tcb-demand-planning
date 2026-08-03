@@ -31,7 +31,7 @@ The Cradle Box sells baby gift hampers across 6 channels. This system captures o
 | Windows Task Scheduler — daily_runner | "Blinkit Sales_Daily Run" — triggers daily_runner.py at 12:01 IST. First run: 16-May-2026. |
 | `automation/fnp_scraper.py` | Playwright scraper — accepts FnP orders, downloads Branding Challan PDF, emails. Live tested 17-May-2026 (3 orders). Runs 11:00/14:00/16:00 IST ✅ Active. |
 | `automation/fc_scraper.py` + `fc_auth.py` | Playwright scraper — accepts FC orders, fills shipment dims, downloads Invoice+PackingSlip PDFs, emails. Multi-item order fix 21-May (row-by-row SKU+qty, all Status dropdowns). Runs 10:30/20:00 IST ✅ Active. |
-| `automation/email_sender.py` | SMTP email helper — `send_with_attachments()` + `send_alert()`. `send_alert()` supports `EMAIL_HIMANSHU_ALT` for backup delivery to personal Gmail. |
+| `automation/email_sender.py` | SMTP email helper — `send_with_attachments()` + `send_alert()`. Alerts go to the official inbox only (personal Gmail backups removed Aug 2026 — official mail delivery confirmed reliable). |
 | **Blinkit Replenishment (Phase J)** | See section below. Full end-to-end replenishment engine built 21-May-2026. |
 | **Blinkit perf data cleanup (28-May)** | `blinkit_performance_ads` table fully dropped (dev + prod, migration 017). Trigger 2 updated to Column Q definition: `inventory_available=False AND total_orders>0`. `blinkit_performance_scraper.py` `ingest()` now runs Pass 0a before `process_file()` — new DS appearing in auto-downloaded files are seeded before load (was silently skipping them). |
 | **COGS lot fix (28-May)** | Created lot_id=149 for 4 orphaned TCB003 units at ₹698.447 COGS — units existed in OWN_WH but had no lot (initial seeding undercount + returns consumed prior lots). Order processed successfully via TinySteps (txn_id=390). |
@@ -614,7 +614,7 @@ Items explicitly decided to skip for now but worth revisiting:
 | `automation/daily_runner.py` | ✅ Built + live — G1+G2+G3, failure email alerts, HTTPError handler fixed |
 | Windows Task Scheduler — daily_runner | ✅ Active — "Blinkit Sales_Daily Run" at 12:01 IST daily |
 | `automation/fnp_scraper.py` | ✅ Live. Angular timing + load wait fix 18-May (retry loop, startsWith match) |
-| `automation/email_sender.py` | ✅ Built — SMTP sender, EMAIL_HIMANSHU_ALT backup support added |
+| `automation/email_sender.py` | ✅ Built — SMTP sender. Personal Gmail backup addresses removed Aug 2026 (official mail confirmed reliable) |
 | FnP Task Scheduler jobs | ✅ Active — 11:00, 14:00, 16:00 IST |
 | `automation/fc_scraper.py` + `fc_auth.py` | ✅ Live + tested. Multi-item fix 21-May: row-by-row SKU scan, all Status dropdowns set to Accepted, weights summed across items |
 | `automation/fc_dimensions.json` | ✅ All 12 SKUs filled |
