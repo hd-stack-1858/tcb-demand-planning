@@ -479,6 +479,7 @@ def update_wh_ds_mapping(df: pd.DataFrame, ds_lookup: dict,
     updated = 0
     unknown_wh  = set()
     unknown_ds  = set()
+    seen_ds     = set()
 
     for _, row in mapping.iterrows():
         raw_ds  = str(row['Darkstore name']).strip()
@@ -488,6 +489,13 @@ def update_wh_ds_mapping(df: pd.DataFrame, ds_lookup: dict,
         if not ds_id:
             unknown_ds.add(raw_ds)
             continue
+
+        if ds_id in seen_ds:
+            # Raw name variants (case/whitespace) resolved to the same DS after
+            # ds_lookup normalization — mapping is globally sorted by data_date
+            # descending, so the first-seen (latest) row for this DS was already applied.
+            continue
+        seen_ds.add(ds_id)
 
         wh_code = resolve_wh_code(wh_name, name_lookup)
         new_parent = wh_lookup.get(wh_code)
@@ -534,13 +542,16 @@ def update_eligibility(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict) -> d
     remark_col = 'Darkstore remark'
     flag_col   = 'Considered for assessment (Y/N)'
 
-    # One row per (item_id, DS_name): the latest data_date row for that pair
+    # Coarse pre-filter: one row per raw (item_id, DS_name) string pair, latest data_date first.
+    # This does NOT guarantee uniqueness on the resolved (ds_id, sku_id) upsert key below —
+    # name-variant collisions (case/whitespace) are caught by seen_pairs instead.
     latest_per_pair = (
         df.sort_values('data_date', ascending=False)
         .drop_duplicates(subset=[item_col, 'Darkstore name'])
     )
 
-    records        = []
+    records         = []
+    seen_pairs      = set()
     unknown_ds      = set()
     unknown_sku     = set()
     unknown_remarks = set()
@@ -582,6 +593,13 @@ def update_eligibility(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict) -> d
                     print(f'  [WARN] Unclassified N-row (blank DS remark), Remarks: {remarks_s!r}')
                 unclassified_n += 1
                 continue  # no actionable status
+
+        pair_key = (ds_id, sku_id)
+        if pair_key in seen_pairs:
+            # Raw name variants (case/whitespace) resolved to the same (location_id, sku_id)
+            # after ds_lookup normalization — latest-dated row for this pair was already kept.
+            continue
+        seen_pairs.add(pair_key)
 
         records.append({
             'location_id':  ds_id,
@@ -637,6 +655,7 @@ def upsert_detail(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict) -> dict:
     inserted  = 0
     skipped   = 0
     unknown_ds = set()
+    seen_keys  = set()
     batch     = []
 
     for _, row in y_rows.iterrows():
@@ -655,6 +674,15 @@ def upsert_detail(df: pd.DataFrame, sku_lookup: dict, ds_lookup: dict) -> dict:
         if not row['data_date']:
             skipped += 1
             continue
+
+        row_key = (str(row['data_date']), ds_id, sku_id)
+        if row_key in seen_keys:
+            # Raw name variants (case/whitespace) resolved to the same (location_id, sku_id)
+            # for this date after ds_lookup normalization — would duplicate the upsert
+            # conflict key and crash Postgres ("cannot affect row a second time").
+            skipped += 1
+            continue
+        seen_keys.add(row_key)
 
         city = str(row.get('city_val', '') or '').strip() or None
 
