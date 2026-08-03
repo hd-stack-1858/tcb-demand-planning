@@ -1,8 +1,11 @@
 """City → state lookup and pincode → (city, state) via India Post API."""
 
 import json
+import logging
 import re
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _PINCODE_CACHE_PATH = Path(__file__).parent.parent / "data" / "reference" / "pincode_cache.json"
 
@@ -162,7 +165,12 @@ def pincode_to_city_state(pincode: str | None) -> tuple[str | None, str | None]:
             except Exception:
                 pass
             return _normalize_city(city), state
-    except Exception:
-        pass
+        logger.warning(
+            "Pincode %s: India Post API returned non-Success status: %s",
+            pincode, data[0].get("Status") if data else "empty response",
+        )
+    except Exception as exc:
+        logger.warning("Pincode %s: India Post API lookup failed (%s) — city/state left NULL.",
+                        pincode, exc)
 
     return None, None
