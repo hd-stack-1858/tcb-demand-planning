@@ -1,6 +1,7 @@
 # Never bake credentials into an image layer
 .env
 .env.dev
+.streamlit/secrets.toml
 
 # Data stays on a mounted volume, not baked into the image
 data/
