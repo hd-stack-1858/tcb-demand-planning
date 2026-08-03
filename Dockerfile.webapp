@@ -1,0 +1,39 @@
+# Streamlit web-app container for ui/tinysteps_app.py (TinySteps WMS) and
+# ui/growthspurt_app.py (Growth Spurt MIS) — issue #114, parent epic #113.
+#
+# Purpose: replace Streamlit Community Cloud as the runtime host for the two
+# internal web apps. Deliberately NOT the automation container (Dockerfile) —
+# that one is a Playwright/Chrome base for the scrapers; these apps are pure
+# Streamlit and only need python:3.11-slim (matches runtime.txt).
+#
+# One image serves either app — choose at run time with STREAMLIT_APP, e.g.:
+#   docker build -f Dockerfile.webapp -t tcb-webapp .
+#   docker run --rm -p 8501:8501 \
+#     -e STREAMLIT_APP=growthspurt_app.py \
+#     -e SUPABASE_URL=... -e SUPABASE_KEY=... \
+#     tcb-webapp
+#
+# Cloud Run: the image listens on $PORT (default 8501 for local runs).
+# Readiness probe: GET /_stcore/health on the configured port.
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY . .
+
+RUN chmod +x scripts/start_webapp.sh
+
+# Informational only — the app listens on $PORT at runtime (default 8501
+# locally; Cloud Run injects 8080). The entrypoint, not EXPOSE, pins the port.
+EXPOSE 8501
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD python -c "import os,urllib.request; p=os.environ.get('PORT','8501'); urllib.request.urlopen(f'http://127.0.0.1:{p}/_stcore/health', timeout=3)"
+
+CMD ["/app/scripts/start_webapp.sh"]
