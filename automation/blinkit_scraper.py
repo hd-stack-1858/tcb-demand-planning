@@ -44,7 +44,6 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 PORTAL_URL    = "https://seller.blinkit.com"
-SESSION_FILE  = Path(__file__).parent.parent / ".blinkit_session" / "state.json"
 DOWNLOAD_DIR  = Path(__file__).parent.parent / "data" / "blinkit" / "auto" / "sales"  # scraper writes MTD sales reports here
 
 
@@ -78,9 +77,12 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
     Returns Path to the downloaded .xlsx file in blinkit_reports/sales/.
     Raises BlinkitSessionExpired if the saved session is no longer valid.
     """
-    if not SESSION_FILE.exists():
+    from tcb.session_store import load_session, save_session
+
+    session_state = load_session("blinkit")
+    if session_state is None:
         raise FileNotFoundError(
-            f"No saved session at {SESSION_FILE}.\n"
+            "No saved Blinkit session in Supabase (portal_sessions).\n"
             "Run: python automation/blinkit_auth.py"
         )
 
@@ -108,7 +110,7 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
                 args=["--disable-blink-features=AutomationControlled"],
             )
         ctx = browser.new_context(
-            storage_state=str(SESSION_FILE),
+            storage_state=session_state,
             accept_downloads=True,
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -284,8 +286,8 @@ def scrape(dry_run: bool = False, headed: bool = False) -> Path:
         download.save_as(str(dest))
         logger.info("Saved: %s", dest)
 
-        ctx.storage_state(path=str(SESSION_FILE))
-        logger.info("Session refreshed: %s", SESSION_FILE)
+        save_session("blinkit", ctx.storage_state())
+        logger.info("Session refreshed in Supabase (portal_sessions)")
         browser.close()
 
     return dest

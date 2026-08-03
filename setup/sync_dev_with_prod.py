@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-setup/sync_dev_to_prod.py
+setup/sync_dev_with_prod.py
 
 One-shot dev DB sync: brings the dev Supabase project to the same schema + master
 data as prod.  Safe to re-run — uses IF EXISTS / ON CONFLICT DO NOTHING throughout.
 
+Direction: reads from prod (Supabase REST client), writes into dev (direct psycopg2
+connection to DEV_DB_URL) — dev is what gets overwritten to match prod, never the
+reverse. (Renamed from sync_dev_to_prod.py, which had the direction backwards.)
+
 Usage:
-    python setup/sync_dev_to_prod.py            # apply all changes
-    python setup/sync_dev_to_prod.py --dry-run  # show plan, no writes
+    python setup/sync_dev_with_prod.py            # apply all changes
+    python setup/sync_dev_with_prod.py --dry-run  # show plan, no writes
 """
 import sys
 from datetime import date, timedelta
@@ -131,6 +135,23 @@ def _upsert_rows(table: str, rows: list[dict], pk_col: str, label: str | None = 
 
 # ── DDL strings ───────────────────────────────────────────────────────────────
 
+# Stale tables dropped in phase 1b. purchase_orders / purchase_order_items are
+# deliberately NOT here: migration 029 restores them and ten procurement tables
+# FK to them, so re-dropping would silently destroy the module (PR #105).
+STALE_TABLES = [
+    "blinkit_ageing_snapshots",     # dropped prod — adds no replen value
+    "blinkit_performance_summary",  # dropped prod — not used in engine
+    "distribution_rules",           # legacy Blinkit distribution logic
+    "replenishment_recommendations",# legacy recommendation table
+    "demand_forecasts",             # legacy forecasting table
+    "invoice_items",                # invoicing deferred
+    "invoices",                     # invoicing deferred
+    "darkstore_inventory",          # dropped prod — migration 006
+    "darkstore_sales",              # dropped prod — migration 006
+    "amazon_fba_inventory",         # dropped prod — migration 007
+    "amazon_warehouses",            # dropped prod — migration 007
+]
+
 _BLINKIT_DS_ELIGIBILITY = """
 CREATE TABLE IF NOT EXISTS blinkit_ds_sku_eligibility (
     location_id   INTEGER NOT NULL REFERENCES partner_locations(location_id),
@@ -214,22 +235,7 @@ def phase1_schema():
         _sql(cur, f"DROP VIEW IF EXISTS {v} CASCADE", f"DROP VIEW {v}")
 
     print("\n=== Phase 1b: Drop stale tables ===")
-    stale = [
-        "blinkit_ageing_snapshots",     # dropped prod — adds no replen value
-        "blinkit_performance_summary",  # dropped prod — not used in engine
-        "distribution_rules",           # legacy Blinkit distribution logic
-        "replenishment_recommendations",# legacy recommendation table
-        "demand_forecasts",             # legacy forecasting table
-        "invoice_items",                # invoicing deferred
-        "invoices",                     # invoicing deferred
-        "purchase_order_items",         # dropped prod this session
-        "purchase_orders",              # dropped prod this session
-        "darkstore_inventory",          # dropped prod — migration 006
-        "darkstore_sales",              # dropped prod — migration 006
-        "amazon_fba_inventory",         # dropped prod — migration 007
-        "amazon_warehouses",            # dropped prod — migration 007
-    ]
-    for t in stale:
+    for t in STALE_TABLES:
         _sql(cur, f"DROP TABLE IF EXISTS {t} CASCADE", f"DROP TABLE {t}")
 
     print("\n=== Phase 1c: Schema fixes ===")
@@ -500,6 +506,19 @@ def phase8_verify():
 def main():
     if DRY:
         print("=== DRY RUN — no writes will be made ===")
+
+    # Phase 0: apply pending migrations from setup/migrations/*.sql (tracked in
+    # schema_migrations) before the legacy hardcoded DDL below. Migrations are
+    # the forward path for schema changes; the phase1_schema() DDL block is
+    # being retired in a follow-up (issue #107). Abort if they can't be applied —
+    # running the legacy DDL against an unknown migration state is unsafe.
+    sys.path.insert(0, str(Path(__file__).parent))
+    from apply_migrations import run_migrations
+    if run_migrations(dry_run=DRY) != 0:
+        print("\nAborting sync: pending migrations could not be applied.", file=sys.stderr)
+        print("If this is the first run on a hand-migrated dev DB, run once:", file=sys.stderr)
+        print("  python setup/apply_migrations.py --baseline", file=sys.stderr)
+        sys.exit(1)
 
     # Phases 1–3: schema changes (autocommit — each statement is independent)
     phase1_schema()
