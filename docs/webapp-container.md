@@ -12,9 +12,15 @@ only need `python:3.11-slim` (matches `runtime.txt`).
 ## What the image contains
 
 - Base: `python:3.11-slim`
-- `requirements.txt` (pins `streamlit==1.56.0`)
+- `requirements-webapp.txt` — webapp-only deps (pins `streamlit==1.56.0`); excludes
+  scraper-only packages (`playwright`, `pyarrow`) that are only needed by `Dockerfile`
 - `scripts/start_webapp.sh` — the entrypoint
 - `HEALTHCHECK` on `/_stcore/health` (Streamlit's readiness endpoint)
+
+> **Note:** `Dockerfile.webapp` deliberately does **not** use the root `requirements.txt`.
+> That file includes `playwright` and `pyarrow` for the scraper container (`Dockerfile`),
+> which are not needed here and bloat the image enough to cause OOM during `pip install`
+> on Docker Desktop (issue #126).
 
 One image serves either app — `STREAMLIT_APP` picks it at run time.
 
