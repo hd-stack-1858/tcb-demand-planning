@@ -1,6 +1,6 @@
 import os, sys
 os.environ['TCB_ENV'] = 'prod'
-sys.path.insert(0, r'C:\01Claude\projects\DemandPlanning')
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from tcb.db import get_client
 from ingest.utils import resolve_amazon_sku
 

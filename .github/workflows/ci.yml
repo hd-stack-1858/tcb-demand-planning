@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  cross-platform-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check for hardcoded local paths
+        run: |
+          python scripts/check_local_paths.py . \
+            --exclude .env .env.dev .env.example \
+            --exclude .claude/ .agy/ data/ .venv/ __pycache__/ \
+            --exclude .git scripts/ tests/ docs/local_setup.md
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: pip install pytest python-dotenv supabase
+
+      - name: Run unit tests
+        run: pytest tests/unit/ -v --rootdir=tests/unit
