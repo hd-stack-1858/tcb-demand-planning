@@ -22,8 +22,8 @@ ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install -r requirements.txt
+COPY requirements-webapp.txt .
+RUN pip install -r requirements-webapp.txt
 
 COPY . .
 
