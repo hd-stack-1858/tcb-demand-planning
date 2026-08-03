@@ -76,3 +76,12 @@ def test_region_is_asia_south1():
 def test_requires_project_id_argument():
     # Script must fail fast if PROJECT_ID is not supplied
     assert "${1:?" in _script_text()
+
+
+def test_push_has_retry_loop():
+    # docker push can EOF mid-layer on flaky networks; script must retry
+    # (completed layers are cached, so retries resume) rather than fail once
+    text = _script_text()
+    assert "push_with_retry" in text
+    assert 'docker push "${image}"' in text
+    assert "attempt" in text
