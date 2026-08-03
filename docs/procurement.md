@@ -62,6 +62,42 @@ python -m pytest tests/test_procurement_schema.py -q
 Requires a DB URL via `TCB_TEST_DB_URL` or `DEV_DB_URL` in `.env.dev`; skips
 cleanly when neither is configured.
 
+---
+
+## L1 repository — `tcb/procurement_repo.py`
+
+Single-concern DB access for `item_suppliers` and the extended `suppliers`
+table (issue [#68](https://github.com/hd-stack-1858/tcb-demand-planning/issues/68)).
+Rows come back shaped as the L0 types in `tcb/procurement.py`
+(`ItemSupplierRow` / `ContractTerms`) so `effective_terms()` /
+`preferred_supplier()` compose directly, and business validation reuses the L0
+helpers (raising `ProcurementError`).
+
+- **Injectable client.** `ProcurementRepo(client=None)` defaults to
+  `tcb/db.py`'s `get_client()`; callers (and tests) pass their own client.
+  This is the first class-based module in `tcb/` — a deliberate architectural
+  choice to make procurement DB access fakes without a network. Existing
+  modules are intentionally not retrofitted in this PR.
+- **Upsert conflict key.** `upsert_item_supplier` upserts on
+  `UNIQUE(item_id, supplier_id)`; on conflict it updates the submitted fields
+  (`cogs`, `lead_time_days`, `moq`, `is_preferred`, and `is_active` when
+  passed). `created_at` / omitted `is_active` are left untouched.
+- **Preferred-supplier invariant.** `set_preferred` (and a preferred
+  `upsert_item_supplier`) demote **all** rows for the item where
+  `is_preferred=True` — mirroring the partial unique index
+  `item_suppliers_one_preferred_idx` — then promote the target pair. The
+  demotion is scoped to the item and never excludes a supplier.
+- **Out of scope:** `items.latest_supplier_id` (migration 021) is a display
+  snapshot updated by `receive_item()`, not the authoritative mapping — left
+  untouched.
+
+Tests are `tests/test_procurement_repo.py` (unit tier; injected fake client,
+no network):
+
+```bash
+python -m pytest tests/test_procurement_repo.py -q
+```
+
 ## Deploying
 
 1. Apply `setup/migrations/029_procurement.sql` to the **dev** Supabase
