@@ -585,12 +585,20 @@ def finalize_az_cogs(dry_run: bool = False) -> dict:
     }
 
 
-def finalize_blk_cogs(dry_run: bool = False) -> dict:
+def finalize_blk_cogs(dry_run: bool = False, order_ids: list[str] | None = None) -> dict:
     """
     Stamp lot-based COGS on BLK FULFILLED orders that have lot_cogs_finalized=False.
 
     Called daily after Blinkit scraper (G2b). Consumes BLK channel sku_cogs_lots FIFO
     using supply_state (tier-1) or full channel pool (tier-2 fallback).
+
+    Orders already stamped with a lot_id take COGS directly from that lot — they are
+    never re-consumed. A NULL supply_state falls to the tier-2 channel pool; the
+    customer `state` is never used as a tier-1 proxy (K1a cross-state drift).
+
+    order_ids scopes finalization to specific orders (integration tests use this to
+    target a dedicated dev order instead of sweeping real BLK orders). When omitted,
+    the full pending sweep runs.
 
     Does NOT insert sku_inventory_transactions rows — TRANSFER_OUT at bulk ship time
     already recorded the stock movement.
@@ -602,21 +610,45 @@ def finalize_blk_cogs(dry_run: bool = False) -> dict:
     blk_id     = next(r["channel_id"] for r in ch_rows if r["code"] == "BLK")
 
     pending = (db.table("orders")
-                 .select("order_id, sku_id, quantity, supply_state, state")
+                 .select("order_id, sku_id, quantity, supply_state, state, lot_id")
                  .eq("lot_cogs_finalized", False)
                  .eq("status", "FULFILLED")
                  .eq("channel_id", blk_id)
                  .order("order_date")
                  .execute().data)
+    if order_ids:
+        scoped = set(order_ids)
+        pending = [o for o in pending if o["order_id"] in scoped]
 
     finalized = fallback_used = no_cogs = 0
 
     for order in pending:
-        # Use supply_state if captured; fall back to customer state as proxy
-        s_state = order["supply_state"] or order["state"]
+        order_id = order["order_id"]
+        sku_id   = order["sku_id"]
+        qty      = int(order["quantity"])
+
+        # lot_id already stamped → COGS straight from that lot, no consumption.
+        # Fall through to normal FIFO consumption if the lot row is stale/missing.
+        lot_id = order.get("lot_id")
+        if lot_id is not None:
+            lot_row = (db.table("sku_cogs_lots")
+                         .select("unit_cogs")
+                         .eq("lot_id", lot_id)
+                         .execute().data)
+            if lot_row and lot_row[0].get("unit_cogs") is not None:
+                cogs = round(float(lot_row[0]["unit_cogs"]) * qty, 2)
+                update = {"cogs": cogs, "lot_id": lot_id, "lot_cogs_finalized": True}
+                if not dry_run:
+                    db.table("orders").update(update).eq("order_id", order_id).execute()
+                finalized += 1
+                continue
+
+        # NULL supply_state → tier-2 channel pool. Never proxy customer `state`
+        # into tier-1 state-level FIFO (K1a cross-state drift).
+        s_state = order["supply_state"] or None
         result  = consume_sor_sale(
-            sku_id=order["sku_id"],
-            qty=order["quantity"],
+            sku_id=sku_id,
+            qty=qty,
             channel_id=blk_id,
             supply_state=s_state,
         )
@@ -625,17 +657,17 @@ def finalize_blk_cogs(dry_run: bool = False) -> dict:
             no_cogs += 1
             update = {"lot_cogs_finalized": True}
         else:
-            unit_cogs, lot_id = result
-            cogs = round(unit_cogs * int(order["quantity"]), 2)
+            unit_cogs, consumed_lot_id = result
+            cogs = round(unit_cogs * qty, 2)
             update = {"cogs": cogs, "lot_cogs_finalized": True}
-            if lot_id is not None:
-                update["lot_id"] = lot_id
+            if consumed_lot_id is not None:
+                update["lot_id"] = consumed_lot_id
             finalized += 1
             if not order["supply_state"]:
                 fallback_used += 1
 
         if not dry_run:
-            db.table("orders").update(update).eq("order_id", order["order_id"]).execute()
+            db.table("orders").update(update).eq("order_id", order_id).execute()
 
     return {
         "total":        len(pending),
