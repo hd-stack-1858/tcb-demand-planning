@@ -1,0 +1,161 @@
+# Streamlit web-app container (`Dockerfile.webapp`)
+
+Runtime container for the two internal Streamlit apps —
+`ui/tinysteps_app.py` (TinySteps WMS) and `ui/growthspurt_app.py`
+(Growth Spurt / Sales MIS). This is the execution host that replaces
+Streamlit Community Cloud (issue #114, parent epic #113).
+
+**This is not the automation container.** `Dockerfile` (repo root) is the
+Playwright/Chrome base for the scrapers; these apps are pure Streamlit and
+only need `python:3.11-slim` (matches `runtime.txt`).
+
+## What the image contains
+
+- Base: `python:3.11-slim`
+- `requirements-webapp.txt` — webapp-only deps (pins `streamlit==1.56.0`); excludes
+  scraper-only packages (`playwright`, `pyarrow`) that are only needed by `Dockerfile`
+- `scripts/start_webapp.sh` — the entrypoint
+- `HEALTHCHECK` on `/_stcore/health` (Streamlit's readiness endpoint)
+
+> **Note:** `Dockerfile.webapp` deliberately does **not** use the root `requirements.txt`.
+> That file includes `playwright` and `pyarrow` for the scraper container (`Dockerfile`),
+> which are not needed here and bloat the image enough to cause OOM during `pip install`
+> on Docker Desktop (issue #126).
+
+One image serves either app — `STREAMLIT_APP` picks it at run time.
+
+## Building and running locally
+
+```bash
+docker build -f Dockerfile.webapp -t tcb-webapp .
+docker run --rm -p 8501:8501 \
+  -e STREAMLIT_APP=growthspurt_app.py \
+  -e SUPABASE_URL=https://your-project-ref.supabase.co \
+  -e SUPABASE_KEY=your-SERVICE-ROLE-key \
+  tcb-webapp
+```
+
+Then open http://localhost:8501. `STREAMLIT_APP` defaults to
+`tinysteps_app.py`; both apps read config from plain env vars
+(`tcb/db.py` reads `SUPABASE_URL`/`SUPABASE_KEY`), so no `secrets.toml`
+is needed in the container. `.streamlit/secrets.toml` is excluded via
+`.dockerignore` so local credentials never enter an image layer.
+
+## Entrypoint behaviour (`scripts/start_webapp.sh`)
+
+```bash
+APP="${STREAMLIT_APP:-tinysteps_app.py}"
+PORT="${PORT:-8501}"
+exec streamlit run "ui/${APP}" \
+  --server.port="${PORT}" --server.address="0.0.0.0" \
+  --server.headless=true --browser.gatherUsageStats=false
+```
+
+- `$PORT` follows the Cloud Run convention (the platform injects `PORT`,
+  default 8080). Local runs without `PORT` fall back to 8501.
+- `--server.address 0.0.0.0` — bind all interfaces so the platform can reach it.
+- `--browser.gatherUsageStats=false` — no telemetry out of the container.
+
+## Health checks
+
+- Docker `HEALTHCHECK` probes `http://127.0.0.1:$PORT/_stcore/health`
+  (`$PORT` read at container runtime, so it stays correct under Cloud Run).
+- Cloud Run readiness probe: configure it to `GET /_stcore/health` on the
+  container's port. Streamlit returns `ok` once the app has finished booting.
+
+## Cloud Run deployment
+
+### GitHub Actions (recommended)
+
+Go to **Actions → Deploy GrowthSpurt** (or **Deploy TinySteps**) → **Run workflow** and pick
+the target environment. The workflow builds, pushes, and deploys — no local gcloud needed.
+Required secrets/variables are set in GitHub Settings → Environments.
+
+For role-based access control, configure required reviewers on the `prod` (or `staging`) GitHub
+Environment: Settings → Environments → prod → Required reviewers. The workflow's `environment:`
+field enforces those rules automatically — no code change needed.
+
+### Local (Unix)
+
+The deploy scripts require `ENV` as a positional argument (`dev` | `staging` | `prod`).
+Each environment maps to a distinct Cloud Run service and a distinct set of Supabase secrets in Secret Manager:
+
+| ENV | Growth Spurt service | TinySteps service | Supabase secrets |
+|-----|---------------------|-------------------|-----------------|
+| dev | `tcb-growthspurt-dev` | `tcb-tinysteps-dev` | `supabase-url-dev` / `supabase-key-dev` |
+| staging | `tcb-growthspurt-staging` | `tcb-tinysteps-staging` | `supabase-url-staging` / `supabase-key-staging` |
+| prod | `tcb-growthspurt` | `tcb-tinysteps` | `supabase-url` / `supabase-key` |
+
+### Growth Spurt (Sales MIS)
+
+```bash
+./scripts/gcp/deploy_growthspurt.sh PROJECT_ID staging
+./scripts/gcp/deploy_growthspurt.sh PROJECT_ID prod
+```
+
+The script builds `Dockerfile.webapp` for `linux/amd64`, pushes to Artifact
+Registry (`tcb-spike` repo), and deploys with:
+- `STREAMLIT_APP=growthspurt_app.py`
+- `--set-secrets` wired to the env-specific secret names above
+- `--no-allow-unauthenticated` — IAM-invoker only until #117
+- `--min-instances=1` — keeps the app warm (Streamlit cold starts ~20–30 s)
+
+Smoke test once deployed:
+
+```bash
+ENV=staging  # or prod
+SVC=tcb-growthspurt-staging  # or tcb-growthspurt for prod
+URL=$(gcloud run services describe ${SVC} \
+  --project=PROJECT_ID --region=asia-south1 --format='value(status.url)')
+curl -s -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+  "${URL}/_stcore/health"
+# Expected: ok
+```
+
+### TinySteps (WMS)
+
+```bash
+./scripts/gcp/deploy_tinysteps.sh PROJECT_ID staging
+./scripts/gcp/deploy_tinysteps.sh PROJECT_ID prod
+```
+
+Same build + push + deploy flow as Growth Spurt, wired to `tinysteps_app.py` and the `tcb-tinysteps-*` services.
+
+### Secret Manager setup for staging
+
+Before deploying to staging for the first time, create the staging Supabase secrets in Secret Manager:
+
+```bash
+echo -n "https://YOUR_STAGING_REF.supabase.co" | \
+  gcloud secrets create supabase-url-staging --data-file=- --project=PROJECT_ID
+echo -n "YOUR_STAGING_SERVICE_ROLE_KEY" | \
+  gcloud secrets create supabase-key-staging --data-file=- --project=PROJECT_ID
+```
+
+Grant the Cloud Run service account access:
+
+```bash
+for SECRET in supabase-url-staging supabase-key-staging; do
+  gcloud secrets add-iam-policy-binding "${SECRET}" \
+    --member="serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+    --role="roles/secretmanager.secretAccessor" \
+    --project=PROJECT_ID
+done
+```
+
+### Consolidated parameterised scripts
+
+Issue #118 will consolidate the per-service deploy scripts into a shared
+helper. Until then, each service has its own script under `scripts/gcp/`.
+The `ENV` parameter is already the agreed interface — #118 will just refactor
+the internals.
+
+The app must stay IAM-locked (`--no-allow-unauthenticated`) until the
+auth gate (issue #117) is live — Cloud Run has no viewer-allowlist
+equivalent (see #15).
+
+## Local parity check
+
+Before a deploy is claimed "done", run each app from the container with the
+same env vars Cloud Run will inject (no `secrets.toml`) and confirm behaviour
+matches the current Streamlit Cloud app.

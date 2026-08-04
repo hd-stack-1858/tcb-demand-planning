@@ -1,0 +1,56 @@
+name: Deploy GrowthSpurt
+
+# Manual trigger only — not part of CI.
+#
+# Role-based access: configure a GitHub Environment (Settings → Environments)
+# named "dev", "staging", or "prod" with required reviewers to gate who can
+# trigger deploys to each environment.  No code change needed — the
+# environment: field below enforces whatever protection rules you set there.
+#
+# Secrets required (set at the repo or environment level in GitHub Settings):
+#   GCP_SA_KEY      — Service account JSON key with roles:
+#                     Artifact Registry Writer, Cloud Run Developer,
+#                     Secret Manager Secret Accessor
+#
+# Variables required (set at repo or environment level):
+#   GCP_PROJECT_ID  — GCP project ID (e.g. tcb-demand-planning)
+#
+# Can also be run locally (Unix):
+#   gcloud auth login
+#   ./scripts/gcp/deploy_growthspurt.sh PROJECT_ID ENV
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
+
+      - name: Deploy GrowthSpurt
+        run: ./scripts/gcp/deploy_growthspurt.sh "${{ vars.GCP_PROJECT_ID }}" "${{ inputs.environment }}"
