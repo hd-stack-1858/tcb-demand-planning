@@ -1,4 +1,4 @@
-# Sync prod → staging (`setup/sync_prod_to_staging.py`)
+# Sync staging with prod (`setup/sync_staging_with_prod.py`)
 
 Copies a full snapshot of the prod Supabase database onto the staging Supabase database.
 Run this before testing a release on staging so staging has realistic prod data.
@@ -31,15 +31,22 @@ Prod credentials are read from the existing `.env` file (`SUPABASE_URL` + `SUPAB
 
 ## Usage
 
+### GitHub Actions (recommended)
+
+Go to **Actions → Sync Staging with Prod → Run workflow** and pick dry-run or live.
+Credentials are injected automatically from the `staging` GitHub Environment secrets.
+
+### Local (Unix)
+
 ```bash
 # Dry run — shows what would happen, writes nothing
-python setup/sync_prod_to_staging.py --dry-run
+python setup/sync_staging_with_prod.py --dry-run
 
 # Full sync — clears staging and loads current prod snapshot
-python setup/sync_prod_to_staging.py
+python setup/sync_staging_with_prod.py
 
-# Explicit credentials (skips .env files — useful in CI or ad hoc)
-python setup/sync_prod_to_staging.py \
+# Explicit credentials (skips .env files — useful in ad hoc scenarios)
+python setup/sync_staging_with_prod.py \
     --prod-url  https://YOUR_PROD_REF.supabase.co \
     --prod-key  YOUR_PROD_SERVICE_ROLE_KEY \
     --staging-db-url postgresql://postgres.YOUR_STAGING_REF:PASSWORD@aws-0-ap-south-1.pooler.supabase.com:5432/postgres

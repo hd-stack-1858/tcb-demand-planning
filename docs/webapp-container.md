@@ -65,7 +65,19 @@ exec streamlit run "ui/${APP}" \
 
 ## Cloud Run deployment
 
-The deploy scripts accept an optional `ENV` parameter (`dev` | `staging` | `prod`, default `prod`).
+### GitHub Actions (recommended)
+
+Go to **Actions → Deploy GrowthSpurt** (or **Deploy TinySteps**) → **Run workflow** and pick
+the target environment. The workflow builds, pushes, and deploys — no local gcloud needed.
+Required secrets/variables are set in GitHub Settings → Environments.
+
+For role-based access control, configure required reviewers on the `prod` (or `staging`) GitHub
+Environment: Settings → Environments → prod → Required reviewers. The workflow's `environment:`
+field enforces those rules automatically — no code change needed.
+
+### Local (Unix)
+
+The deploy scripts require `ENV` as a positional argument (`dev` | `staging` | `prod`).
 Each environment maps to a distinct Cloud Run service and a distinct set of Supabase secrets in Secret Manager:
 
 | ENV | Growth Spurt service | TinySteps service | Supabase secrets |
@@ -77,11 +89,8 @@ Each environment maps to a distinct Cloud Run service and a distinct set of Supa
 ### Growth Spurt (Sales MIS)
 
 ```bash
-# Deploy to staging
 ./scripts/gcp/deploy_growthspurt.sh PROJECT_ID staging
-
-# Deploy to prod (default)
-./scripts/gcp/deploy_growthspurt.sh PROJECT_ID
+./scripts/gcp/deploy_growthspurt.sh PROJECT_ID prod
 ```
 
 The script builds `Dockerfile.webapp` for `linux/amd64`, pushes to Artifact
@@ -106,11 +115,8 @@ curl -s -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
 ### TinySteps (WMS)
 
 ```bash
-# Deploy to staging
 ./scripts/gcp/deploy_tinysteps.sh PROJECT_ID staging
-
-# Deploy to prod (default)
-./scripts/gcp/deploy_tinysteps.sh PROJECT_ID
+./scripts/gcp/deploy_tinysteps.sh PROJECT_ID prod
 ```
 
 Same build + push + deploy flow as Growth Spurt, wired to `tinysteps_app.py` and the `tcb-tinysteps-*` services.

@@ -1,0 +1,59 @@
+name: Sync Staging with Prod
+
+# Manual trigger only — not part of CI.
+# Copies a full prod snapshot onto staging (clears staging first).
+# Equivalent to running locally: python setup/sync_staging_with_prod.py
+#
+# Role-based access: add required reviewers to the "staging" GitHub Environment
+# (Settings → Environments → staging) to control who can trigger this workflow.
+#
+# Secrets required (set at the "staging" environment or repo level):
+#   PROD_SUPABASE_URL   — prod project URL  (https://xxx.supabase.co)
+#   PROD_SUPABASE_KEY   — prod service-role key
+#   STAGING_DB_URL      — staging direct PostgreSQL connection string
+#                         (postgresql://postgres.xxx:PASSWORD@aws-xxx.pooler.supabase.com:5432/postgres)
+#
+# Can also be run locally (Unix):
+#   python setup/sync_staging_with_prod.py [--dry-run]
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — show what would be synced without writing to staging"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  sync:
+    name: Sync staging with prod
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install python-dotenv psycopg2-binary supabase
+
+      - name: Sync prod → staging
+        env:
+          PROD_SUPABASE_URL: ${{ secrets.PROD_SUPABASE_URL }}
+          PROD_SUPABASE_KEY: ${{ secrets.PROD_SUPABASE_KEY }}
+          STAGING_DB_URL: ${{ secrets.STAGING_DB_URL }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="--dry-run"
+          fi
+          python setup/sync_staging_with_prod.py $ARGS

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Deploy Growth Spurt (ui/growthspurt_app.py) to Cloud Run — issue #116 (epic #113).
 #
-# Usage: ./scripts/gcp/deploy_growthspurt.sh PROJECT_ID [ENV]
+# Usage: ./scripts/gcp/deploy_growthspurt.sh PROJECT_ID ENV
 #
-#   ENV — one of: dev | staging | prod (default: prod)
+#   ENV — required: dev | staging | prod
 #
 #   ENV       Service name              Image tag           Secrets
 #   -------   -----------------------   -----------------   ----------------------------
@@ -25,8 +25,8 @@
 # until the auth gate (issue #117) lands. Never remove this flag without #117.
 set -euo pipefail
 
-PROJECT_ID="${1:?Usage: deploy_growthspurt.sh PROJECT_ID [ENV]}"
-ENV="${2:-prod}"
+PROJECT_ID="${1:?Usage: deploy_growthspurt.sh PROJECT_ID ENV}"
+ENV="${2:?ENV is required — pass dev, staging, or prod}"
 
 case "${ENV}" in
   dev)
