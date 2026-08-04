@@ -82,9 +82,9 @@ def test_push_has_retry_loop():
 
 
 def test_env_parameter_accepted():
-    # ENV is the second parameter; must default to prod if omitted
+    # ENV is the second parameter; must fail fast if omitted
     text = _script_text()
-    assert "${2:-prod}" in text
+    assert "${2:?" in text
 
 
 def test_prod_env_uses_unqualified_service_name():
@@ -123,3 +123,30 @@ def test_invalid_env_exits_with_error():
     # Case statement must have a catch-all that prints an error and exits non-zero
     text = _script_text()
     assert "exit 1" in text
+
+
+def test_validate_secrets_function_exists():
+    # Must have a pre-deploy validation step that checks secrets exist before build+push
+    text = _script_text()
+    assert "validate_secrets()" in text or "validate_secrets ()" in text
+
+
+def test_validate_secrets_checks_gcloud_describe():
+    # Validation must use `gcloud secrets describe` to verify each secret exists
+    text = _script_text()
+    assert "gcloud secrets describe" in text
+
+
+def test_validate_secrets_called_before_docker_build():
+    # Validation must run before any docker build/push — fail fast, not mid-deploy
+    text = _script_text()
+    validate_pos = text.index("validate_secrets \"${SECRET_URL}\"")
+    build_pos = text.index("docker build")
+    assert validate_pos < build_pos, "validate_secrets must be called before docker build"
+
+
+def test_validate_secrets_prints_missing_with_create_commands():
+    # Error output must list each missing secret and show the gcloud command to create it
+    text = _script_text()
+    assert "gcloud secrets create" in text
+    assert "missing" in text.lower() or "ERROR" in text
