@@ -150,3 +150,29 @@ def test_validate_secrets_prints_missing_with_create_commands():
     text = _script_text()
     assert "gcloud secrets create" in text
     assert "missing" in text.lower() or "ERROR" in text
+
+
+def test_validate_ar_repo_function_exists():
+    # Must validate the Artifact Registry repo exists before docker build
+    text = _script_text()
+    assert "validate_ar_repo()" in text or "validate_ar_repo ()" in text
+
+
+def test_validate_ar_repo_checks_gcloud_artifacts_describe():
+    # Must use `gcloud artifacts repositories describe` to verify the repo
+    text = _script_text()
+    assert "gcloud artifacts repositories describe" in text
+
+
+def test_validate_ar_repo_called_before_docker_build():
+    # AR repo check must run before docker build — fail fast
+    text = _script_text()
+    ar_pos = text.index("validate_ar_repo")
+    build_pos = text.index("docker build")
+    assert ar_pos < build_pos, "validate_ar_repo must be called before docker build"
+
+
+def test_validate_ar_repo_prints_create_command():
+    # Error output must show the exact gcloud command to create the missing repo
+    text = _script_text()
+    assert "gcloud artifacts repositories create" in text

@@ -84,6 +84,27 @@ validate_secrets() {
 
 validate_secrets "${SECRET_URL}" "${SECRET_KEY}"
 
+# Fail fast: verify the Artifact Registry repo exists before building the image.
+# Without this, the script wastes a full image build cycle before failing at push
+# with "Repository not found" — which gives no hint about how to fix it.
+validate_ar_repo() {
+  if ! gcloud artifacts repositories describe "${REPO}" \
+      --location="${REGION}" \
+      --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    echo "ERROR: Artifact Registry repository '${REPO}' not found in project=${PROJECT_ID}, location=${REGION}" >&2
+    echo "" >&2
+    echo "Create it with:" >&2
+    echo "  gcloud artifacts repositories create ${REPO} \\" >&2
+    echo "    --repository-format=docker \\" >&2
+    echo "    --location=${REGION} \\" >&2
+    echo "    --project=${PROJECT_ID}" >&2
+    exit 1
+  fi
+  echo "==> Artifact Registry repo validated: ${REPO}"
+}
+
+validate_ar_repo
+
 # docker push can die with 'unexpected EOF' mid-large-layer over flaky
 # networks to Artifact Registry; completed layers are cached server-side, so
 # a retry resumes rather than restarts. Retry up to 3 times with a short pause.
