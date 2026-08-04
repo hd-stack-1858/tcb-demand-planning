@@ -1,6 +1,7 @@
 # Credentials — NEVER commit these
 .env
 .env.dev
+.env.staging
 
 # Excel master files — stay local, not needed for the running app
 *.xlsx
