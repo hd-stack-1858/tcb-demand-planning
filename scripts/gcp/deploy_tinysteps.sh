@@ -57,6 +57,33 @@ REGION=asia-south1
 REPO=tcb-spike
 IMAGE="asia-south1-docker.pkg.dev/${PROJECT_ID}/${REPO}/${IMAGE_NAME}:latest"
 
+# Fail fast: verify that every secret the deploy needs already exists in
+# Secret Manager. Without this, `gcloud run deploy` fails mid-deploy with a
+# cryptic 404 on the secret ref — wasting a full build+push cycle.
+validate_secrets() {
+  local missing=()
+  for secret in "$@"; do
+    if ! gcloud secrets describe "${secret}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+      missing+=("${secret}")
+    fi
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    echo "ERROR: missing secrets in Secret Manager (project=${PROJECT_ID}):" >&2
+    for s in "${missing[@]}"; do
+      echo "  - ${s}" >&2
+    done
+    echo "" >&2
+    echo "Create them with:" >&2
+    for s in "${missing[@]}"; do
+      echo "  echo -n \"VALUE\" | gcloud secrets create ${s} --data-file=- --project=${PROJECT_ID}" >&2
+    done
+    exit 1
+  fi
+  echo "==> Secrets validated: $*"
+}
+
+validate_secrets "${SECRET_URL}" "${SECRET_KEY}"
+
 # docker push can die with 'unexpected EOF' mid-large-layer over flaky
 # networks to Artifact Registry; completed layers are cached server-side, so
 # a retry resumes rather than restarts. Retry up to 3 times with a short pause.
