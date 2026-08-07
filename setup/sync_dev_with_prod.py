@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-setup/sync_dev_to_prod.py
+setup/sync_dev_with_prod.py
 
 One-shot dev DB sync: brings the dev Supabase project to the same schema + master
 data as prod.  Safe to re-run — uses IF EXISTS / ON CONFLICT DO NOTHING throughout.
 
+Direction: reads from prod (Supabase REST client), writes into dev (direct psycopg2
+connection to DEV_DB_URL) — dev is what gets overwritten to match prod, never the
+reverse. (Renamed from sync_dev_to_prod.py, which had the direction backwards.)
+
 Usage:
-    python setup/sync_dev_to_prod.py            # apply all changes
-    python setup/sync_dev_to_prod.py --dry-run  # show plan, no writes
+    python setup/sync_dev_with_prod.py            # apply all changes
+    python setup/sync_dev_with_prod.py --dry-run  # show plan, no writes
 """
 import sys
 from datetime import date, timedelta
