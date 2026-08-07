@@ -321,47 +321,37 @@ def _select_all(page) -> None:
     logger.warning("No 'Select All' checkbox found.")
 
 
+def _select_all_when_ready(page, count: int, col_count: int) -> None:
+    """
+    Wait for Angular to render row checkboxes, then Select All.
+    Shared by the Allocated (Accept) and Orders-to-be-shipped (Branding Challan) flows —
+    clicking Select All before rows exist leaves each row's own "selected" state unset,
+    so the header checkbox shows checked=true but downstream bulk-action buttons stay
+    ng-disabled (their condition checks row selection, not the header checkbox).
+    """
+    _wait_for_table_rows(page)
+    expected_rows = count if count > 0 else col_count
+    _wait_for_row_checkboxes(page, expected=expected_rows)
+    _select_all(page)
+
+
 def _click_accept(page) -> None:
     """Click the Accept button on the Allocated orders page."""
-    # ng-disabled until Select All is checked. Wait up to 5s for Angular to enable it,
-    # then JS-click (scrollIntoView + click) to handle the SPA scroll container.
-    # There are TWO bulkAccept buttons: ng-show="!selectall" and ng-show="selectall".
-    # After Select All, the !selectall button gets ng-hide; the selectall button becomes visible.
+    # ng-disabled until Select All is checked. There are TWO bulkAccept buttons:
+    # ng-show="!selectall" and ng-show="selectall" — after Select All, the !selectall
+    # button gets ng-hide and the selectall button becomes visible. Both can be
+    # visible/non-hidden at the same instant during that transition, and a find()
+    # without a !b.disabled filter can grab the stale disabled one — .click() on a
+    # disabled element is a documented no-op (spec: no click event dispatched), so the
+    # accept would silently do nothing while the caller believes it succeeded. Filter
+    # for an enabled button explicitly and retry (up to 6s) until Angular enables one.
     # Use getComputedStyle (not offsetParent — that's null for position:fixed bottom ribbons).
-    find_js = """
-        () => {
-            const all = [...document.querySelectorAll('button')].map(b => ({
-                text: (b.innerText || '').trim().substring(0, 40),
-                cls: b.className,
-                disabled: b.disabled,
-                display: window.getComputedStyle(b).display,
-                visibility: window.getComputedStyle(b).visibility,
-            }));
-            const btn = [...document.querySelectorAll('button')].find(b =>
-                (b.innerText || '').trim().toLowerCase().startsWith('accept') &&
-                !b.classList.contains('ng-hide') &&
-                window.getComputedStyle(b).display !== 'none' &&
-                window.getComputedStyle(b).visibility !== 'hidden'
-            );
-            if (!btn) return {found: false, all_buttons: all};
-            return {found: true, disabled: btn.disabled, cls: btn.className};
-        }
-    """
-    for attempt in range(10):
-        state = page.evaluate(find_js)
-        if state and state.get("found") and not state.get("disabled"):
-            break
-        if attempt == 0:
-            logger.info("Accept button scan: %s", state)
-        else:
-            logger.info("Accept button not ready (attempt %d/10): found=%s", attempt + 1, state.get("found"))
-        time.sleep(0.5)
-
-    clicked = page.evaluate("""
+    click_js = """
         () => {
             const btn = [...document.querySelectorAll('button')].find(b =>
                 (b.innerText || '').trim().toLowerCase().startsWith('accept') &&
                 !b.classList.contains('ng-hide') &&
+                !b.disabled &&
                 window.getComputedStyle(b).display !== 'none' &&
                 window.getComputedStyle(b).visibility !== 'hidden'
             );
@@ -370,10 +360,17 @@ def _click_accept(page) -> None:
             btn.click();
             return {found: true, disabled: btn.disabled, cls: btn.className};
         }
-    """)
+    """
+    clicked = None
+    for click_attempt in range(6):
+        clicked = page.evaluate(click_js)
+        if clicked and clicked.get("found"):
+            break
+        logger.info("Accept click attempt %d/6: no enabled accept button visible yet.", click_attempt + 1)
+        time.sleep(1)
     logger.info("Accept click result: %s", clicked)
     if not clicked or not clicked.get("found"):
-        raise RuntimeError("Accept button not found on allocated orders page.")
+        raise RuntimeError("Accept button never became enabled/clickable on allocated orders page — order was NOT accepted.")
     time.sleep(3)
     time.sleep(5)  # Accept triggers a server-side status update, not a new page load
     logger.info("ACCEPT clicked.")
@@ -933,10 +930,41 @@ def _run_once(dry_run: bool = False, headed: bool = False, no_email: bool = Fals
                             col_idx, col_count)
                 _click_column(page, "Allocated", col_idx)
                 count = _read_order_count(page)
-                _select_all(page)
+                _select_all_when_ready(page, count, col_count)
                 _click_accept(page)
                 result["allocated_accepted"] += count if count > 0 else col_count
                 _return_to_dashboard(page)
+
+            # Verify the accept actually registered — the portal's disabled-button race
+            # can make _click_accept believe it succeeded while nothing happened server-side.
+            # Ground truth is the Allocated column count itself, not the click return value.
+            if alloc_cols:
+                alloc_cols_after = _scan_section(page, "Allocated")
+                still_allocated = sum(c for _, c in alloc_cols_after)
+                if still_allocated > 0:
+                    msg = (
+                        f"{still_allocated} order(s) still show under 'Allocated' after the "
+                        f"Accept step ran — the accept likely did NOT register on the portal "
+                        f"(known race: portal briefly shows a disabled Accept button that "
+                        f"click() silently no-ops on). These orders were NOT actually accepted "
+                        f"and will need a manual accept or a re-run of this scraper. "
+                        f"CHECK: log in to partner.fnp.com and accept manually if this recurs."
+                    )
+                    logger.error("ACCEPT VERIFICATION FAILED: %s", msg)
+                    result["allocated_accepted"] = max(0, result["allocated_accepted"] - still_allocated)
+                    if not dry_run and not no_email:
+                        from automation.email_sender import send_alert
+                        try:
+                            send_alert(
+                                f"⚠️ FnP Accept — {date.today().strftime('%d-%b-%Y')} "
+                                f"({still_allocated} order(s) still Allocated) [ACTION NEEDED]",
+                                f"Hi,\n\n*** ACTION NEEDED ***\n{msg}\n*********************\n\n"
+                                f"— Vignesh (automated)\n",
+                            )
+                        except Exception:
+                            logger.exception("Failed to send accept-verification-failed alert email.")
+                else:
+                    logger.info("Accept verified — Allocated now shows 0.")
 
             # ── Step 3: Orders to be shipped — ALL non-zero columns ────────────
             ship_cols = _scan_section(page, "Orders to be shipped")
@@ -1027,12 +1055,7 @@ def _run_once(dry_run: bool = False, headed: bool = False, no_email: bool = Fals
                 _click_column(page, "Orders to be shipped", col_idx)
                 count = _read_order_count(page)
                 total_ship += count if count > 0 else col_count
-                # Wait for Angular XHR to populate table rows BEFORE clicking Select All.
-                # Without this wait the checkbox fires before rows exist → 0-byte download.
-                _wait_for_table_rows(page)
-                expected_rows = count if count > 0 else col_count
-                _wait_for_row_checkboxes(page, expected=expected_rows)
-                _select_all(page)
+                _select_all_when_ready(page, count, col_count)
                 pdf = _click_branding_challan(page)
                 pdf_paths.append(pdf)
                 result["challan_downloaded"] = True
